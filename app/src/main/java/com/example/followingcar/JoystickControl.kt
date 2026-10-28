@@ -29,6 +29,7 @@ import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import kotlin.math.min
 
 /**
@@ -40,7 +41,8 @@ fun JoystickControl(
     enabled: Boolean,
     onMove: (Float, Float) -> Unit,
     onRelease: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    controlSize: Dp = 256.dp,
 ) {
     var position by remember { mutableStateOf(Offset.Zero) }
     var active by remember { mutableStateOf(false) }
@@ -61,7 +63,7 @@ fun JoystickControl(
     }
 
     Box(
-        modifier = modifier.size(256.dp)
+        modifier = modifier.size(controlSize)
             .graphicsLayer { alpha = if (enabled) 1f else 0.45f }
             .testTag("joystick")
             .semantics(mergeDescendants = true) {

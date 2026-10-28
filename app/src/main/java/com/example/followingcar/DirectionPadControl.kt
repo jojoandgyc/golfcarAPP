@@ -26,6 +26,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 
 private enum class PadDirection(val label: String, val symbol: String, val x: Float, val forward: Float) {
     FORWARD("前进", "▲", 0f, 1f),
@@ -41,6 +42,7 @@ internal fun DirectionPadControl(
     onMove: (Float, Float) -> Unit,
     onRelease: () -> Unit,
     modifier: Modifier = Modifier,
+    keySize: Dp = 80.dp,
 ) {
     val held = remember { mutableStateOf<PadDirection?>(null) }
     val latestOnMove = rememberUpdatedState(onMove)
@@ -59,31 +61,31 @@ internal fun DirectionPadControl(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Spacer(Modifier.size(80.dp))
+            Spacer(Modifier.size(keySize))
             DirectionKey(PadDirection.FORWARD, enabled, held.value == PadDirection.FORWARD,
-                held, latestOnMove.value, latestOnRelease.value)
-            Spacer(Modifier.size(80.dp))
+                held, latestOnMove.value, latestOnRelease.value, keySize)
+            Spacer(Modifier.size(keySize))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             DirectionKey(PadDirection.LEFT, enabled, held.value == PadDirection.LEFT,
-                held, latestOnMove.value, latestOnRelease.value)
+                held, latestOnMove.value, latestOnRelease.value, keySize)
             Button(onClick = {
                 if (held.value == null) latestOnRelease.value() else release()
             }, enabled = enabled,
-                modifier = Modifier.size(80.dp).testTag("directionStop"),
+                modifier = Modifier.size(keySize).testTag("directionStop"),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.errorContainer,
                     contentColor = MaterialTheme.colorScheme.onErrorContainer)) {
                 Text("停止")
             }
             DirectionKey(PadDirection.RIGHT, enabled, held.value == PadDirection.RIGHT,
-                held, latestOnMove.value, latestOnRelease.value)
+                held, latestOnMove.value, latestOnRelease.value, keySize)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Spacer(Modifier.size(80.dp))
+            Spacer(Modifier.size(keySize))
             DirectionKey(PadDirection.REVERSE, enabled, held.value == PadDirection.REVERSE,
-                held, latestOnMove.value, latestOnRelease.value)
-            Spacer(Modifier.size(80.dp))
+                held, latestOnMove.value, latestOnRelease.value, keySize)
+            Spacer(Modifier.size(keySize))
         }
     }
 }
@@ -96,12 +98,13 @@ private fun DirectionKey(
     held: androidx.compose.runtime.MutableState<PadDirection?>,
     onMove: (Float, Float) -> Unit,
     onRelease: () -> Unit,
+    keySize: Dp,
 ) {
     val latestOnMove = rememberUpdatedState(onMove)
     val latestOnRelease = rememberUpdatedState(onRelease)
     val colors = MaterialTheme.colorScheme
     Surface(
-        modifier = Modifier.size(80.dp)
+        modifier = Modifier.size(keySize)
             .graphicsLayer { alpha = if (enabled) 1f else 0.45f }
             .testTag("direction${direction.name}")
             .semantics {
