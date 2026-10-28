@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- A tracking pulse above a top-down car. Everything important sits in the adaptive safe zone. -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#5068D8EA"
+        android:strokeWidth="1.5"
+        android:pathData="M26,51 C27,35 37,24 48,21 M60,21 C71,24 81,35 82,51 M81,62 C77,76 66,84 54,85 M54,85 C42,84 31,76 27,62" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#4BDAF1"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.5"
+        android:pathData="M43,32 Q54,22 65,32 M48,37 Q54,31 60,37" />
+    <path
+        android:fillColor="#FFC270"
+        android:pathData="M54,36 a2.5,2.5 0,1 1,0 -5 a2.5,2.5 0,1 1,0 5" />
+    <!-- Side tyres and a bright body edge make the car legible at small launcher sizes. -->
+    <path
+        android:fillColor="#061724"
+        android:strokeColor="#55D7E8"
+        android:strokeWidth="1"
+        android:pathData="M32,52 h5 v17 h-5 q-2,0 -2,-3 v-11 q0,-3 2,-3 Z M71,52 h5 q2,0 2,3 v11 q0,3 -2,3 h-5 Z" />
+    <path
+        android:fillColor="#19B8D5"
+        android:pathData="M43,43 H65 Q70,43 71,49 L74,70 Q74,77 68,79 H40 Q34,77 34,70 L37,49 Q38,43 43,43 Z" />
+    <path
+        android:fillColor="#EEF9FF"
+        android:pathData="M43,41 H65 Q69,41 70,46 L72,69 Q73,74 68,76 H40 Q35,74 36,69 L38,46 Q39,41 43,41 Z" />
+    <path
+        android:fillColor="#164861"
+        android:pathData="M45,47 H63 Q66,47 67,51 L68,57 H40 L41,51 Q42,47 45,47 Z" />
+    <path
+        android:fillColor="#96D9E8"
+        android:pathData="M43,62 H65 L67,69 Q54,72 41,69 Z" />
+    <path
+        android:fillColor="#FFC270"
+        android:pathData="M39,48 L43,45 L44,49 L39,51 Z M69,48 L65,45 L64,49 L69,51 Z" />
+    <path
+        android:fillColor="#0D6378"
+        android:pathData="M42,74 H66 V76 H42 Z" />
+    <path
+        android:fillColor="#45D9E7"
+        android:pathData="M48,81 L54,84 L60,81 L60,83 L54,87 L48,83 Z" />
+</vector>
