@@ -46,7 +46,7 @@ class BoardPagesTest {
     }
 
     @Test
-    fun manualDriveAndParkingViewsFitWithoutPageScrolling() {
+    fun manualDriveParkingAndCameraViewsFitWithoutPageScrolling() {
         compose.onNodeWithTag("pageJoystick").performClick()
         assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
         compose.onNodeWithTag("manualDriveTab").assertIsSelected()
@@ -57,6 +57,11 @@ class BoardPagesTest {
         assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
         compose.onNodeWithTag("parkingSwitch").assertExists()
         compose.onNodeWithTag("parkingCurrent").assertExists()
+        compose.onNodeWithTag("enableDrive").assertIsDisplayed()
+
+        compose.onNodeWithTag("manualCameraTab").performClick()
+        assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithTag("cameraConnectHint").assertIsDisplayed()
         compose.onNodeWithTag("enableDrive").assertIsDisplayed()
 
         compose.onNodeWithTag("manualDriveTab").performClick()

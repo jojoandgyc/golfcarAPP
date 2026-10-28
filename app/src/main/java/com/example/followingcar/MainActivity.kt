@@ -96,6 +96,8 @@ private enum class BoardPage(val label: String, val tag: String) {
     TERMINAL("终端", "pageTerminal"),
 }
 
+private enum class ManualSection { DRIVE, PARKING, CAMERA }
+
 @Composable
 private fun BoardScreen(viewModel: BoardViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -292,7 +294,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
 @Composable
 private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifier: Modifier = Modifier) {
     var useDirectionPad by rememberSaveable { mutableStateOf(false) }
-    var showParking by rememberSaveable { mutableStateOf(false) }
+    var manualSection by rememberSaveable { mutableStateOf(ManualSection.DRIVE) }
     var waitingForModeStop by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
     var showError by remember { mutableStateOf(false) }
@@ -307,13 +309,13 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
         viewModel.releaseJoystick()
         useDirectionPad = directionPad
     }
-    fun chooseManualSection(parking: Boolean) {
-        if (showParking == parking) return
-        if (parking) {
+    fun chooseManualSection(next: ManualSection) {
+        if (manualSection == next) return
+        if (manualSection == ManualSection.DRIVE) {
             waitingForModeStop = state.driveEnabled && !state.driveConfirmedStopped
             viewModel.releaseJoystick()
         }
-        showParking = parking
+        manualSection = next
     }
     val controlling = state.driveEnabled || state.driveStarting || state.driveStopping
     val canAdjustSpeed = !state.parkingUpdating && !state.followBlocksControl &&
@@ -332,14 +334,29 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                 style = MaterialTheme.typography.bodySmall, maxLines = 1,
                 overflow = TextOverflow.Ellipsis)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = !showParking, onClick = { chooseManualSection(false) },
+                FilterChip(selected = manualSection == ManualSection.DRIVE,
+                    onClick = { chooseManualSection(ManualSection.DRIVE) },
                     label = { Text("驾驶") }, modifier = Modifier.testTag("manualDriveTab"))
-                FilterChip(selected = showParking, onClick = { chooseManualSection(true) },
+                FilterChip(selected = manualSection == ManualSection.PARKING,
+                    onClick = { chooseManualSection(ManualSection.PARKING) },
                     label = { Text("驻车") }, modifier = Modifier.testTag("manualParkingTab"))
+                FilterChip(selected = manualSection == ManualSection.CAMERA,
+                    onClick = { chooseManualSection(ManualSection.CAMERA) },
+                    label = { Text("画面") }, modifier = Modifier.testTag("manualCameraTab"))
             }
-            if (showParking) {
+            if (manualSection == ManualSection.PARKING) {
                 Box(Modifier.fillMaxWidth().weight(1f)) {
                     ParkingControls(state, viewModel::setParkingEnabled, viewModel::changeParkingCurrent)
+                }
+            } else if (manualSection == ManualSection.CAMERA) {
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                    if (state.connected) {
+                        BoardCameraPreview(boardHost = state.host, modifier = Modifier.fillMaxSize())
+                    } else {
+                        Text("请先连接开发板；视频服务需在板上手动启动。",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.testTag("cameraConnectHint"))
+                    }
                 }
             } else {
                 Column(Modifier.fillMaxWidth().weight(1f),
@@ -408,7 +425,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
         confirmButton = { TextButton(onClick = { showError = false }) { Text("关闭") } })
     if (showHelp) AlertDialog(onDismissRequest = { showHelp = false },
         title = { Text("手动控制说明") },
-        text = { Text("启用前请退出开发板上的键盘遥控或跟随程序。摇杆上推前进、下拉后退、左右转向，推得越远速度越快。方向键按住行驶，松手停车。切换控制方式或页面会停车；离开 App 会停用手动控制。") },
+        text = { Text("启用前请退出开发板上的键盘遥控或跟随程序。摇杆上推前进、下拉后退、左右转向，推得越远速度越快。方向键按住行驶，松手停车。切换控制方式或页面会停车；离开 App 会停用手动控制。画面页左侧是 RGB、右侧是深度伪彩，视频服务需在开发板上手动启动。") },
         confirmButton = { TextButton(onClick = { showHelp = false }) { Text("关闭") } })
 }
 

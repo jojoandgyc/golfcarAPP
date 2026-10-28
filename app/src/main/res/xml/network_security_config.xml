@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The board address is editable and can be a local IP address. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

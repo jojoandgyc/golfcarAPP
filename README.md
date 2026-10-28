@@ -2,6 +2,15 @@
 
 通过 SSH 连接开发板的 Android 小车控制 App。界面包含连接、自动跟随、手动控制和终端四页；手动控制可切换摇杆或按住操作的方向键。
 
+手动页的“画面”子页显示开发板视频服务提供的拼接画面：左侧 RGB，右侧深度伪彩。先让手机与开发板位于同一热点并在 App 连接开发板，再由用户在开发板上手动启动独立视频服务：
+
+```bash
+cd /home/topeet/Desktop/video
+./scripts/videoctl.sh start
+```
+
+App 读取 `http://<开发板 IP>:8080/preview`，不会启动或停止板端视频服务。画面页提供重连按钮；离开画面页或把 App 切到后台时会释放预览连接。若画面页提示连接失败，先检查板端服务、热点 IP 与 TCP 8080、8889 和 UDP 8189。
+
 ## 构建
 
 使用 Android Studio 打开项目并安装 Android SDK 37，或在配置好 Android SDK 与 JDK 后运行：
