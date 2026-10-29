@@ -11,6 +11,7 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -48,13 +49,20 @@ class BoardSshClient {
     private var generation = 0L
     private var connection: Connection? = null
 
+    val diagnosticConnectionId: String?
+        get() = synchronized(stateLock) { connection?.diagnostic?.connectionId }
+
     val isConnected: Boolean
         get() = synchronized(stateLock) {
             connection?.let { it.ready && it.session.isConnected && !it.socket.isClosed } == true
         }
 
-    suspend fun connect(config: BoardConnection) = withContext(Dispatchers.IO) {
+    suspend fun connect(
+        config: BoardConnection,
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ) = withContext(Dispatchers.IO) {
         operations.withLock {
+            Diagnostics.protectSecret(config.password)
             require(config.host.isNotBlank()) { "请输入开发板地址" }
             require(config.port in 1..65535) { "端口必须在 1 到 65535 之间" }
             require(config.username.isNotBlank()) { "请输入用户名" }
@@ -67,7 +75,16 @@ class BoardSshClient {
                 connection = null
                 generation to old
             }
-            previous?.close()
+            previous?.let {
+                Diagnostics.event("ssh.transport_close", it.diagnostic, source = "replacement", critical = true)
+                it.close()
+            }
+
+            val context = diagnostic.copy(connectionId = UUID.randomUUID().toString())
+            val started = System.nanoTime()
+            Diagnostics.event("ssh.connect_started", context,
+                fields = mapOf("host" to config.host, "port" to config.port,
+                    "generation" to attempt, "timeoutMs" to CONNECT_TIMEOUT_MS), critical = true)
 
             val socket = Socket()
             val jsch = JSch().apply {
@@ -94,7 +111,7 @@ class BoardSshClient {
                     override fun getOutputStream(socket: Socket): OutputStream = socket.getOutputStream()
                 })
             }
-            val candidate = Connection(session, socket)
+            val candidate = Connection(session, socket, context)
             try {
                 currentCoroutineContext().ensureActive()
                 synchronized(stateLock) {
@@ -103,7 +120,7 @@ class BoardSshClient {
                 }
                 // Cancellation closes the socket even while JSch is blocked in connect/authentication.
                 suspendCancellableCoroutine<Unit> { continuation ->
-                    continuation.invokeOnCancellation { closeConnection(candidate) }
+                    continuation.invokeOnCancellation { closeConnection(candidate, "connect_cancelled", context) }
                     try {
                         if (continuation.isActive) {
                             session.connect(CONNECT_TIMEOUT_MS)
@@ -120,14 +137,25 @@ class BoardSshClient {
                     }
                     candidate.ready = true
                 }
+                Diagnostics.event("ssh.connected", context,
+                    fields = mapOf("elapsedMs" to elapsedMillis(started), "generation" to attempt), critical = true)
             } catch (error: Exception) {
-                closeConnection(candidate)
+                if (error is CancellationException) {
+                    Diagnostics.event("ssh.connect_cancelled", context, critical = true)
+                } else {
+                    Diagnostics.failure(context, "ssh.connect_failed", error,
+                        mapOf("phase" to "connect_and_authenticate", "elapsedMs" to elapsedMillis(started)))
+                }
+                closeConnection(candidate, "connect_failed", context)
                 throw error
             }
         }
     }
 
-    suspend fun execute(command: String, timeoutMillis: Long = 15_000L): CommandResult =
+    suspend fun execute(
+        command: String, timeoutMillis: Long = 15_000L, kind: String = "terminal",
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ): CommandResult =
         withContext(Dispatchers.IO) {
             operations.withLock {
                 require(command.isNotBlank()) { "请输入要执行的命令" }
@@ -139,6 +167,11 @@ class BoardSshClient {
                 val stderr = BoundedOutputStream(OUTPUT_LIMIT_PER_STREAM)
                 var channel: ChannelExec? = null
                 val started = System.nanoTime()
+                val context = diagnostic.copy(connectionId = active.diagnostic.connectionId)
+                val category = safeDiagnosticCommandKind(kind)
+                var phase = "channel_open"
+                Diagnostics.event("ssh.exec_started", context, fields = mapOf(
+                    "kind" to category, "commandLength" to command.length, "timeoutMs" to timeoutMillis), critical = true)
                 try {
                     currentCoroutineContext().ensureActive()
                     channel = (active.session.openChannel("exec") as ChannelExec).apply {
@@ -153,7 +186,7 @@ class BoardSshClient {
                     }
                     val execChannel = channel
                     suspendCancellableCoroutine<Unit> { continuation ->
-                        continuation.invokeOnCancellation { closeConnection(active) }
+                        continuation.invokeOnCancellation { closeConnection(active, "exec_open_cancelled", context) }
                         try {
                             if (continuation.isActive) {
                                 execChannel.connect(minOf(timeoutMillis, CHANNEL_TIMEOUT_MS).toInt())
@@ -163,6 +196,9 @@ class BoardSshClient {
                             if (continuation.isActive) continuation.resumeWithException(error)
                         }
                     }
+                    phase = "command_wait"
+                    Diagnostics.event("ssh.channel_opened", context,
+                        fields = mapOf("kind" to category, "elapsedMs" to elapsedMillis(started)))
                     while (!execChannel.isClosed) {
                         currentCoroutineContext().ensureActive()
                         if (!active.session.isConnected || active.socket.isClosed) {
@@ -179,6 +215,11 @@ class BoardSshClient {
                     if (execChannel.exitStatus < 0) {
                         throw IOException("命令通道已关闭，但未收到退出状态，请重新连接")
                     }
+                    Diagnostics.event("ssh.exec_completed", context, fields = mapOf(
+                        "kind" to category, "exitCode" to execChannel.exitStatus,
+                        "elapsedMs" to elapsedMillis(started), "stdoutBytes" to stdout.retainedBytes,
+                        "stderrBytes" to stderr.retainedBytes,
+                        "truncated" to (stdout.truncated || stderr.truncated)), critical = true)
                     CommandResult(
                         command = command,
                         stdout = stdout.text(),
@@ -187,43 +228,71 @@ class BoardSshClient {
                         truncated = stdout.truncated || stderr.truncated,
                     )
                 } catch (error: Exception) {
-                    closeConnection(active)
+                    val fields = mapOf("kind" to category, "phase" to phase,
+                        "elapsedMs" to elapsedMillis(started), "sessionConnected" to active.session.isConnected,
+                        "channelConnected" to channel?.isConnected, "socketClosed" to active.socket.isClosed,
+                        "originalExceptionClass" to error.javaClass.name)
+                    if (error is CancellationException) {
+                        Diagnostics.event("ssh.exec_cancelled", context, fields = fields, critical = true)
+                    } else {
+                        Diagnostics.failure(context, "ssh.exec_failed",
+                            if (category == "terminal") terminalDiagnosticFailure(error) else error, fields)
+                    }
+                    closeConnection(active, "exec_failed", context)
                     throw error
                 } finally {
                     channel?.disconnect()
+                    Diagnostics.event("ssh.channel_closed", context,
+                        fields = mapOf("kind" to category, "phase" to phase), critical = true)
                 }
             }
         }
 
     /** Opens the board's persistent control bridge on the already authenticated SSH session. */
-    suspend fun openDriveChannel(dryRun: Boolean = false): BoardDriveChannel =
+    suspend fun openDriveChannel(
+        dryRun: Boolean = false,
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ): BoardDriveChannel =
         withContext(Dispatchers.IO) {
             operations.withLock {
                 val active = synchronized(stateLock) {
                     connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
                 } ?: throw IOException("尚未连接开发板，请先连接")
-                BoardDriveChannel.open(active.session, dryRun) {
+                val context = diagnostic.copy(connectionId = active.diagnostic.connectionId)
+                BoardDriveChannel.open(active.session, dryRun, context) {
                     // A timed-out write cannot be safely retried. Closing the socket also
                     // unblocks JSch without waiting for its channel/write monitor.
+                    Diagnostics.event("ssh.transport_abort", context, source = "drive_blocking_io_cancelled", critical = true)
                     runCatching { active.socket.close() }
                 }
             }
         }
 
     /** Uses the active joystick session so parking settings share its serial ownership and ACKs. */
-    suspend fun configureParking(channel: BoardDriveChannel, settings: ParkingSettings): DriveAck {
+    suspend fun configureParking(
+        channel: BoardDriveChannel, settings: ParkingSettings,
+        diagnostic: DiagnosticContext = channel.diagnosticContext,
+    ): DriveAck {
         check(isConnected) { "尚未连接开发板，请先连接" }
+        Diagnostics.event("parking.request", diagnostic,
+            fields = mapOf("enabled" to settings.enabled, "currentAmps" to settings.currentAmps), critical = true)
         return channel.configureParking(settings)
     }
 
     /** Read-only: inspect both streaming services and live RGB/depth health without starting them. */
-    suspend fun readVideoServiceState(): VideoServiceState =
-        parseVideoServiceState(execute(videoServiceCommand(), timeoutMillis = 15_000L))
+    suspend fun readVideoServiceState(
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ): VideoServiceState =
+        parseVideoServiceState(execute(videoServiceCommand(), timeoutMillis = 15_000L,
+            kind = "video_inspect", diagnostic = diagnostic))
 
     /** Uses the board's videoctl.sh; success includes readiness or confirmed camera release. */
-    suspend fun setVideoServiceEnabled(enabled: Boolean): VideoServiceState =
+    suspend fun setVideoServiceEnabled(
+        enabled: Boolean, diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ): VideoServiceState =
         requireVideoServiceState(
-            execute(videoServiceCommand(enabled), timeoutMillis = if (enabled) 60_000L else 45_000L),
+            execute(videoServiceCommand(enabled), timeoutMillis = if (enabled) 60_000L else 45_000L,
+                kind = if (enabled) "video_start" else "video_stop", diagnostic = diagnostic),
             enabled,
         )
 
@@ -235,15 +304,20 @@ class BoardSshClient {
      */
     suspend fun readFollowConfiguration(
         camera: FollowCamera, options: FollowLaunchOptions = FollowLaunchOptions(),
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
     ): FollowConfiguration {
-        val result = execute(followConfigurationCommand(camera, options), timeoutMillis = 30_000L)
+        val result = execute(followConfigurationCommand(camera, options), timeoutMillis = 30_000L,
+            kind = "follow_config", diagnostic = diagnostic)
         requireFollowResult(result, "跟随配置检查失败")
         return parseFollowConfiguration(result.stdout, camera)
     }
 
     /** Checks ownership after a lost session without opening devices or restarting a run. */
-    suspend fun readFollowAvailability(): FollowAvailability {
-        val result = execute("python3 -u $FOLLOW_PROJECT_ROOT/app_follow_bridge.py --inspect")
+    suspend fun readFollowAvailability(
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ): FollowAvailability {
+        val result = execute("python3 -u $FOLLOW_PROJECT_ROOT/app_follow_bridge.py --inspect",
+            kind = "follow_availability", diagnostic = diagnostic)
         requireFollowResult(result, "无法检查跟随控制占用")
         return parseFollowAvailability(result.stdout)
     }
@@ -251,12 +325,15 @@ class BoardSshClient {
     suspend fun openFollowChannel(
         camera: FollowCamera, execute: Boolean, dryRun: Boolean = false,
         options: FollowLaunchOptions = FollowLaunchOptions(),
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
     ): BoardFollowChannel = withContext(Dispatchers.IO) {
         operations.withLock {
             val active = synchronized(stateLock) {
                 connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
             } ?: throw IOException("尚未连接开发板，请先连接")
-            BoardFollowChannel.open(active.session, camera, execute, dryRun, options) {
+            val context = diagnostic.copy(connectionId = active.diagnostic.connectionId)
+            BoardFollowChannel.open(active.session, camera, execute, dryRun, options, context) {
+                Diagnostics.event("ssh.transport_abort", context, source = "follow_blocking_io_cancelled", critical = true)
                 runCatching { active.socket.close() }
             }
         }
@@ -271,22 +348,31 @@ class BoardSshClient {
     }
 
     /** Safe to call from another thread to interrupt connection or command execution. */
-    fun disconnect() {
+    fun disconnect(
+        reason: String = "requested",
+        diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ) {
         val old = synchronized(stateLock) {
             generation += 1
             connection.also { connection = null }
         }
-        old?.close()
+        old?.let {
+            Diagnostics.event("ssh.transport_close", diagnostic.copy(connectionId = it.diagnostic.connectionId),
+                source = reason, critical = true)
+            it.close()
+        }
     }
 
-    private fun closeConnection(target: Connection) {
+    private fun closeConnection(target: Connection, reason: String, diagnostic: DiagnosticContext) {
         synchronized(stateLock) {
             if (connection === target) connection = null
         }
+        Diagnostics.event("ssh.transport_close", diagnostic.copy(connectionId = target.diagnostic.connectionId),
+            source = reason, critical = true)
         target.close()
     }
 
-    private class Connection(val session: Session, val socket: Socket) {
+    private class Connection(val session: Session, val socket: Socket, val diagnostic: DiagnosticContext) {
         var ready = false // Accessed only under stateLock.
 
         fun close() {
@@ -317,6 +403,9 @@ internal class BoundedOutputStream(private val limit: Int) : OutputStream() {
     var truncated: Boolean = false
         private set
 
+    val retainedBytes: Int
+        @Synchronized get() = bytes.size()
+
     init {
         require(limit >= 0)
     }
@@ -337,3 +426,23 @@ internal class BoundedOutputStream(private val limit: Int) : OutputStream() {
     @Synchronized
     fun text(): String = bytes.toString(Charsets.UTF_8.name())
 }
+
+/** Never let caller-provided command labels or terminal exceptions leak command contents. */
+internal fun safeDiagnosticCommandKind(kind: String): String = when (kind) {
+    "board_status", "memory", "disk", "network", "video_inspect", "video_start", "video_stop",
+    "follow_config", "follow_availability" -> kind
+    else -> "terminal"
+}
+
+internal fun terminalDiagnosticFailure(error: Throwable): Throwable =
+    IOException("终端操作异常（${error.javaClass.name}）；命令正文和输出不写入日志").apply {
+        stackTrace = error.stackTrace
+    }
+
+/** Android JSON exception messages may contain the rejected field or complete input. */
+internal fun protocolDiagnosticFailure(error: Exception): Exception =
+    if (error is org.json.JSONException) IOException("开发板控制响应字段格式无效").apply {
+        stackTrace = error.stackTrace
+    } else error
+
+internal fun elapsedMillis(started: Long): Long = (System.nanoTime() - started) / 1_000_000

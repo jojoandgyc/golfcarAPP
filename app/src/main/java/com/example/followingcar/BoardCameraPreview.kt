@@ -127,6 +127,7 @@ internal fun BoardCameraPreview(
 @Suppress("DEPRECATION")
 private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit, modifier: Modifier) {
     val host = boardHost.trim()
+    val diagnostic = remember(host) { Diagnostics.newContext() }
     if (!isBoardIpv4(host)) {
         Text("请先在连接页填写开发板的 IPv4 地址。", modifier,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -186,6 +187,8 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
                     error: WebResourceError) {
                     if (request.isForMainFrame && request.url.toString() == currentUrl.value) {
                         pageFailed = true
+                        Diagnostics.event("video.player.load_failed", diagnostic,
+                            fields = mapOf("errorCode" to error.errorCode, "host" to currentHost.value), critical = true)
                         currentOnStatusChange.value("画面连接失败，可重连")
                     }
                 }
@@ -194,12 +197,16 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
                     errorResponse: WebResourceResponse) {
                     if (request.isForMainFrame && request.url.toString() == currentUrl.value) {
                         pageFailed = true
+                        Diagnostics.event("video.player.http_failed", diagnostic,
+                            fields = mapOf("httpStatus" to errorResponse.statusCode), critical = true)
                         currentOnStatusChange.value("视频服务返回 HTTP ${errorResponse.statusCode}")
                     }
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
                     if (url == currentUrl.value && !pageFailed) {
+                        Diagnostics.event("video.player.page_loaded", diagnostic,
+                            fields = mapOf("width" to view.width, "height" to view.height))
                         currentOnStatusChange.value("播放器已加载")
                     }
                 }
@@ -220,11 +227,13 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
     }
     LaunchedEffect(webView, foreground, previewUrl) {
         if (foreground) {
+            Diagnostics.event("video.player.load_started", diagnostic, fields = mapOf("host" to host))
             pageFailed = false
             currentOnStatusChange.value("正在连接画面…")
             webView.onResume()
             webView.loadUrl(previewUrl)
         } else {
+            Diagnostics.event("video.player.paused", diagnostic)
             // Unloading closes the page's WebRTC connection.
             webView.loadUrl("about:blank")
             webView.onPause()
@@ -233,6 +242,7 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
     }
     DisposableEffect(webView) {
         onDispose {
+            Diagnostics.event("video.player.disposed", diagnostic)
             webView.stopLoading()
             webView.loadUrl("about:blank")
             webView.onPause()

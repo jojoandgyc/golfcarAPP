@@ -10,6 +10,7 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -29,13 +30,20 @@ class BoardFollowChannel private constructor(
     private val output: OutputStream,
     private val stderr: BoundedOutputStream,
     private val abortTransport: () -> Unit,
+    diagnostic: DiagnosticContext,
 ) {
+    var diagnosticContext: DiagnosticContext = diagnostic
+        private set
     private val transaction = Mutex()
     private val closed = AtomicBoolean(false)
     private val blockingIo = AtomicBoolean(false)
     private var token = ""
     private var sequence = 0L
     private var startSent = false
+    @Volatile private var phase = "created"
+    @Volatile private var currentCommand = "open"
+    @Volatile private var lastAckSequence = 0L
+    @Volatile private var lastAckNanos = 0L
     lateinit var ready: FollowReady
         private set
 
@@ -54,8 +62,11 @@ class BoardFollowChannel private constructor(
     suspend fun requestStop(): FollowReply = transact("stop")
 
     /** EOF asks the supervisor to stop; a lost network also expires the board-side lease. */
-    fun close() {
+    fun close(reason: String = "requested") {
         if (!closed.compareAndSet(false, true)) return
+        Diagnostics.event("follow.channel_close", diagnosticContext, source = reason,
+            fields = diagnosticFields() + mapOf("closeScope" to if (blockingIo.get()) "transport" else "channel"),
+            critical = true)
         if (blockingIo.get()) abortTransport()
         cleanup.execute {
             runCatching { channel.disconnect() }
@@ -65,6 +76,9 @@ class BoardFollowChannel private constructor(
 
     private suspend fun transact(command: String): FollowReply = withContext(Dispatchers.IO) {
         check(transaction.tryLock()) { "上一个跟随指令尚未收到回执" }
+        val started = System.nanoTime()
+        currentCommand = command
+        phase = "check_open"
         try {
             check(isOpen) { "跟随通道已关闭，运行状态未确认" }
             val result = withTimeout(ACK_TIMEOUT_MS) {
@@ -74,11 +88,17 @@ class BoardFollowChannel private constructor(
                 val previousToken = token
                 val request = JSONObject().put("seq", sentSequence).put("token", previousToken)
                     .put("runId", ready.runId).put("cmd", command)
+                phase = "write"
+                Diagnostics.event("follow.request_send", diagnosticContext,
+                    fields = mapOf("commandType" to command, "seq" to sentSequence, "timeoutMs" to ACK_TIMEOUT_MS),
+                    critical = command != "heartbeat")
                 blockingCall {
                     output.write((request.toString() + "\n").toByteArray(Charsets.UTF_8))
                     output.flush()
                 }
+                phase = "ack_wait"
                 val reply = readMessage()
+                phase = "ack_validate"
                 requireMessage(reply.opt("type") == "ack", "开发板返回了未知跟随响应")
                 val replySequence = reply.opt("seq")
                 requireMessage((replySequence is Int || replySequence is Long) &&
@@ -96,16 +116,41 @@ class BoardFollowChannel private constructor(
                         "跟随进程结束回执不一致")
                 }
                 token = nextToken
+                lastAckSequence = sentSequence
+                lastAckNanos = System.nanoTime()
+                Diagnostics.event("follow.ack", diagnosticContext, fields = mapOf(
+                    "commandType" to command, "seq" to sentSequence, "elapsedMs" to elapsedMillis(started),
+                    "terminal" to terminal, "runState" to status.runState,
+                    "processExited" to status.processExited, "stopRequested" to status.stopRequested,
+                    "stopAcknowledged" to status.stopAcknowledged, "statusAgeMs" to status.statusAgeMs),
+                    critical = terminal == true || command != "heartbeat" || status.fault != null)
+                status.fault?.let { fault ->
+                    Diagnostics.failure(diagnosticContext, "follow.board_fault", IOException(fault),
+                        diagnosticFields())
+                }
+                phase = "idle"
                 FollowReply(status, terminal as Boolean)
             }
-            if (result.terminal) close()
+            if (result.terminal) close("terminal_ack")
             result
         } catch (timeout: TimeoutCancellationException) {
-            close()
-            throw SocketTimeoutException("跟随回执超时；板端将请求停止，车辆状态未确认")
-        } catch (failure: Exception) {
-            close()
+            val failure = SocketTimeoutException("跟随回执超时；板端将请求停止，车辆状态未确认")
+            Diagnostics.failure(diagnosticContext, "follow.ack_timeout", failure,
+                diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to ACK_TIMEOUT_MS))
+            close("ack_timeout")
             throw failure
+        } catch (failure: Exception) {
+            val safeFailure = protocolDiagnosticFailure(failure)
+            if (failure is CancellationException) {
+                Diagnostics.event("follow.transaction_cancelled", diagnosticContext,
+                    fields = diagnosticFields(), critical = true)
+            } else {
+                Diagnostics.failure(diagnosticContext, "follow.transaction_failed", safeFailure,
+                    diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started),
+                        "originalExceptionClass" to failure.javaClass.name))
+            }
+            close(if (failure is CancellationException) "transaction_cancelled" else "transaction_failed")
+            throw safeFailure
         } finally {
             transaction.unlock()
         }
@@ -123,7 +168,11 @@ class BoardFollowChannel private constructor(
                     val message = try {
                         JSONObject(bytes.toString(Charsets.UTF_8.name()))
                     } catch (failure: Exception) {
-                        throw IOException("开发板跟随响应不是有效 JSON", failure)
+                        // A parser's exception can echo the raw protocol, including its token.
+                        Diagnostics.event("follow.protocol_error", diagnosticContext,
+                            fields = diagnosticFields() + mapOf("protocolStage" to "invalid_json"),
+                            critical = true)
+                        throw IOException("开发板跟随响应不是有效 JSON")
                     }
                     if (message.opt("type") == "error") {
                         throw IOException(message.optString("error", "开发板跟随程序报错").take(600))
@@ -139,6 +188,7 @@ class BoardFollowChannel private constructor(
     }
 
     private fun endedError(): IOException {
+        Diagnostics.event("follow.eof", diagnosticContext, fields = diagnosticFields(), critical = true)
         val detail = stderr.text().trim().take(600)
         return IOException(if (detail.isNotBlank()) "跟随控制程序退出：$detail"
             else "跟随控制通道已结束，未确认车辆停止；请检查控制占用")
@@ -146,9 +196,12 @@ class BoardFollowChannel private constructor(
 
     private suspend fun blockingCall(action: () -> Unit) {
         suspendCancellableCoroutine<Unit> { continuation ->
-            continuation.invokeOnCancellation {
+            continuation.invokeOnCancellation { cause ->
+                Diagnostics.event("follow.blocking_io_cancelled", diagnosticContext,
+                    fields = diagnosticFields() + mapOf("causeClass" to cause?.javaClass?.name,
+                        "closeScope" to "transport"), critical = true)
                 abortTransport()
-                close()
+                close("blocking_io_cancelled")
             }
             blockingIo.set(true)
             try {
@@ -169,11 +222,24 @@ class BoardFollowChannel private constructor(
     private fun readToken(message: JSONObject): String {
         val value = message.opt("token")
         requireMessage(value is String && value.matches(Regex("[0-9a-f]{32}")), "跟随控制令牌无效")
-        return value as String
+        return (value as String).also(Diagnostics::protectSecret)
     }
 
+    private fun diagnosticFields(): Map<String, Any?> = mapOf(
+        "phase" to phase, "commandType" to currentCommand, "seq" to sequence,
+        "lastAckSeq" to lastAckSequence,
+        "lastAckAgeMs" to if (lastAckNanos == 0L) null else elapsedMillis(lastAckNanos),
+        "channelConnected" to channel.isConnected, "channelClosed" to channel.isClosed,
+        "channelEof" to channel.isEOF, "blockingIo" to blockingIo.get(),
+    )
+
     private fun requireMessage(condition: Boolean, message: String) {
-        if (!condition) throw IOException(message)
+        if (!condition) {
+            Diagnostics.event("follow.protocol_error", diagnosticContext,
+                fields = diagnosticFields() + mapOf("protocolStage" to "validation", "reason" to message),
+                critical = true)
+            throw IOException(message)
+        }
     }
 
     internal companion object {
@@ -187,44 +253,74 @@ class BoardFollowChannel private constructor(
         suspend fun open(
             session: Session, camera: FollowCamera, execute: Boolean, dryRun: Boolean,
             options: FollowLaunchOptions,
+            diagnostic: DiagnosticContext,
             abortTransport: () -> Unit,
         ): BoardFollowChannel = withContext(Dispatchers.IO) {
             options.validate(camera)
-            val channel = (session.openChannel("exec") as ChannelExec).apply {
-                setCommand("python3 -u $FOLLOW_PROJECT_ROOT/app_follow_bridge.py --camera ${camera.argument}" +
-                    followLaunchArguments(options) +
-                    (if (execute) " --execute" else "") + (if (dryRun) " --dry-run" else ""))
-                setPty(false)
-                setAgentForwarding(false)
-                setInputStream(null)
-            }
-            val stderr = BoundedOutputStream(4096)
-            channel.setErrStream(stderr, true)
-            val control = BoardFollowChannel(channel, channel.inputStream, channel.outputStream, stderr, abortTransport)
+            val started = System.nanoTime()
+            var opened: BoardFollowChannel? = null
+            Diagnostics.event("follow.channel_open_requested", diagnostic,
+                fields = mapOf("camera" to camera.argument, "execute" to execute,
+                    "dryRun" to dryRun, "timeoutMs" to START_TIMEOUT_MS), critical = true)
             try {
+                val channel = (session.openChannel("exec") as ChannelExec).apply {
+                    setCommand("python3 -u $FOLLOW_PROJECT_ROOT/app_follow_bridge.py --camera ${camera.argument}" +
+                        followLaunchArguments(options) +
+                        (if (execute) " --execute" else "") + (if (dryRun) " --dry-run" else ""))
+                    setPty(false)
+                    setAgentForwarding(false)
+                    setInputStream(null)
+                }
+                val stderr = BoundedOutputStream(4096)
+                channel.setErrStream(stderr, true)
+                val control = BoardFollowChannel(channel, channel.inputStream, channel.outputStream,
+                    stderr, abortTransport, diagnostic).also { opened = it }
                 withTimeout(START_TIMEOUT_MS) {
+                    control.phase = "channel_open"
                     control.blockingCall { channel.connect(START_TIMEOUT_MS.toInt()) }
+                    control.phase = "ready_wait"
+                    Diagnostics.event("follow.channel_opened", diagnostic,
+                        fields = mapOf("elapsedMs" to elapsedMillis(started)))
                     val reply = control.readMessage()
+                    control.phase = "ready_validate"
                     control.requireMessage(reply.opt("type") == "ready", "开发板跟随服务未就绪")
                     control.token = control.readToken(reply)
                     val runId = reply.opt("runId")
                     control.requireMessage(runId is String && runId.isNotBlank() && runId.length <= 128,
                         "跟随会话标识无效")
+                    control.diagnosticContext = diagnostic.copy(runId = runId as String)
                     control.requireMessage(reply.opt("dryRun") == dryRun && reply.opt("execute") == execute &&
                         reply.opt("camera") == camera.argument, "开发板跟随模式或相机不匹配")
                     control.requireMessage(reply.optJSONObject("options")?.matches(options) == true,
                         "开发板跟随参数与 App 选择不一致，请更新车端桥接脚本")
                     control.requireMessage(reply.opt("heartbeatMs") == 500 && reply.opt("watchdogMs") == 2000,
                         "开发板跟随心跳参数不匹配")
-                    control.ready = FollowReady(runId as String, dryRun, execute, camera)
+                    control.ready = FollowReady(runId, dryRun, execute, camera)
+                    control.phase = "idle"
+                    Diagnostics.event("follow.ready", control.diagnosticContext,
+                        fields = mapOf("camera" to camera.argument, "execute" to execute, "dryRun" to dryRun,
+                            "elapsedMs" to elapsedMillis(started)), critical = true)
                     control
                 }
             } catch (timeout: TimeoutCancellationException) {
-                control.close()
-                throw SocketTimeoutException("跟随服务连接超时，请检查开发板脚本")
-            } catch (failure: Exception) {
-                control.close()
+                val failure = SocketTimeoutException("跟随服务连接超时，请检查开发板脚本")
+                Diagnostics.failure(opened?.diagnosticContext ?: diagnostic, "follow.open_timeout", failure,
+                    (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
+                        mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to START_TIMEOUT_MS))
+                opened?.close("open_timeout")
                 throw failure
+            } catch (failure: Exception) {
+                val safeFailure = protocolDiagnosticFailure(failure)
+                val fields = (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
+                    mapOf("elapsedMs" to elapsedMillis(started), "originalExceptionClass" to failure.javaClass.name)
+                if (failure is CancellationException) {
+                    Diagnostics.event("follow.open_cancelled", opened?.diagnosticContext ?: diagnostic,
+                        fields = fields, critical = true)
+                } else {
+                    Diagnostics.failure(opened?.diagnosticContext ?: diagnostic, "follow.open_failed", safeFailure, fields)
+                }
+                opened?.close(if (failure is CancellationException) "open_cancelled" else "open_failed")
+                throw safeFailure
             }
         }
     }

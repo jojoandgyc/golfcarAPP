@@ -263,8 +263,11 @@ class WorkerTests(unittest.TestCase):
 
 class ProcessTests(unittest.TestCase):
     def start(self, *arguments):
+        diagnostic_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(diagnostic_directory.cleanup)
         p = subprocess.Popen([sys.executable, "-u", str(SCRIPT), "--dry-run", *arguments],
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=dict(os.environ, APP_FOLLOW_DIAGNOSTIC_TEST_DIR=diagnostic_directory.name))
         def cleanup():
             if p.poll() is None:
                 with contextlib.suppress(Exception):

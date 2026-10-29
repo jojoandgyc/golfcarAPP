@@ -41,6 +41,7 @@ data class BoardUiState(
     val driveStatus: String = "手动控制未启用",
     val drivePort: String = "自动检测串口",
     val driveError: String? = null,
+    val driveFirstFailure: DiagnosticFailure? = null,
     val speedLimit: Int = 50,
     val driveLeft: Int = 0,
     val driveRight: Int = 0,
@@ -65,6 +66,7 @@ data class BoardUiState(
     val followStatus: FollowStatus? = null,
     val followMessage: String = "尚未启动自动跟随",
     val followError: String? = null,
+    val followFirstFailure: DiagnosticFailure? = null,
 ) {
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followUncertain
@@ -86,6 +88,13 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("board_connection", 0)
     private val credentialPreferences = application.getSharedPreferences("board_credentials", 0)
     private val client = BoardSshClient()
+    private val ownerDiagnostic = Diagnostics.newContext()
+    private var followDiagnostic = DiagnosticContext(preferences.getString("last_follow_operation", null)
+        ?: Diagnostics.newContext().operationId)
+    private var driveDiagnostic = DiagnosticContext(preferences.getString("last_drive_operation", null)
+        ?: Diagnostics.newContext().operationId)
+    private var firstFollowStopSource: ControlStopSource? = null
+    private var firstDriveStopSource: ControlStopSource? = null
     private val mutableState = MutableStateFlow(
         BoardUiState(
             host = preferences.getString("host", null) ?: "172.16.16.82",
@@ -118,12 +127,38 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val followWakeup = Channel<Unit>(Channel.CONFLATED)
 
     init {
+        Diagnostics.event("viewmodel.created", ownerDiagnostic)
+        viewModelScope.launch {
+            Diagnostics.failures.collect { failures ->
+                val followFailure = failures.firstOrNull { it.context.operationId == followDiagnostic.operationId }
+                val driveFailure = failures.firstOrNull { it.context.operationId == driveDiagnostic.operationId }
+                followFailure?.let {
+                    followDiagnostic = followDiagnostic.copy(
+                        connectionId = followDiagnostic.connectionId ?: it.context.connectionId,
+                        runId = followDiagnostic.runId ?: it.context.runId,
+                    )
+                }
+                driveFailure?.let {
+                    driveDiagnostic = driveDiagnostic.copy(
+                        connectionId = driveDiagnostic.connectionId ?: it.context.connectionId,
+                        runId = driveDiagnostic.runId ?: it.context.runId,
+                    )
+                }
+                mutableState.update { it.copy(
+                    followFirstFailure = followFailure
+                        ?: it.followFirstFailure?.takeIf { f -> f.context.operationId == followDiagnostic.operationId },
+                    driveFirstFailure = driveFailure
+                        ?: it.driveFirstFailure?.takeIf { f -> f.context.operationId == driveDiagnostic.operationId },
+                ) }
+            }
+        }
         viewModelScope.launch {
             while (true) {
                 delay(2000)
                 if (state.value.connected && !state.value.busy && !client.isConnected) {
-                    disableDrive("SSH 连接中断")
-                    stopFollow("SSH 连接中断，正在请求结束跟随")
+                    Diagnostics.event("connection.lost", activeDiagnostic(), critical = true)
+                    disableDrive("SSH 连接中断", source = ControlStopSource.TRANSPORT_LOST)
+                    stopFollow("SSH 连接中断，正在请求结束跟随", ControlStopSource.TRANSPORT_LOST)
                     mutableState.update {
                         it.copy(connected = false, status = "连接已断开", error = "连接中断，请检查 Wi-Fi 后重新连接。",
                             videoServiceState = VideoServiceState.UNKNOWN,
@@ -132,6 +167,18 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+    }
+
+    private fun activeDiagnostic(): DiagnosticContext = when {
+        state.value.followActive -> followDiagnostic
+        state.value.manualActive -> driveDiagnostic
+        else -> ownerDiagnostic.copy(connectionId = client.diagnosticConnectionId)
+    }
+
+    fun recordUiEvent(event: String, detail: String? = null) {
+        Diagnostics.event(event, activeDiagnostic(), fields = mapOf("detail" to detail,
+            "ownerId" to ownerDiagnostic.operationId, "followActive" to state.value.followActive,
+            "manualActive" to state.value.manualActive))
     }
 
     fun updateHost(value: String) = editConnection { copy(host = value) }
@@ -146,6 +193,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun permissionDenied() {
+        Diagnostics.event("connection.permission_denied", ownerDiagnostic, critical = true)
         mutableState.update { it.copy(error = "请允许访问本地网络，App 才能连接开发板。") }
     }
 
@@ -162,6 +210,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             mutableState.update { it.copy(error = "请填写开发板 IP、用户名、密码，以及 1–65535 范围内的端口。") }
             return
         }
+        val diagnostic = Diagnostics.newContext()
+        Diagnostics.protectSecret(input.password)
+        Diagnostics.event("connection.requested", diagnostic, source = "USER_CONNECT",
+            fields = mapOf("host" to host, "port" to port))
         mutableState.update {
             it.copy(host = host, username = username, busy = true, error = null, result = null,
                 followConfiguration = null, followConfigurationError = null, status = "正在连接…",
@@ -173,22 +225,26 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 withInitialConnectionRetry(onRetry = { attempt ->
                     connectionAttempts = attempt
+                    Diagnostics.event("connection.retry", diagnostic, fields = mapOf("attempt" to attempt))
                     mutableState.update { it.copy(status = "正在重新连接（$attempt/2）…") }
                 }) {
-                    client.connect(BoardConnection(host, port, username, input.password))
+                    client.connect(BoardConnection(host, port, username, input.password), diagnostic)
                 }
                 sshEstablished = true
                 preferences.edit().putString("host", host).putString("port", port.toString())
                     .putString("username", username).apply()
                 credentialPreferences.edit().putString("password", input.password).apply()
                 mutableState.update { it.copy(connected = true, status = "正在读取开发板信息…") }
-                val result = client.execute(BOARD_STATUS_COMMAND)
+                val result = client.execute(BOARD_STATUS_COMMAND, kind = "board_status", diagnostic = diagnostic)
                 mutableState.update { it.copy(result = result, status = "已连接") }
                 refreshVideoServiceState()
             } catch (cancelled: CancellationException) {
+                Diagnostics.event("connection.cancelled", diagnostic, critical = true)
                 throw cancelled
             } catch (failure: Exception) {
-                withContext(Dispatchers.IO) { client.disconnect() }
+                Diagnostics.failure(diagnostic, "connection.failed", failure,
+                    mapOf("sshEstablished" to sshEstablished, "attempts" to connectionAttempts))
+                withContext(Dispatchers.IO) { client.disconnect("connection_failed", diagnostic) }
                 mutableState.update {
                     it.copy(connected = false, status = "连接失败",
                         error = describeFailure(failure, connecting = !sshEstablished, attempts = connectionAttempts))
@@ -202,16 +258,22 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun execute(command: String = state.value.command) {
         if (!state.value.connected || state.value.busy || state.value.videoServiceBusy || state.value.driveStarting ||
             state.value.driveEnabled || state.value.driveStopping || state.value.followBlocksControl || command.isBlank()) return
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        Diagnostics.event("terminal.requested", diagnostic, fields = mapOf("commandLength" to command.length))
         mutableState.update { it.copy(busy = true, error = null, result = null, status = "正在执行…") }
         operation = viewModelScope.launch {
             try {
-                val result = client.execute(command.trim())
+                val result = client.execute(command.trim(), diagnostic = diagnostic)
+                Diagnostics.event("terminal.completed", diagnostic, fields = mapOf("exitCode" to result.exitCode))
                 mutableState.update {
                     it.copy(result = result, status = "已连接", error = if (result.exitCode != 0) "命令返回退出码 ${result.exitCode}，请查看下方输出。" else null)
                 }
             } catch (cancelled: CancellationException) {
+                Diagnostics.event("terminal.cancelled", diagnostic)
                 throw cancelled
             } catch (failure: Exception) {
+                // The transport records a sanitized exception; terminal contents are never logged.
+                Diagnostics.event("terminal.failed", diagnostic, fields = mapOf("exceptionType" to failure.javaClass.name), critical = true)
                 mutableState.update {
                     it.copy(connected = client.isConnected, status = if (client.isConnected) "已连接" else "连接已断开", error = describeFailure(failure))
                 }
@@ -223,11 +285,13 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setVideoServiceEnabled(enabled: Boolean) {
         if (disconnecting || !state.value.canToggleVideoService) return
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        Diagnostics.event("video.requested", diagnostic, source = "USER_VIDEO", fields = mapOf("enabled" to enabled))
         mutableState.update { it.copy(videoServiceBusy = true, videoServiceError = null,
             videoServiceMessage = if (enabled) "正在开启视频…" else "正在关闭视频…") }
         videoServiceJob = viewModelScope.launch {
             try {
-                changeVideoService(enabled)
+                changeVideoService(enabled, diagnostic)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -237,9 +301,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun refreshVideoServiceState() = videoServiceMutex.withLock {
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         mutableState.update { it.copy(videoServiceBusy = true, videoServiceMessage = "正在读取视频服务状态…") }
         try {
-            val videoState = client.readVideoServiceState()
+            val videoState = client.readVideoServiceState(diagnostic)
+            Diagnostics.event("video.inspected", diagnostic, fields = mapOf("videoState" to videoState.name))
             mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
                 videoServiceMessage = when (videoState) {
                     VideoServiceState.RUNNING -> "视频服务已开启"
@@ -249,22 +315,29 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
+            Diagnostics.failure(diagnostic, "video.inspect_failed", failure)
             recordVideoServiceFailure(failure)
         } finally {
             mutableState.update { it.copy(videoServiceBusy = false) }
         }
     }
 
-    private suspend fun changeVideoService(enabled: Boolean) = videoServiceMutex.withLock {
+    private suspend fun changeVideoService(enabled: Boolean,
+        diagnostic: DiagnosticContext = Diagnostics.newContext(client.diagnosticConnectionId),
+    ) = videoServiceMutex.withLock {
+        Diagnostics.event("video.change_started", diagnostic, fields = mapOf("enabled" to enabled))
         mutableState.update { it.copy(videoServiceBusy = true, videoServiceError = null,
             videoServiceMessage = if (enabled) "正在开启视频…" else "正在关闭视频…") }
         try {
             check(client.isConnected) { "SSH 已断开，无法确认视频服务状态，请重连后关闭视频。" }
-            val videoState = client.setVideoServiceEnabled(enabled)
+            val videoState = client.setVideoServiceEnabled(enabled, diagnostic)
+            Diagnostics.event("video.change_confirmed", diagnostic, fields = mapOf("videoState" to videoState.name))
             mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
                 videoServiceMessage = if (enabled) "视频服务已开启" else "视频服务已关闭",
                 videoPreviewRevision = if (enabled) it.videoPreviewRevision + 1 else it.videoPreviewRevision) }
         } catch (failure: Exception) {
+            if (failure !is CancellationException) Diagnostics.failure(diagnostic, "video.change_failed", failure)
+            else Diagnostics.event("video.change_cancelled", diagnostic, critical = true)
             recordVideoServiceFailure(failure)
             throw failure
         } finally {
@@ -281,22 +354,26 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         if (disconnecting) return
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        Diagnostics.event("connection.disconnect_requested", diagnostic, source = ControlStopSource.DISCONNECT.name, critical = true)
         disconnecting = true
         val previous = operation
         previous?.cancel()
         mutableState.update { it.copy(busy = true, status = "正在断开…") }
         operation = viewModelScope.launch {
-            disableDrive("连接已断开")
-            stopFollow("正在停止跟随后断开连接…")
+            disableDrive("连接已断开", source = ControlStopSource.DISCONNECT)
+            stopFollow("正在停止跟随后断开连接…", ControlStopSource.DISCONNECT)
             // A follow startup may still be releasing the camera. Let that bounded service
             // command finish; a pending stop prevents any late follow runtime start.
             if (followChannel == null) followJob?.join()
             val followFinished = withTimeoutOrNull(12_000L) { followJob?.join(); true } == true
             if (!followFinished) {
-                followChannel?.close()
+                val failure = SocketTimeoutException("断开等待超时，跟随进程退出未确认")
+                val first = Diagnostics.failure(followDiagnostic, "follow.disconnect_timeout", failure)
+                followChannel?.close("disconnect_timeout")
                 followJob?.cancel()
                 mutableState.update {
-                    it.copy(followUncertain = true, followMessage = "断开等待超时，跟随进程退出未确认",
+                    it.copy(followUncertain = true, followFirstFailure = first, followMessage = "断开等待超时，跟随进程退出未确认",
                         followError = "车端将按会话超时请求停止；请检查进程和车辆状态。")
                 }
             }
@@ -305,19 +382,22 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             if (client.isConnected && state.value.videoServiceState != VideoServiceState.STOPPED) {
                 try { changeVideoService(false) } catch (_: Exception) { /* Keep the failure visible. */ }
             }
-            withContext(Dispatchers.IO) { client.disconnect() }
+            withContext(Dispatchers.IO) { client.disconnect("user_disconnect", diagnostic) }
             withTimeoutOrNull(1_000L) { followJob?.join() }
             previous?.join()
             disconnecting = false
             mutableState.update { it.copy(connected = false, busy = false, status = "已断开", error = null) }
+            Diagnostics.event("connection.disconnect_completed", diagnostic, critical = true)
         }
     }
 
     override fun onCleared() {
+        Diagnostics.event("viewmodel.cleared", activeDiagnostic(), source = ControlStopSource.VIEW_MODEL_CLEARED.name,
+            fields = mapOf("ownerId" to ownerDiagnostic.operationId), critical = true)
         desiredWheels = WheelSpeeds()
-        driveChannel?.close()
-        followChannel?.close()
-        client.disconnect()
+        driveChannel?.close("viewmodel_cleared")
+        followChannel?.close("viewmodel_cleared")
+        client.disconnect("viewmodel_cleared", activeDiagnostic())
         super.onCleared()
     }
 
@@ -325,12 +405,17 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun enableDrive(dryRun: Boolean = false) {
         val current = state.value
         if (disconnecting || !current.canEnableDrive) return
+        driveDiagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        preferences.edit().putString("last_drive_operation", driveDiagnostic.operationId).apply()
+        firstDriveStopSource = null
+        Diagnostics.event("drive.start_requested", driveDiagnostic, source = "USER_START",
+            fields = mapOf("dryRun" to dryRun, "speedLimit" to current.speedLimit), critical = true)
         desiredWheels = WheelSpeeds()
         stopRequest = null
         pendingParking = null
         while (driveWakeup.tryReceive().isSuccess) { /* Discard signals from the previous session. */ }
         mutableState.update {
-            it.copy(driveStarting = true, driveConfirmedStopped = false, driveError = null,
+            it.copy(driveStarting = true, driveConfirmedStopped = false, driveError = null, driveFirstFailure = null,
                 driveStatus = "正在开启视频…", parkingSupported = false, parkingSettings = null,
                 parkingUpdating = false, parkingStatus = "正在读取驻车设置…")
         }
@@ -338,16 +423,20 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             var channel: BoardDriveChannel? = null
             var parkingCleared = false
             try {
-                if (stopRequest == null) changeVideoService(true)
+                if (stopRequest == null) changeVideoService(true, driveDiagnostic)
                 if (stopRequest != null) {
+                    Diagnostics.event("drive.start_cancelled", driveDiagnostic,
+                        source = firstDriveStopSource?.name, critical = true)
                     // Do not open the motor bridge after a stop received during video startup.
                     mutableState.update { it.copy(driveConfirmedStopped = true, driveStatus = stopReason) }
                     return@launch
                 }
                 mutableState.update { it.copy(driveStatus = "正在检测电机…") }
-                val activeChannel = client.openDriveChannel(dryRun)
+                val activeChannel = client.openDriveChannel(dryRun, driveDiagnostic)
                 channel = activeChannel
                 driveChannel = activeChannel
+                driveDiagnostic = activeChannel.diagnosticContext
+                Diagnostics.event("drive.ready", driveDiagnostic, fields = mapOf("dryRun" to activeChannel.ready.dryRun))
                 if (stopRequest == null) {
                     mutableState.update {
                         it.copy(driveStarting = false, driveEnabled = true, driveConfirmedStopped = true,
@@ -362,8 +451,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 while (true) {
                     val requestedStop = stopRequest
                     if (requestedStop != null) {
+                        Diagnostics.event("drive.stop_sending", driveDiagnostic, source = firstDriveStopSource?.name,
+                            fields = mapOf("stopKind" to requestedStop), critical = true)
                         if (requestedStop == "estop") activeChannel.exchange(0, 0, emergency = true)
                         else activeChannel.stopAndClose()
+                        Diagnostics.event("drive.stop_acknowledged", driveDiagnostic, critical = true)
                         parkingCleared = activeChannel.ready.parkingSupported
                         mutableState.update { it.copy(driveConfirmedStopped = true, driveStatus = stopReason) }
                         break
@@ -373,8 +465,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     val requestedParking = pendingParking
                     if (requestedParking != null) {
                         check(desiredWheels.stopped && state.value.driveConfirmedStopped) { "请先停车再设置驻车" }
-                        val ack = client.configureParking(activeChannel, requestedParking)
+                        val ack = client.configureParking(activeChannel, requestedParking, driveDiagnostic)
                         check(ack.stopped && ack.parking == requestedParking) { "开发板驻车设置回执不一致" }
+                        Diagnostics.event("parking.confirmed", driveDiagnostic,
+                            fields = mapOf("enabled" to requestedParking.enabled, "currentAmps" to requestedParking.currentAmps), critical = true)
                         pendingParking = null
                         mutableState.update {
                             it.copy(parkingSettings = ack.parking, parkingUpdating = false,
@@ -395,15 +489,17 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     withTimeoutOrNull(100L) { driveWakeup.receive() }
                 }
             } catch (cancelled: CancellationException) {
+                Diagnostics.event("drive.cancelled", driveDiagnostic, critical = true)
                 throw cancelled
             } catch (failure: Exception) {
+                val first = Diagnostics.failure(driveDiagnostic, "drive.failed", failure)
                 mutableState.update {
-                    it.copy(driveStatus = "手动控制已停用", driveConfirmedStopped = false,
+                    it.copy(driveStatus = "手动控制已停用", driveConfirmedStopped = false, driveFirstFailure = first,
                         parkingStatus = "驻车状态未确认，请重新启用手动控制",
                         driveError = "控制连接已中止：${failure.message.orEmpty().take(220)}。请检查小车后重新启用。")
                 }
             } finally {
-                channel?.close()
+                channel?.close("drive_cleanup")
                 driveChannel = null
                 desiredWheels = WheelSpeeds()
                 pendingParking = null
@@ -412,7 +508,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 mutableState.update { it.copy(driveStarting = false, driveEnabled = false,
                     driveStopping = true, driveLeft = 0, driveRight = 0) }
                 withContext(NonCancellable) {
-                    try { changeVideoService(false) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
+                    try { changeVideoService(false, driveDiagnostic) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
                 }
                 mutableState.update {
                     it.copy(driveStarting = false, driveEnabled = false, driveStopping = false,
@@ -424,6 +520,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         driveLeft = 0, driveRight = 0, connected = client.isConnected,
                         status = if (client.isConnected) it.status else "连接已断开")
                 }
+                Diagnostics.event("drive.finished", driveDiagnostic, source = firstDriveStopSource?.name,
+                    fields = mapOf("stopAcknowledged" to state.value.driveConfirmedStopped,
+                        "transportConnected" to client.isConnected), critical = true)
             }
         }
     }
@@ -441,6 +540,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun releaseJoystick() {
+        if (!desiredWheels.stopped) Diagnostics.event("drive.input_released", driveDiagnostic, critical = true)
         if (!desiredWheels.stopped) desiredGeneration += 1
         desiredWheels = WheelSpeeds()
         mutableState.update { it.copy(driveLeft = 0, driveRight = 0) }
@@ -450,6 +550,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun changeSpeedLimit(value: Int) {
         if (state.value.parkingUpdating || !desiredWheels.stopped || (state.value.driveEnabled && !state.value.driveConfirmedStopped)) return
         mutableState.update { it.copy(speedLimit = value.coerceIn(10, 100)) }
+        Diagnostics.event("drive.speed_limit_changed", activeDiagnostic(), fields = mapOf("rpm" to state.value.speedLimit))
     }
 
     fun setParkingEnabled(enabled: Boolean) {
@@ -469,14 +570,21 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         if (!current.canConfigureParking || !desiredWheels.stopped || stopRequest != null ||
             settings == current.parkingSettings) return
         pendingParking = settings
+        Diagnostics.event("parking.requested", driveDiagnostic,
+            fields = mapOf("enabled" to settings.enabled, "currentAmps" to settings.currentAmps), critical = true)
         // Keep the displayed switch/current at their last acknowledged values until the
         // board confirms the entire request. This flag also gates joystick input.
         mutableState.update { it.copy(parkingUpdating = true, parkingStatus = "正在应用驻车设置…") }
         driveWakeup.trySend(Unit)
     }
 
-    fun disableDrive(reason: String = "手动控制已停用", emergency: Boolean = false) {
+    fun disableDrive(reason: String = "手动控制已停用", emergency: Boolean = false,
+        source: ControlStopSource = if (emergency) ControlStopSource.EMERGENCY_STOP else ControlStopSource.USER_STOP,
+    ) {
         if (driveJob?.isActive != true) return
+        if (firstDriveStopSource == null) firstDriveStopSource = source
+        Diagnostics.event("drive.stop_requested", driveDiagnostic, source = source.name,
+            fields = mapOf("firstSource" to firstDriveStopSource?.name, "emergency" to emergency), critical = true)
         releaseJoystick()
         if (state.value.driveStopping && !state.value.driveStarting && driveChannel == null) return
         if (stopRequest == "estop") return
@@ -492,6 +600,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun selectFollowCamera(camera: FollowCamera) {
         val current = state.value
         if (current.busy || current.followActive || current.manualActive || current.followCamera == camera) return
+        Diagnostics.event("follow.camera_selected", activeDiagnostic(), fields = mapOf("camera" to camera.argument))
         mutableState.update {
             it.copy(followCamera = camera,
                 followLaunchOptions = if (camera == FollowCamera.ASTRA_PRO) it.followLaunchOptions
@@ -503,12 +612,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun setFollowExecute(execute: Boolean) {
         if (state.value.busy || state.value.followBlocksControl || state.value.manualActive) return
         mutableState.update { it.copy(followExecute = execute) }
+        Diagnostics.event("follow.execution_selected", activeDiagnostic(), fields = mapOf("execute" to execute))
     }
 
     fun setFollowLaunchOptions(options: FollowLaunchOptions) {
         val current = state.value
         if (current.busy || current.followBlocksControl || current.manualActive) return
         if (current.followLaunchOptions == options) return
+        Diagnostics.event("follow.options_changed", activeDiagnostic(), fields = followOptionFields(options))
         mutableState.update {
             it.copy(followCamera = if (options.avoidanceEnabled) FollowCamera.ASTRA_PRO else it.followCamera,
                 followLaunchOptions = options, followConfiguration = null,
@@ -521,7 +632,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         if (!current.canInspectFollow) return
         val camera = current.followCamera
         val options = current.followLaunchOptions
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        Diagnostics.event("follow.configuration_requested", diagnostic,
+            fields = followOptionFields(options) + mapOf("camera" to camera.argument))
         runCatching { options.validate(camera) }.exceptionOrNull()?.let { failure ->
+            Diagnostics.failure(diagnostic, "follow.configuration_invalid", failure)
             mutableState.update { it.copy(followConfiguration = null,
                 followConfigurationError = failure.message ?: "自动跟随参数无效") }
             return
@@ -532,13 +647,17 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
         operation = viewModelScope.launch {
             try {
-                val configuration = client.readFollowConfiguration(camera, options)
+                val configuration = client.readFollowConfiguration(camera, options, diagnostic)
+                Diagnostics.event("follow.configuration_confirmed", diagnostic,
+                    fields = mapOf("targetDistanceMeters" to configuration.targetDistanceMeters))
                 mutableState.update { it.copy(followConfiguration = configuration) }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
+                Diagnostics.failure(diagnostic, "follow.configuration_failed", failure)
                 mutableState.update {
-                    it.copy(followConfigurationError = describeFailure(failure), connected = client.isConnected)
+                    it.copy(followConfigurationError = describeFailure(failure), connected = client.isConnected,
+                        status = if (client.isConnected) "已连接" else "连接已断开")
                 }
             } finally {
                 mutableState.update { it.copy(followConfigurationLoading = false, busy = if (disconnecting) it.busy else false) }
@@ -549,10 +668,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshFollowAvailability() {
         val current = state.value
         if (!current.canInspectFollow || !current.followUncertain) return
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        Diagnostics.event("follow.availability_requested", diagnostic,
+            fields = mapOf("controlOperationId" to followDiagnostic.operationId, "runId" to followDiagnostic.runId))
         mutableState.update { it.copy(busy = true, followError = null, followMessage = "正在检查车端控制占用…") }
         operation = viewModelScope.launch {
             try {
-                val availability = client.readFollowAvailability()
+                val availability = client.readFollowAvailability(diagnostic)
+                Diagnostics.event("follow.availability_result", diagnostic,
+                    fields = mapOf("controlAvailable" to availability.controlAvailable))
                 if (availability.controlAvailable) {
                     preferences.edit().putBoolean("follow_unconfirmed", false).apply()
                     mutableState.update {
@@ -568,9 +692,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
+                Diagnostics.failure(diagnostic, "follow.availability_failed", failure)
                 mutableState.update {
-                    it.copy(followMessage = "控制占用检查失败，保持锁定",
-                        followError = describeFailure(failure), connected = client.isConnected)
+                    it.afterAvailabilityFailure(describeFailure(failure), client.isConnected)
                 }
             } finally {
                 if (!disconnecting) mutableState.update { it.copy(busy = false) }
@@ -582,11 +706,17 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun startFollow(dryRun: Boolean = false) {
         val current = state.value
         if (!current.canStartFollow) return
+        followDiagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        preferences.edit().putString("last_follow_operation", followDiagnostic.operationId).apply()
+        firstFollowStopSource = null
+        Diagnostics.event("follow.start_requested", followDiagnostic, source = "USER_START",
+            fields = followOptionFields(current.followLaunchOptions) + mapOf("camera" to current.followCamera.argument,
+                "execute" to current.followExecute, "dryRun" to dryRun), critical = true)
         followStopRequested = false
         while (followWakeup.tryReceive().isSuccess) { /* Discard previous-session signals. */ }
         mutableState.update {
             it.copy(followActive = true, followStopping = false, followStatus = null,
-                followError = null, followMessage = "正在关闭视频并释放摄像头…")
+                followError = null, followFirstFailure = null, followMessage = "正在关闭视频并释放摄像头…")
         }
         followJob = viewModelScope.launch {
             var channel: BoardFollowChannel? = null
@@ -595,30 +725,49 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 // A successful stop must confirm both video processes have exited before
                 // anything can open the follow camera. Failure leaves follow unstarted.
-                changeVideoService(false)
+                changeVideoService(false, followDiagnostic)
                 if (followStopRequested) {
+                    Diagnostics.event("follow.start_cancelled", followDiagnostic, source = firstFollowStopSource?.name, critical = true)
                     terminal = true
                     mutableState.update { it.copy(followMessage = "启动已取消，未发送跟随启动指令") }
                     return@launch
                 }
                 mutableState.update { it.copy(followMessage = "正在建立跟随会话…") }
                 val control = client.openFollowChannel(current.followCamera, current.followExecute,
-                    dryRun, current.followLaunchOptions)
+                    dryRun, current.followLaunchOptions, followDiagnostic)
                 channel = control
                 followChannel = control
+                followDiagnostic = control.diagnosticContext
+                Diagnostics.event("follow.ready", followDiagnostic,
+                    fields = mapOf("dryRun" to control.ready.dryRun, "execute" to control.ready.execute))
                 if (followStopRequested) {
                     // Opening the bridge does not start the runtime. A lifecycle stop received
                     // during connection must not be followed by a late start command.
                     terminal = true
+                    Diagnostics.event("follow.start_cancelled", followDiagnostic, source = firstFollowStopSource?.name, critical = true)
                     mutableState.update { it.copy(followMessage = "启动已取消，未发送跟随启动指令") }
                     return@launch
                 }
                 startAttempted = true
                 preferences.edit().putBoolean("follow_unconfirmed", true).apply()
+                Diagnostics.event("follow.start_sending", followDiagnostic, critical = true)
                 var reply = control.start()
                 var stopSent = false
+                var lastRunState: String? = null
                 while (true) {
                     terminal = reply.terminal
+                    if (reply.status.runState != lastRunState || terminal) {
+                        Diagnostics.event(if (terminal) "follow.terminal_received" else "follow.state_changed", followDiagnostic,
+                            fields = mapOf("runState" to reply.status.runState, "reason" to reply.status.reason,
+                                "processExited" to reply.status.processExited,
+                                "stopAcknowledged" to reply.status.stopAcknowledged,
+                                "physicalStopped" to reply.status.physicalStopped), critical = terminal)
+                        lastRunState = reply.status.runState
+                    }
+                    reply.status.fault?.let { fault ->
+                        val first = Diagnostics.failure(followDiagnostic, "follow.board_fault", IllegalStateException(fault))
+                        mutableState.update { it.copy(followFirstFailure = first) }
+                    }
                     mutableState.update {
                         it.copy(followStatus = reply.status, followError = reply.status.fault,
                             followStopping = it.followStopping || reply.status.stopRequested,
@@ -628,12 +777,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     if (terminal) break
                     if (followStopRequested && !stopSent) {
+                        Diagnostics.event("follow.stop_sending", followDiagnostic, source = firstFollowStopSource?.name, critical = true)
                         reply = control.requestStop()
                         stopSent = true
                     } else {
                         withTimeoutOrNull(500L) { followWakeup.receive() }
                         // A stop request wakes the wait and has priority over the next heartbeat.
                         if (followStopRequested && !stopSent) {
+                            Diagnostics.event("follow.stop_sending", followDiagnostic, source = firstFollowStopSource?.name, critical = true)
                             reply = control.requestStop()
                             stopSent = true
                         } else {
@@ -642,15 +793,18 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } catch (cancelled: CancellationException) {
+                Diagnostics.event("follow.cancelled", followDiagnostic, fields = mapOf("startAttempted" to startAttempted), critical = true)
                 throw cancelled
             } catch (failure: Exception) {
+                val first = Diagnostics.failure(followDiagnostic, "follow.failed", failure,
+                    mapOf("startAttempted" to startAttempted, "terminalReceived" to terminal))
                 mutableState.update {
-                    it.copy(followStatus = null, followError = failure.message.orEmpty().take(350),
+                    it.copy(followStatus = null, followFirstFailure = first, followError = failure.message.orEmpty().take(350),
                         followMessage = if (startAttempted) "跟随连接中断，进程退出和车辆状态未知"
                             else "跟随会话未建立，未发送启动指令")
                 }
             } finally {
-                channel?.close()
+                channel?.close("follow_cleanup")
                 followChannel = null
                 val uncertain = startAttempted && !terminal
                 preferences.edit().putBoolean("follow_unconfirmed", uncertain).apply()
@@ -661,21 +815,38 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         followMessage = if (uncertain && it.followError == null) "跟随进程退出未确认，请在车端检查"
                             else it.followMessage)
                 }
+                Diagnostics.event("follow.finished", followDiagnostic, source = firstFollowStopSource?.name,
+                    fields = mapOf("uncertain" to uncertain, "terminalReceived" to terminal,
+                        "transportConnected" to client.isConnected), critical = true)
             }
         }
     }
 
-    fun stopFollow(reason: String = "已请求停止，正在等待跟随进程退出…") {
+    fun stopFollow(reason: String = "已请求停止，正在等待跟随进程退出…",
+        source: ControlStopSource = ControlStopSource.USER_STOP,
+    ) {
         if (followJob?.isActive != true) return
+        if (firstFollowStopSource == null) firstFollowStopSource = source
+        Diagnostics.event("follow.stop_requested", followDiagnostic, source = source.name,
+            fields = mapOf("firstSource" to firstFollowStopSource?.name,
+                "alreadyRequested" to followStopRequested), critical = true)
         followStopRequested = true
         mutableState.update { it.copy(followStopping = true, followMessage = reason) }
         followWakeup.trySend(Unit)
     }
 
-    fun onControlSurfaceHidden(reason: String) {
-        disableDrive(reason)
-        stopFollow("$reason，正在请求结束跟随")
+    fun onControlSurfaceHidden(reason: String, source: ControlStopSource = ControlStopSource.CONTROL_SURFACE_HIDDEN) {
+        Diagnostics.event("ui.control_surface_hidden", activeDiagnostic(), source = source.name,
+            fields = mapOf("followActive" to state.value.followActive, "manualActive" to state.value.manualActive), critical = true)
+        disableDrive(reason, source = source)
+        stopFollow("$reason，正在请求结束跟随", source)
     }
+
+    private fun followOptionFields(options: FollowLaunchOptions): Map<String, Any?> = mapOf(
+        "targetDistanceMeters" to options.targetDistanceMeters, "gesturesEnabled" to options.gesturesEnabled,
+        "resumeGesture" to options.resumeGesture.name, "avoidanceEnabled" to options.avoidanceEnabled,
+        "reverseEnabled" to options.reverseEnabled, "reverseDistanceMeters" to options.reverseDistanceMeters,
+    )
 
     private fun describeFailure(failure: Exception, connecting: Boolean = false, attempts: Int = 1): String {
         val message = generateSequence(failure as Throwable?) { it.cause }.take(8)

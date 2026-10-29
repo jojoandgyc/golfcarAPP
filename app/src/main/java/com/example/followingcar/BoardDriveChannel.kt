@@ -10,6 +10,7 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -41,6 +42,7 @@ class BoardDriveChannel private constructor(
     private val output: OutputStream,
     private val stderr: BoundedOutputStream,
     private val abortTransport: () -> Unit,
+    val diagnosticContext: DiagnosticContext,
 ) {
     private val transaction = Mutex()
     private val closed = AtomicBoolean(false)
@@ -48,6 +50,14 @@ class BoardDriveChannel private constructor(
     private var token = ""
     private var sequence = 0L
     private var confirmedParking: ParkingSettings? = null
+    @Volatile private var phase = "created"
+    @Volatile private var currentCommand = "open"
+    @Volatile private var lastAckSequence = 0L
+    @Volatile private var lastAckNanos = 0L
+    private var summaryAt = System.nanoTime()
+    private var summaryCount = 0
+    private var summaryRttTotal = 0L
+    private var summaryRttMax = 0L
     lateinit var ready: DriveReady
         private set
 
@@ -64,7 +74,7 @@ class BoardDriveChannel private constructor(
             else -> "drive"
         }
         val result = transact(command, if (emergency) 0 else left, if (emergency) 0 else right)
-        if (emergency) close()
+        if (emergency) close("emergency_ack")
         return result
     }
 
@@ -73,7 +83,7 @@ class BoardDriveChannel private constructor(
             check(isOpen) { "摇杆通道已关闭，未收到本次停车回执" }
             transact("close", 0, 0)
         } finally {
-            close()
+            close("stop_and_close")
         }
     }
 
@@ -84,8 +94,11 @@ class BoardDriveChannel private constructor(
     }
 
     /** Nonblocking for UI/lifecycle callers. EOF or the board watchdog stops the motors. */
-    fun close() {
+    fun close(reason: String = "requested") {
         if (!closed.compareAndSet(false, true)) return
+        Diagnostics.event("drive.channel_close", diagnosticContext, source = reason,
+            fields = diagnosticFields() + mapOf("closeScope" to if (blockingIo.get()) "transport" else "channel"),
+            critical = true)
         // Explicitly interrupt a network write if one is in flight. A partially sent control
         // command must not be retried on this transport.
         if (blockingIo.get()) abortTransport()
@@ -101,6 +114,12 @@ class BoardDriveChannel private constructor(
         withContext(Dispatchers.IO) {
             // Refuse concurrency instead of keeping stale movement requests in a queue.
             check(transaction.tryLock()) { "上一个摇杆指令尚未收到回执" }
+            val started = System.nanoTime()
+            val transition = command != currentCommand
+            val important = parking != null || command == "estop" || command == "close" || transition
+            val report = important || elapsedMillis(summaryAt) >= 1_000L
+            currentCommand = command
+            phase = "check_open"
             try {
                 check(isOpen) { "摇杆控制通道已关闭，请重新启用" }
                 val closing = command == "estop" || command == "close"
@@ -114,11 +133,19 @@ class BoardDriveChannel private constructor(
                         request.put("parkingEnabled", parking.enabled)
                             .put("parkingCurrent", parking.currentAmps)
                     }
+                    phase = "write"
+                    if (report) Diagnostics.event("drive.request_send", diagnosticContext,
+                        fields = mapOf("commandType" to command, "seq" to sentSequence,
+                            "leftRpm" to left, "rightRpm" to right,
+                            "parkingEnabled" to parking?.enabled, "parkingAmps" to parking?.currentAmps),
+                        critical = important)
                     blockingCall {
                         output.write((request.toString() + "\n").toByteArray(Charsets.UTF_8))
                         output.flush()
                     }
+                    phase = "ack_wait"
                     val reply = readMessage()
+                    phase = "ack_validate"
                     requireMessage(reply.getString("type") == "ack", "开发板返回了未知控制响应")
                     requireMessage(reply.getLong("seq") == sentSequence, "开发板回执序号不匹配")
                     val nextToken = readToken(reply)
@@ -136,14 +163,47 @@ class BoardDriveChannel private constructor(
                     }
                     token = nextToken
                     confirmedParking = actualParking
+                    lastAckSequence = sentSequence
+                    lastAckNanos = System.nanoTime()
+                    val rtt = elapsedMillis(started)
+                    summaryCount += 1
+                    summaryRttTotal += rtt
+                    summaryRttMax = maxOf(summaryRttMax, rtt)
+                    if (report) {
+                        Diagnostics.event("drive.ack_summary", diagnosticContext, fields = mapOf(
+                            "commandType" to command, "seq" to sentSequence, "elapsedMs" to rtt,
+                            "sampleCount" to summaryCount, "maxRttMs" to summaryRttMax,
+                            "meanRttMs" to summaryRttTotal / summaryCount,
+                            "leftRpm" to actualLeft, "rightRpm" to actualRight, "stopped" to stopped),
+                            critical = important)
+                        summaryAt = System.nanoTime()
+                        summaryCount = 0
+                        summaryRttTotal = 0
+                        summaryRttMax = 0
+                    }
+                    phase = "idle"
                     DriveAck(actualLeft, actualRight, stopped, actualParking)
                 }
             } catch (timeout: TimeoutCancellationException) {
-                close()
-                throw SocketTimeoutException("摇杆控制回执超时，已关闭控制通道；请重新启用摇杆")
-            } catch (failure: Exception) {
-                close()
+                val failure = SocketTimeoutException("摇杆控制回执超时，已关闭控制通道；请重新启用摇杆")
+                Diagnostics.failure(diagnosticContext, "drive.ack_timeout", failure,
+                    diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started),
+                        "leftRpm" to left, "rightRpm" to right))
+                close("ack_timeout")
                 throw failure
+            } catch (failure: Exception) {
+                val safeFailure = protocolDiagnosticFailure(failure)
+                if (failure is CancellationException) {
+                    Diagnostics.event("drive.transaction_cancelled", diagnosticContext,
+                        fields = diagnosticFields(), critical = true)
+                } else {
+                    Diagnostics.failure(diagnosticContext, "drive.transaction_failed", safeFailure,
+                        diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started),
+                            "leftRpm" to left, "rightRpm" to right,
+                            "originalExceptionClass" to failure.javaClass.name))
+                }
+                close(if (failure is CancellationException) "transaction_cancelled" else "transaction_failed")
+                throw safeFailure
             } finally {
                 transaction.unlock()
             }
@@ -161,7 +221,10 @@ class BoardDriveChannel private constructor(
                     val message = try {
                         JSONObject(bytes.toString(Charsets.UTF_8.name()))
                     } catch (failure: Exception) {
-                        throw IOException("开发板控制响应不是有效 JSON", failure)
+                        Diagnostics.event("drive.protocol_error", diagnosticContext,
+                            fields = diagnosticFields() + mapOf("protocolStage" to "invalid_json"),
+                            critical = true)
+                        throw IOException("开发板控制响应不是有效 JSON")
                     }
                     if (message.optString("type") == "error") {
                         throw IOException(message.optString("error", "开发板控制程序报错").take(500))
@@ -177,6 +240,7 @@ class BoardDriveChannel private constructor(
     }
 
     private fun endedError(): IOException {
+        Diagnostics.event("drive.eof", diagnosticContext, fields = diagnosticFields(), critical = true)
         val detail = stderr.text().trim().take(500)
         return IOException(
             if (detail.isNotBlank()) "摇杆控制程序退出：$detail"
@@ -187,9 +251,12 @@ class BoardDriveChannel private constructor(
     /** JSch writes are blocking; a timeout/cancellation must close the real socket too. */
     private suspend fun blockingCall(action: () -> Unit) {
         suspendCancellableCoroutine<Unit> { continuation ->
-            continuation.invokeOnCancellation {
+            continuation.invokeOnCancellation { cause ->
+                Diagnostics.event("drive.blocking_io_cancelled", diagnosticContext,
+                    fields = diagnosticFields() + mapOf("causeClass" to cause?.javaClass?.name,
+                        "closeScope" to "transport"), critical = true)
                 abortTransport()
-                close()
+                close("blocking_io_cancelled")
             }
             blockingIo.set(true)
             try {
@@ -210,11 +277,24 @@ class BoardDriveChannel private constructor(
     private fun readToken(message: JSONObject): String {
         val value = message.getString("token")
         requireMessage(value.isNotBlank() && value.length <= 256, "开发板控制令牌无效")
-        return value
+        return value.also(Diagnostics::protectSecret)
     }
 
+    private fun diagnosticFields(): Map<String, Any?> = mapOf(
+        "phase" to phase, "commandType" to currentCommand, "seq" to sequence,
+        "lastAckSeq" to lastAckSequence,
+        "lastAckAgeMs" to if (lastAckNanos == 0L) null else elapsedMillis(lastAckNanos),
+        "channelConnected" to channel.isConnected, "channelClosed" to channel.isClosed,
+        "channelEof" to channel.isEOF, "blockingIo" to blockingIo.get(),
+    )
+
     private fun requireMessage(condition: Boolean, message: String) {
-        if (!condition) throw IOException(message)
+        if (!condition) {
+            Diagnostics.event("drive.protocol_error", diagnosticContext,
+                fields = diagnosticFields() + mapOf("protocolStage" to "validation", "reason" to message),
+                critical = true)
+            throw IOException(message)
+        }
     }
 
     private fun readParking(message: JSONObject): ParkingSettings {
@@ -238,21 +318,33 @@ class BoardDriveChannel private constructor(
             Thread(runnable, "drive-channel-cleanup").apply { isDaemon = true }
         }
 
-        suspend fun open(session: Session, dryRun: Boolean, abortTransport: () -> Unit): BoardDriveChannel =
+        suspend fun open(
+            session: Session, dryRun: Boolean, diagnostic: DiagnosticContext, abortTransport: () -> Unit,
+        ): BoardDriveChannel =
             withContext(Dispatchers.IO) {
-                val channel = (session.openChannel("exec") as ChannelExec).apply {
-                    setCommand("python3 -u /home/topeet/lianzhan/scripts/app_joystick_bridge.py" + if (dryRun) " --dry-run" else "")
-                    setPty(false)
-                    setAgentForwarding(false)
-                    setInputStream(null)
-                }
-                val stderr = BoundedOutputStream(2048)
-                channel.setErrStream(stderr, true)
-                val control = BoardDriveChannel(channel, channel.inputStream, channel.outputStream, stderr, abortTransport)
+                val started = System.nanoTime()
+                var opened: BoardDriveChannel? = null
+                Diagnostics.event("drive.channel_open_requested", diagnostic,
+                    fields = mapOf("dryRun" to dryRun, "timeoutMs" to START_TIMEOUT_MS), critical = true)
                 try {
+                    val channel = (session.openChannel("exec") as ChannelExec).apply {
+                        setCommand("python3 -u /home/topeet/lianzhan/scripts/app_joystick_bridge.py" + if (dryRun) " --dry-run" else "")
+                        setPty(false)
+                        setAgentForwarding(false)
+                        setInputStream(null)
+                    }
+                    val stderr = BoundedOutputStream(2048)
+                    channel.setErrStream(stderr, true)
+                    val control = BoardDriveChannel(channel, channel.inputStream, channel.outputStream,
+                        stderr, abortTransport, diagnostic).also { opened = it }
                     withTimeout(START_TIMEOUT_MS) {
+                        control.phase = "channel_open"
                         control.blockingCall { channel.connect(START_TIMEOUT_MS.toInt()) }
+                        control.phase = "ready_wait"
+                        Diagnostics.event("drive.channel_opened", diagnostic,
+                            fields = mapOf("elapsedMs" to elapsedMillis(started)))
                         val reply = control.readMessage()
+                        control.phase = "ready_validate"
                         control.requireMessage(reply.getString("type") == "ready", "开发板未就绪")
                         control.token = control.readToken(reply)
                         val parkingSupported = reply.optBoolean("parkingSupported", false)
@@ -266,14 +358,31 @@ class BoardDriveChannel private constructor(
                         control.requireMessage(ready.maxRpm in 1..100 && ready.watchdogMs == 600, "开发板限速或超时参数不匹配")
                         control.ready = ready
                         control.confirmedParking = parking
+                        control.phase = "idle"
+                        Diagnostics.event("drive.ready", diagnostic, fields = mapOf(
+                            "dryRun" to ready.dryRun, "port" to ready.port,
+                            "parkingSupported" to ready.parkingSupported,
+                            "elapsedMs" to elapsedMillis(started)), critical = true)
                         control
                     }
                 } catch (timeout: TimeoutCancellationException) {
-                    control.close()
-                    throw SocketTimeoutException("启动摇杆控制超时，请检查串口、电机电源和控制脚本")
-                } catch (failure: Exception) {
-                    control.close()
+                    val failure = SocketTimeoutException("启动摇杆控制超时，请检查串口、电机电源和控制脚本")
+                    Diagnostics.failure(diagnostic, "drive.open_timeout", failure,
+                        (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
+                            mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to START_TIMEOUT_MS))
+                    opened?.close("open_timeout")
                     throw failure
+                } catch (failure: Exception) {
+                    val safeFailure = protocolDiagnosticFailure(failure)
+                    val fields = (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
+                        mapOf("elapsedMs" to elapsedMillis(started), "originalExceptionClass" to failure.javaClass.name)
+                    if (failure is CancellationException) {
+                        Diagnostics.event("drive.open_cancelled", diagnostic, fields = fields, critical = true)
+                    } else {
+                        Diagnostics.failure(diagnostic, "drive.open_failed", safeFailure, fields)
+                    }
+                    opened?.close(if (failure is CancellationException) "open_cancelled" else "open_failed")
+                    throw safeFailure
                 }
             }
     }

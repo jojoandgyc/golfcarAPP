@@ -76,19 +76,36 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         boardViewModel = ViewModelProvider(this)[BoardViewModel::class.java]
+        boardViewModel.recordUiEvent("ui.activity_created", "restored=${savedInstanceState != null}")
         setContent {
             FollowingCarTheme { BoardScreen(boardViewModel) }
         }
     }
 
     override fun onPause() {
-        if (::boardViewModel.isInitialized) boardViewModel.onControlSurfaceHidden("App 已离开前台")
+        if (::boardViewModel.isInitialized) {
+            boardViewModel.recordUiEvent("ui.activity_paused")
+            boardViewModel.onControlSurfaceHidden("App 已离开前台", ControlStopSource.APP_PAUSED)
+        }
         super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::boardViewModel.isInitialized) boardViewModel.recordUiEvent("ui.activity_resumed")
+    }
+
+    override fun onDestroy() {
+        if (::boardViewModel.isInitialized) boardViewModel.recordUiEvent("ui.activity_destroyed", "finishing=$isFinishing")
+        super.onDestroy()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (!hasFocus && ::boardViewModel.isInitialized) boardViewModel.onControlSurfaceHidden("界面失去焦点")
+        if (::boardViewModel.isInitialized) {
+            boardViewModel.recordUiEvent("ui.window_focus", "hasFocus=$hasFocus")
+            if (!hasFocus) boardViewModel.onControlSurfaceHidden("界面失去焦点", ControlStopSource.WINDOW_FOCUS_LOST)
+        }
     }
 }
 
@@ -128,9 +145,10 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     }
     val selectPage: (BoardPage) -> Unit = { next ->
         if (next.ordinal != selectedPageIndex) {
+            viewModel.recordUiEvent("ui.page_changed", "${BoardPage.entries[selectedPageIndex].name}->${next.name}")
             val leavingControl = (selectedPageIndex == BoardPage.FOLLOW.ordinal && state.followActive) ||
                 (selectedPageIndex == BoardPage.JOYSTICK.ordinal && state.manualActive)
-            if (leavingControl) viewModel.onControlSurfaceHidden("已离开控制页面")
+            if (leavingControl) viewModel.onControlSurfaceHidden("已离开控制页面", ControlStopSource.PAGE_CHANGED)
             selectedPageIndex = next.ordinal
         }
     }
@@ -222,6 +240,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                         }
                         BoardPage.JOYSTICK -> Unit
                         BoardPage.TERMINAL -> {
+                            DiagnosticLogCard(controlActive = state.manualActive || state.followActive || state.followStopping)
                             Card(modifier = Modifier.fillMaxWidth()) {
                                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                     Text("快捷查询", style = MaterialTheme.typography.titleMedium)
@@ -311,12 +330,14 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
     }
     fun chooseControlMode(directionPad: Boolean) {
         if (useDirectionPad == directionPad) return
+        viewModel.recordUiEvent("ui.drive_input_mode", if (directionPad) "BUTTONS" else "JOYSTICK")
         waitingForModeStop = state.driveEnabled && !state.driveConfirmedStopped
         viewModel.releaseJoystick()
         useDirectionPad = directionPad
     }
     fun chooseManualSection(next: ManualSection) {
         if (manualSection == next) return
+        viewModel.recordUiEvent("ui.manual_section", "${manualSection.name}->${next.name}")
         if (manualSection != ManualSection.PARKING) {
             waitingForModeStop = state.driveEnabled && !state.driveConfirmedStopped
             viewModel.releaseJoystick()
@@ -326,7 +347,11 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
     val controlling = state.driveEnabled || state.driveStarting || state.driveStopping
     val canAdjustSpeed = !state.parkingUpdating && !state.followBlocksControl &&
         (!controlling || (state.driveEnabled && state.driveLeft == 0 && state.driveRight == 0 && state.driveConfirmedStopped))
-    val errorText = state.driveError ?: state.videoServiceError ?: state.error
+    val latestError = state.driveError ?: state.videoServiceError ?: state.error
+    val errorText = state.driveFirstFailure?.let {
+        "本次会话首次异常\n${it.time}\n${it.event}\n${it.message}" +
+            (latestError?.let { last -> "\n\n最近操作错误\n$last" } ?: "")
+    } ?: latestError
     Card(modifier = modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
         Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,

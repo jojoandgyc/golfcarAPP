@@ -8,7 +8,7 @@ runtime's configuration check. It does not open hardware.
 ## Deployment
 
 - `app_joystick_bridge.py` belongs in `/home/topeet/lianzhan/scripts/`.
-- `app_follow_bridge.py` and `app_follow_worker.py` belong together in
+- `app_follow_bridge.py`, `app_follow_worker.py`, and `app_diagnostic_log.py` belong together in
   `/home/topeet/Desktop/rk_car_runtime_module/`.
 - Follow uses the existing runtime and its installed dependencies. The existing
   joystick bridge supplies read-only conflict/serial-ownership checks; it is not
@@ -71,6 +71,48 @@ Missing or stale target, range, and wheel feedback are unknown, never zero.
 `python3 app_follow_bridge.py --inspect` checks both ownership locks and known
 conflicting processes without opening devices. The App uses it to recover from
 an uncertain session after reconnecting; reconnecting never starts follow.
+
+## Session diagnostics
+
+The bridge writes private JSONL files under
+`/home/topeet/Desktop/rk_car_runtime_module/app_diagnostic_logs/`. Their filenames
+contain the same `runId` returned in `ready` and recorded by the Android App.
+Records include UTC wall time, board monotonic milliseconds, bridge/worker PID,
+accepted request sequence, response/terminal delivery, first stop source, first
+failure, worker runtime log directory, cleanup and exit codes. The two devices'
+monotonic clocks are independent; correlate by `runId` and request sequence, not
+by comparing raw monotonic timestamps.
+
+`firstStop` and `firstFailure` are retained in the final session record. An App
+`stop` request, input EOF, heartbeat watchdog expiry, protocol validation failure,
+worker status failure and a supervisor signal have distinct diagnostic sources.
+Later cleanup does not overwrite the first trigger. This supplements the
+runtime's generic `app_stop_requested`: the worker still receives the unchanged
+`S` lease message, and request/response JSON is unchanged.
+
+A bounded background writer rotates files at 2 MiB, keeps at most 20 MiB total,
+and removes files older than 7 days on subsequent writes. The directory is mode
+700 and files are mode 600 on Linux. Critical stop/error records take priority
+over routine heartbeats when the queue fills; a subsequent record reports the
+cumulative `droppedEvents` count. Slow or failed disk writes never block the
+control thread. Failure is reported with `FOLLOW_DIAGNOSTIC_UNAVAILABLE` on
+stderr, never on the protocol stdout stream. Tokens, credential-shaped values
+and raw protocol messages are not written. Logging remains best effort if the
+process is killed or storage is unavailable.
+
+For a reported App session, inspect matching files via SSH, for example:
+
+```bash
+ls -lt /home/topeet/Desktop/rk_car_runtime_module/app_diagnostic_logs/
+rg '"event":"session_failed"|"event":"session_finished"' \
+  /home/topeet/Desktop/rk_car_runtime_module/app_diagnostic_logs/*_<runId>_*.jsonl
+```
+
+Deploy the diagnostics module before replacing the bridge, with control idle,
+and retain a backup of the previous bridge/module. The worker is unchanged by
+the diagnostic enhancement. Offline `--dry-run` tests may set
+`APP_FOLLOW_DIAGNOSTIC_TEST_DIR` to an isolated temporary folder; this override
+is ignored for real/shadow runs.
 
 ## Modes and verification
 

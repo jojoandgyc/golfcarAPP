@@ -7,4 +7,5 @@
 -->
 <full-backup-content>
     <exclude domain="sharedpref" path="board_credentials.xml" />
+    <exclude domain="file" path="diagnostics/" />
 </full-backup-content>

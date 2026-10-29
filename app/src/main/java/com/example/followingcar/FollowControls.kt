@@ -212,7 +212,14 @@ internal fun FollowControlCard(
                 else "影子模式：打开相机和模型，计算跟随指令，不打开电机。",
                 style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followMode"))
             Text(state.followMessage, modifier = Modifier.testTag("followMessage"))
+            state.followFirstFailure?.let { first ->
+                Text("本次会话首次异常 · ${first.time}", style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error)
+                Text("${first.event}\n${first.message}", modifier = Modifier.testTag("followFirstFailure"),
+                    color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
             state.followError?.let {
+                if (state.followFirstFailure != null) Text("最近操作错误", style = MaterialTheme.typography.labelMedium)
                 Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("followError"))
             }
             state.followStatus?.let { FollowStatusDetails(it, state.followUncertain) }
