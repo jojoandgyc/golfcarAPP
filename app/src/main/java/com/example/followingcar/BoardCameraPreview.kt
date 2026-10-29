@@ -149,6 +149,11 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
     @SuppressLint("SetJavaScriptEnabled")
     val webView = remember(context) {
         WebView(context).apply {
+            // A wrap-content WebView gives this absolute-positioned, 100%-height player a
+            // zero-height CSS viewport. Match the 8:3 Compose container on both axes.
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            )
             setBackgroundColor(Color.BLACK)
             isVerticalScrollBarEnabled = false
             isHorizontalScrollBarEnabled = false
