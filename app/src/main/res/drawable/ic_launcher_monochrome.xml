@@ -4,13 +4,25 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <path
-        android:fillColor="#00000000"
-        android:strokeColor="#FFFFFFFF"
-        android:strokeLineCap="round"
-        android:strokeWidth="3"
-        android:pathData="M40,33 Q54,20 68,33 M47,38 Q54,31 61,38" />
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M54,37 a3,3 0,1 1,0 -6 a3,3 0,1 1,0 6 M42,43 H66 Q70,43 71,49 L74,70 Q74,77 68,79 H40 Q34,77 34,70 L37,49 Q38,43 42,43 Z M30,54 H34 V68 H30 Z M74,54 H78 V68 H74 Z" />
+    <!-- Electric golf trolley: tilted control panel, open frame, large rear wheel and front caster. -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M35,31 Q34,29 36,28.5 L42,27 Q44,26.5 45,28.5 L53,40 Q54,42 52,43 L49,44 Q47,45 46,43 Z" />
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="3.6"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M47,44 L51,60 M54,44 L58,59 M51,43 L63,39" />
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="4"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M34,62 L53,60 L68,67 M34,62 L34,66" />
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="3.6"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M62,63 L72,55" />
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="4"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M79,68 A10,10 0,1 1,59 68 A10,10 0,1 1,79 68" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M39,69 A5,5 0,1 1,29 69 A5,5 0,1 1,39 69" />
 </vector>
