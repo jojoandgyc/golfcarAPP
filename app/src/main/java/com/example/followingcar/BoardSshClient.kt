@@ -216,6 +216,17 @@ class BoardSshClient {
         return channel.configureParking(settings)
     }
 
+    /** Read-only: inspect both streaming services and live RGB/depth health without starting them. */
+    suspend fun readVideoServiceState(): VideoServiceState =
+        parseVideoServiceState(execute(videoServiceCommand(), timeoutMillis = 15_000L))
+
+    /** Uses the board's videoctl.sh; success includes readiness or confirmed camera release. */
+    suspend fun setVideoServiceEnabled(enabled: Boolean): VideoServiceState =
+        requireVideoServiceState(
+            execute(videoServiceCommand(enabled), timeoutMillis = if (enabled) 60_000L else 45_000L),
+            enabled,
+        )
+
     /**
      * Static configuration validation only: this command never opens the camera or motors.
      * Camera fields remain the board's original values. The configuration page adds their

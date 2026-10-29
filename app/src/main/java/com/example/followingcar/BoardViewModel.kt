@@ -7,12 +7,15 @@ import java.net.SocketTimeoutException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -27,6 +30,11 @@ data class BoardUiState(
     val status: String = "尚未连接",
     val error: String? = null,
     val result: CommandResult? = null,
+    val videoServiceState: VideoServiceState = VideoServiceState.UNKNOWN,
+    val videoServiceBusy: Boolean = false,
+    val videoServiceMessage: String = "连接开发板后可开启视频",
+    val videoServiceError: String? = null,
+    val videoPreviewRevision: Int = 0,
     val driveStarting: Boolean = false,
     val driveEnabled: Boolean = false,
     val driveStopping: Boolean = false,
@@ -60,7 +68,10 @@ data class BoardUiState(
 ) {
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followUncertain
-    val canInspectFollow: Boolean get() = connected && !busy && !manualActive && !followActive
+    val canEnableDrive: Boolean get() = connected && !busy && !manualActive && !followBlocksControl && !videoServiceBusy
+    val canToggleVideoService: Boolean
+        get() = connected && !busy && !videoServiceBusy && !driveStarting && !driveStopping && !followBlocksControl
+    val canInspectFollow: Boolean get() = connected && !busy && !manualActive && !followActive && !videoServiceBusy
     val canStartFollow: Boolean
         get() = canInspectFollow && !followUncertain && !followConfigurationLoading &&
             followConfiguration != null && followConfigurationError == null &&
@@ -88,6 +99,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     )
     val state = mutableState.asStateFlow()
     private var operation: Job? = null
+    // Service commands must finish before a competing start/stop. Cancelling an SSH command
+    // closes the shared session, so motor stop uses its own channel and never cancels this job.
+    private val videoServiceMutex = Mutex()
+    private var videoServiceJob: Job? = null
     private var disconnecting = false
     private var driveJob: Job? = null
     private var driveChannel: BoardDriveChannel? = null
@@ -110,7 +125,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     disableDrive("SSH 连接中断")
                     stopFollow("SSH 连接中断，正在请求结束跟随")
                     mutableState.update {
-                        it.copy(connected = false, status = "连接已断开", error = "连接中断，请检查 Wi-Fi 后重新连接。")
+                        it.copy(connected = false, status = "连接已断开", error = "连接中断，请检查 Wi-Fi 后重新连接。",
+                            videoServiceState = VideoServiceState.UNKNOWN,
+                            videoServiceMessage = "连接中断，视频服务状态未确认")
                     }
                 }
             }
@@ -124,7 +141,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun updateCommand(value: String) { mutableState.update { it.copy(command = value) } }
 
     private fun editConnection(edit: BoardUiState.() -> BoardUiState) {
-        if (!state.value.busy && !state.value.connected) mutableState.update { it.edit().copy(error = null) }
+        if (!state.value.busy && !state.value.connected && !state.value.manualActive &&
+            !state.value.followActive && !state.value.videoServiceBusy) mutableState.update { it.edit().copy(error = null) }
     }
 
     fun permissionDenied() {
@@ -133,7 +151,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connect() {
         val input = state.value
-        if (input.busy || input.connected) return
+        if (disconnecting || input.busy || input.connected || input.manualActive ||
+            input.followActive || input.videoServiceBusy) return
         val host = input.host.trim()
         val username = input.username.trim()
         val port = input.port.toIntOrNull()
@@ -145,7 +164,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
         mutableState.update {
             it.copy(host = host, username = username, busy = true, error = null, result = null,
-                followConfiguration = null, followConfigurationError = null, status = "正在连接…")
+                followConfiguration = null, followConfigurationError = null, status = "正在连接…",
+                videoServiceState = VideoServiceState.UNKNOWN, videoServiceError = null)
         }
         operation = viewModelScope.launch {
             var connectionAttempts = 1
@@ -164,6 +184,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 mutableState.update { it.copy(connected = true, status = "正在读取开发板信息…") }
                 val result = client.execute(BOARD_STATUS_COMMAND)
                 mutableState.update { it.copy(result = result, status = "已连接") }
+                refreshVideoServiceState()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
@@ -179,7 +200,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun execute(command: String = state.value.command) {
-        if (!state.value.connected || state.value.busy || state.value.driveStarting ||
+        if (!state.value.connected || state.value.busy || state.value.videoServiceBusy || state.value.driveStarting ||
             state.value.driveEnabled || state.value.driveStopping || state.value.followBlocksControl || command.isBlank()) return
         mutableState.update { it.copy(busy = true, error = null, result = null, status = "正在执行…") }
         operation = viewModelScope.launch {
@@ -200,6 +221,64 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setVideoServiceEnabled(enabled: Boolean) {
+        if (disconnecting || !state.value.canToggleVideoService) return
+        mutableState.update { it.copy(videoServiceBusy = true, videoServiceError = null,
+            videoServiceMessage = if (enabled) "正在开启视频…" else "正在关闭视频…") }
+        videoServiceJob = viewModelScope.launch {
+            try {
+                changeVideoService(enabled)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // changeVideoService publishes the failure and keeps the result UNKNOWN.
+            }
+        }
+    }
+
+    private suspend fun refreshVideoServiceState() = videoServiceMutex.withLock {
+        mutableState.update { it.copy(videoServiceBusy = true, videoServiceMessage = "正在读取视频服务状态…") }
+        try {
+            val videoState = client.readVideoServiceState()
+            mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
+                videoServiceMessage = when (videoState) {
+                    VideoServiceState.RUNNING -> "视频服务已开启"
+                    VideoServiceState.STOPPED -> "视频服务已关闭"
+                    VideoServiceState.UNKNOWN -> "视频服务未就绪，可关闭后重试"
+                }) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            recordVideoServiceFailure(failure)
+        } finally {
+            mutableState.update { it.copy(videoServiceBusy = false) }
+        }
+    }
+
+    private suspend fun changeVideoService(enabled: Boolean) = videoServiceMutex.withLock {
+        mutableState.update { it.copy(videoServiceBusy = true, videoServiceError = null,
+            videoServiceMessage = if (enabled) "正在开启视频…" else "正在关闭视频…") }
+        try {
+            check(client.isConnected) { "SSH 已断开，无法确认视频服务状态，请重连后关闭视频。" }
+            val videoState = client.setVideoServiceEnabled(enabled)
+            mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
+                videoServiceMessage = if (enabled) "视频服务已开启" else "视频服务已关闭",
+                videoPreviewRevision = if (enabled) it.videoPreviewRevision + 1 else it.videoPreviewRevision) }
+        } catch (failure: Exception) {
+            recordVideoServiceFailure(failure)
+            throw failure
+        } finally {
+            mutableState.update { it.copy(videoServiceBusy = false) }
+        }
+    }
+
+    private fun recordVideoServiceFailure(failure: Exception) {
+        mutableState.update { it.copy(videoServiceState = VideoServiceState.UNKNOWN,
+            videoServiceMessage = "视频操作失败，状态未确认",
+            videoServiceError = failure.message.orEmpty().ifBlank { "视频服务操作未完成，请重试。" }.take(800),
+            connected = client.isConnected, status = if (client.isConnected) it.status else "连接已断开") }
+    }
+
     fun disconnect() {
         if (disconnecting) return
         disconnecting = true
@@ -209,6 +288,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         operation = viewModelScope.launch {
             disableDrive("连接已断开")
             stopFollow("正在停止跟随后断开连接…")
+            // A follow startup may still be releasing the camera. Let that bounded service
+            // command finish; a pending stop prevents any late follow runtime start.
+            if (followChannel == null) followJob?.join()
             val followFinished = withTimeoutOrNull(12_000L) { followJob?.join(); true } == true
             if (!followFinished) {
                 followChannel?.close()
@@ -219,6 +301,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             driveJob?.join()
+            videoServiceJob?.join()
+            if (client.isConnected && state.value.videoServiceState != VideoServiceState.STOPPED) {
+                try { changeVideoService(false) } catch (_: Exception) { /* Keep the failure visible. */ }
+            }
             withContext(Dispatchers.IO) { client.disconnect() }
             withTimeoutOrNull(1_000L) { followJob?.join() }
             previous?.join()
@@ -235,24 +321,30 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
     }
 
-    /** dryRun is used by instrumented tests; the user-facing button always controls real hardware. */
+    /** dryRun simulates motors only; the video service is still managed on the board. */
     fun enableDrive(dryRun: Boolean = false) {
         val current = state.value
-        if (!current.connected || current.busy || current.driveEnabled || current.driveStarting || current.driveStopping ||
-            current.followBlocksControl) return
+        if (disconnecting || !current.canEnableDrive) return
         desiredWheels = WheelSpeeds()
         stopRequest = null
         pendingParking = null
         while (driveWakeup.tryReceive().isSuccess) { /* Discard signals from the previous session. */ }
         mutableState.update {
             it.copy(driveStarting = true, driveConfirmedStopped = false, driveError = null,
-                driveStatus = "正在检测电机…", parkingSupported = false, parkingSettings = null,
+                driveStatus = "正在开启视频…", parkingSupported = false, parkingSettings = null,
                 parkingUpdating = false, parkingStatus = "正在读取驻车设置…")
         }
         driveJob = viewModelScope.launch {
             var channel: BoardDriveChannel? = null
             var parkingCleared = false
             try {
+                if (stopRequest == null) changeVideoService(true)
+                if (stopRequest != null) {
+                    // Do not open the motor bridge after a stop received during video startup.
+                    mutableState.update { it.copy(driveConfirmedStopped = true, driveStatus = stopReason) }
+                    return@launch
+                }
+                mutableState.update { it.copy(driveStatus = "正在检测电机…") }
                 val activeChannel = client.openDriveChannel(dryRun)
                 channel = activeChannel
                 driveChannel = activeChannel
@@ -315,6 +407,13 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 driveChannel = null
                 desiredWheels = WheelSpeeds()
                 pendingParking = null
+                // Motor stop/close always precedes service cleanup. Retain manual ownership
+                // until cleanup finishes so follow cannot race a late camera-service start.
+                mutableState.update { it.copy(driveStarting = false, driveEnabled = false,
+                    driveStopping = true, driveLeft = 0, driveRight = 0) }
+                withContext(NonCancellable) {
+                    try { changeVideoService(false) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
+                }
                 mutableState.update {
                     it.copy(driveStarting = false, driveEnabled = false, driveStopping = false,
                         parkingSupported = false, parkingSettings = null, parkingUpdating = false,
@@ -379,6 +478,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun disableDrive(reason: String = "手动控制已停用", emergency: Boolean = false) {
         if (driveJob?.isActive != true) return
         releaseJoystick()
+        if (state.value.driveStopping && !state.value.driveStarting && driveChannel == null) return
         if (stopRequest == "estop") return
         pendingParking = null
         stopRequest = if (emergency) "estop" else "close"
@@ -478,7 +578,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Only explicit UI activation starts a session; dryRun belongs to offline integration tests. */
+    /** dryRun simulates follow hardware; camera-service shutdown still runs on the board. */
     fun startFollow(dryRun: Boolean = false) {
         val current = state.value
         if (!current.canStartFollow) return
@@ -486,13 +586,22 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         while (followWakeup.tryReceive().isSuccess) { /* Discard previous-session signals. */ }
         mutableState.update {
             it.copy(followActive = true, followStopping = false, followStatus = null,
-                followError = null, followMessage = "正在建立跟随会话…")
+                followError = null, followMessage = "正在关闭视频并释放摄像头…")
         }
         followJob = viewModelScope.launch {
             var channel: BoardFollowChannel? = null
             var startAttempted = false
             var terminal = false
             try {
+                // A successful stop must confirm both video processes have exited before
+                // anything can open the follow camera. Failure leaves follow unstarted.
+                changeVideoService(false)
+                if (followStopRequested) {
+                    terminal = true
+                    mutableState.update { it.copy(followMessage = "启动已取消，未发送跟随启动指令") }
+                    return@launch
+                }
+                mutableState.update { it.copy(followMessage = "正在建立跟随会话…") }
                 val control = client.openFollowChannel(current.followCamera, current.followExecute,
                     dryRun, current.followLaunchOptions)
                 channel = control

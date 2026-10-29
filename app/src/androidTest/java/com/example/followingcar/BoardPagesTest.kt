@@ -1,14 +1,17 @@
 package com.example.followingcar
 
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Rule
 import org.junit.Test
@@ -36,36 +39,53 @@ class BoardPagesTest {
     @Test
     fun manualPageSwitchesBetweenJoystickAndDirectionButtonsWithoutStartingDrive() {
         compose.onNodeWithTag("pageJoystick").performClick()
-        compose.onNodeWithTag("joystick").assertExists()
+        compose.onNodeWithTag("drivingCameraPanel").assertIsDisplayed()
+        compose.onNodeWithTag("videoServiceToggle").assertIsDisplayed().assertIsNotEnabled()
+        compose.onNodeWithTag("joystick").assertIsDisplayed()
         compose.onNodeWithTag("controlModeButtons").performClick()
-        compose.onNodeWithTag("directionPad").assertExists()
+        compose.onNodeWithTag("directionPad").assertIsDisplayed()
+        listOf("directionFORWARD", "directionLEFT", "directionRIGHT", "directionREVERSE", "directionStop")
+            .forEach { tag ->
+                compose.onNodeWithTag(tag).assertIsDisplayed().assertWidthIsAtLeast(48.dp)
+            }
+        compose.onNodeWithTag("drivingCameraPanel").assertIsDisplayed()
+        compose.onNodeWithTag("enableDrive").assertIsDisplayed()
         compose.onNodeWithTag("joystick").assertDoesNotExist()
         compose.onNodeWithTag("controlModeJoystick").performClick()
-        compose.onNodeWithTag("joystick").assertExists()
+        compose.onNodeWithTag("joystick").assertIsDisplayed()
         compose.onNodeWithTag("directionPad").assertDoesNotExist()
     }
 
     @Test
-    fun manualDriveParkingAndCameraViewsFitWithoutPageScrolling() {
+    fun drivingVideoAndControlsFitWithoutPageScrolling() {
+        compose.onNodeWithTag("boardHeader").assertIsDisplayed()
+        compose.onNodeWithTag("connectionSummary").assertIsDisplayed()
         compose.onNodeWithTag("pageJoystick").performClick()
         assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithTag("boardHeader").assertDoesNotExist()
+        compose.onNodeWithTag("connectionSummary").assertDoesNotExist()
+        compose.onNodeWithTag("manualCameraTab").assertDoesNotExist()
         compose.onNodeWithTag("manualDriveTab").assertIsSelected()
-        compose.onNodeWithTag("joystick").assertExists()
+        compose.onNodeWithTag("drivingCameraPanel").assertIsDisplayed()
+        compose.onNodeWithTag("videoServiceToggle").assertIsDisplayed().assertIsNotEnabled()
+        compose.onNodeWithTag("joystick").assertIsDisplayed()
         compose.onNodeWithTag("enableDrive").assertIsDisplayed()
 
         compose.onNodeWithTag("manualParkingTab").performClick()
         assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
-        compose.onNodeWithTag("parkingSwitch").assertExists()
-        compose.onNodeWithTag("parkingCurrent").assertExists()
-        compose.onNodeWithTag("enableDrive").assertIsDisplayed()
-
-        compose.onNodeWithTag("manualCameraTab").performClick()
-        assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
-        compose.onNodeWithTag("cameraConnectHint").assertIsDisplayed()
+        compose.onNodeWithTag("parkingSwitch").assertIsDisplayed()
+        compose.onNodeWithTag("parkingCurrent").assertIsDisplayed()
+        compose.onNodeWithTag("drivingCameraPanel").assertDoesNotExist()
         compose.onNodeWithTag("enableDrive").assertIsDisplayed()
 
         compose.onNodeWithTag("manualDriveTab").performClick()
-        compose.onNodeWithTag("joystick").assertExists()
+        compose.onNodeWithTag("drivingCameraPanel").assertIsDisplayed()
+        compose.onNodeWithTag("joystick").assertIsDisplayed()
+        compose.onNodeWithTag("enableDrive").assertIsDisplayed()
+
+        compose.onNodeWithTag("pageConnection").performClick()
+        compose.onNodeWithTag("boardHeader").assertIsDisplayed()
+        compose.onNodeWithTag("connectionSummary").assertIsDisplayed()
     }
 
     @Test

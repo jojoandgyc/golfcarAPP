@@ -12,11 +12,14 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -96,6 +99,7 @@ private enum class BoardPage(val label: String, val tag: String) {
     TERMINAL("终端", "pageTerminal"),
 }
 
+// CAMERA remains readable for saved state from the previous version; it now shows DRIVE.
 private enum class ManualSection { DRIVE, PARKING, CAMERA }
 
 @Composable
@@ -131,44 +135,47 @@ private fun BoardScreen(viewModel: BoardViewModel) {
         }
     }
 
+    val page = BoardPage.entries[selectedPageIndex]
     Scaffold { padding ->
         Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
-            Column(Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("FollowingCar", style = MaterialTheme.typography.headlineLarge,
-                    fontWeight = FontWeight.Bold)
-                Text("开发板控制台", style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Surface(
-                color = if (state.connected) MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.surfaceVariant,
-                shape = MaterialTheme.shapes.medium,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)
-            ) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(state.status, fontWeight = FontWeight.Bold,
-                                modifier = Modifier.testTag("connectionStatus"))
-                            Text(state.username + "@" + state.host + ":" + state.port,
-                                style = MaterialTheme.typography.bodySmall)
-                        }
-                        if (state.connected || state.busy) {
-                            OutlinedButton(
-                                onClick = viewModel::disconnect,
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    contentColor = if (state.connected) MaterialTheme.colorScheme.onPrimaryContainer
-                                        else MaterialTheme.colorScheme.onSurfaceVariant
-                                ),
-                                modifier = Modifier.testTag("disconnect")
-                            ) {
-                                Text(if (state.busy) "取消并断开" else "断开连接")
+            if (page != BoardPage.JOYSTICK) {
+                Column(Modifier.padding(horizontal = 20.dp, vertical = 10.dp).testTag("boardHeader"),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("FollowingCar", style = MaterialTheme.typography.headlineLarge,
+                        fontWeight = FontWeight.Bold)
+                    Text("开发板控制台", style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Surface(
+                    color = if (state.connected) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).testTag("connectionSummary")
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(state.status, fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.testTag("connectionStatus"))
+                                Text(state.username + "@" + state.host + ":" + state.port,
+                                    style = MaterialTheme.typography.bodySmall)
+                            }
+                            if (state.connected || state.busy) {
+                                OutlinedButton(
+                                    onClick = viewModel::disconnect,
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        contentColor = if (state.connected) MaterialTheme.colorScheme.onPrimaryContainer
+                                            else MaterialTheme.colorScheme.onSurfaceVariant
+                                    ),
+                                    modifier = Modifier.testTag("disconnect")
+                                ) {
+                                    Text(if (state.busy) "取消并断开" else "断开连接")
+                                }
                             }
                         }
+                        if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                     }
-                    if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 }
             }
             PrimaryTabRow(selectedTabIndex = selectedPageIndex) {
@@ -181,7 +188,6 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     )
                 }
             }
-            val page = BoardPage.entries[selectedPageIndex]
             if (page == BoardPage.JOYSTICK) {
                 JoystickCard(state, viewModel,
                     modifier = Modifier.fillMaxWidth().weight(1f).testTag("manualPage"))
@@ -311,7 +317,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
     }
     fun chooseManualSection(next: ManualSection) {
         if (manualSection == next) return
-        if (manualSection == ManualSection.DRIVE) {
+        if (manualSection != ManualSection.PARKING) {
             waitingForModeStop = state.driveEnabled && !state.driveConfirmedStopped
             viewModel.releaseJoystick()
         }
@@ -320,60 +326,64 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
     val controlling = state.driveEnabled || state.driveStarting || state.driveStopping
     val canAdjustSpeed = !state.parkingUpdating && !state.followBlocksControl &&
         (!controlling || (state.driveEnabled && state.driveLeft == 0 && state.driveRight == 0 && state.driveConfirmedStopped))
-    val errorText = state.driveError ?: state.error
+    val errorText = state.driveError ?: state.videoServiceError ?: state.error
     Card(modifier = modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
         Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("手动控制", style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                if (errorText != null) TextButton(onClick = { showError = true },
-                    modifier = Modifier.testTag("driveError")) { Text("查看故障") }
-                TextButton(onClick = { showHelp = true }) { Text("说明") }
-            }
-            Text(state.driveStatus, modifier = Modifier.fillMaxWidth().testTag("driveStatus"),
-                style = MaterialTheme.typography.bodySmall, maxLines = 1,
-                overflow = TextOverflow.Ellipsis)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = manualSection == ManualSection.DRIVE,
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = manualSection != ManualSection.PARKING,
                     onClick = { chooseManualSection(ManualSection.DRIVE) },
                     label = { Text("驾驶") }, modifier = Modifier.testTag("manualDriveTab"))
                 FilterChip(selected = manualSection == ManualSection.PARKING,
                     onClick = { chooseManualSection(ManualSection.PARKING) },
                     label = { Text("驻车") }, modifier = Modifier.testTag("manualParkingTab"))
-                FilterChip(selected = manualSection == ManualSection.CAMERA,
-                    onClick = { chooseManualSection(ManualSection.CAMERA) },
-                    label = { Text("画面") }, modifier = Modifier.testTag("manualCameraTab"))
+                Box(Modifier.weight(1f))
+                if (errorText != null) TextButton(onClick = { showError = true },
+                    modifier = Modifier.testTag("driveError")) { Text("故障") }
+                TextButton(onClick = { showHelp = true }) { Text("说明") }
             }
+            Text("${state.status} · ${state.driveStatus}",
+                modifier = Modifier.fillMaxWidth().testTag("driveStatus"),
+                style = MaterialTheme.typography.bodySmall, maxLines = 1,
+                overflow = TextOverflow.Ellipsis)
             if (manualSection == ManualSection.PARKING) {
                 Box(Modifier.fillMaxWidth().weight(1f)) {
                     ParkingControls(state, viewModel::setParkingEnabled, viewModel::changeParkingCurrent)
                 }
-            } else if (manualSection == ManualSection.CAMERA) {
-                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                    if (state.connected) {
-                        BoardCameraPreview(boardHost = state.host, modifier = Modifier.fillMaxSize())
-                    } else {
-                        Text("请先连接开发板；视频服务需在板上手动启动。",
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.testTag("cameraConnectHint"))
-                    }
-                }
             } else {
                 Column(Modifier.fillMaxWidth().weight(1f),
                     verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    BoxWithConstraints(Modifier.fillMaxWidth().testTag("drivingCameraPanel")) {
+                        // The board joins two 4:3 frames into one 8:3 video. Reserve the same
+                        // space while disconnected so reconnecting never shifts the controls.
+                        val panelHeight = maxWidth * 3 / 8 + 48.dp
+                        BoardCameraPreview(state = state,
+                            onVideoServiceEnabledChange = viewModel::setVideoServiceEnabled,
+                            modifier = Modifier.fillMaxWidth().height(panelHeight))
+                    }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedButton(onClick = { viewModel.changeSpeedLimit(state.speedLimit - 10) },
-                            enabled = state.speedLimit > 10 && canAdjustSpeed) { Text("−") }
-                        Text("最高 ${state.speedLimit} RPM", fontWeight = FontWeight.Bold)
-                        OutlinedButton(onClick = { viewModel.changeSpeedLimit(state.speedLimit + 10) },
-                            enabled = state.speedLimit < 100 && canAdjustSpeed) { Text("＋") }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(selected = !useDirectionPad, onClick = { chooseControlMode(false) },
-                            label = { Text("摇杆") }, modifier = Modifier.testTag("controlModeJoystick"))
-                        FilterChip(selected = useDirectionPad, onClick = { chooseControlMode(true) },
-                            label = { Text("方向按键") }, modifier = Modifier.testTag("controlModeButtons"))
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            FilterChip(selected = !useDirectionPad, onClick = { chooseControlMode(false) },
+                                label = { Text("摇杆") }, modifier = Modifier.testTag("controlModeJoystick"))
+                            FilterChip(selected = useDirectionPad, onClick = { chooseControlMode(true) },
+                                label = { Text("按键") }, modifier = Modifier.testTag("controlModeButtons"))
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedButton(onClick = { viewModel.changeSpeedLimit(state.speedLimit - 10) },
+                                enabled = state.speedLimit > 10 && canAdjustSpeed,
+                                modifier = Modifier.size(48.dp).semantics { contentDescription = "降低最高转速" },
+                                contentPadding = PaddingValues(0.dp)) { Text("−") }
+                            Column(Modifier.width(64.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("最高转速", style = MaterialTheme.typography.labelSmall)
+                                Text("${state.speedLimit} RPM", style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(onClick = { viewModel.changeSpeedLimit(state.speedLimit + 10) },
+                                enabled = state.speedLimit < 100 && canAdjustSpeed,
+                                modifier = Modifier.size(48.dp).semantics { contentDescription = "提高最高转速" },
+                                contentPadding = PaddingValues(0.dp)) { Text("＋") }
+                        }
                     }
                     val inputEnabled = state.driveEnabled && !state.driveStopping &&
                         !state.parkingUpdating && !state.followBlocksControl && !waitingForModeStop
@@ -406,7 +416,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
             }
             if (!controlling) {
                 Button(onClick = { viewModel.enableDrive() },
-                    enabled = state.connected && !state.busy && !state.followBlocksControl,
+                    enabled = state.canEnableDrive,
                     modifier = Modifier.fillMaxWidth().testTag("enableDrive")) {
                     Text("启用手动控制")
                 }
@@ -425,7 +435,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
         confirmButton = { TextButton(onClick = { showError = false }) { Text("关闭") } })
     if (showHelp) AlertDialog(onDismissRequest = { showHelp = false },
         title = { Text("手动控制说明") },
-        text = { Text("启用前请退出开发板上的键盘遥控或跟随程序。摇杆上推前进、下拉后退、左右转向，推得越远速度越快。方向键按住行驶，松手停车。切换控制方式或页面会停车；离开 App 会停用手动控制。画面页左侧是 RGB、右侧是深度伪彩，视频服务需在开发板上手动启动。") },
+        text = { Text("启用前请退出开发板上的键盘遥控或跟随程序。摇杆上推前进、下拉后退、左右转向，推得越远速度越快。方向键按住行驶，松手停车。切换控制方式或页面会停车；离开 App 会停用手动控制。驾驶页上方视频左侧是 RGB、右侧是深度伪彩，可用视频按钮单独开关。启用手动控制会自动开启视频；停用手动控制会关闭视频。启动自动跟随前会先关闭视频，释放摄像头。") },
         confirmButton = { TextButton(onClick = { showHelp = false }) { Text("关闭") } })
 }
 
