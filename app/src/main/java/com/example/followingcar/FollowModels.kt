@@ -49,6 +49,17 @@ data class FollowConfiguration(
     val models: List<String>,
     val cameraDetails: Map<String, String>,
     val rawJson: String,
+    val execute: Boolean = false,
+)
+
+/** Board-reported phase timings, not a percentage or a promise of remaining time. */
+data class FollowStartup(
+    val stage: String,
+    val stageElapsedMs: Long,
+    val totalElapsedMs: Long,
+    val stageTimeoutMs: Long,
+    val totalTimeoutMs: Long,
+    val completed: Boolean,
 )
 
 /** Null telemetry is unknown/unavailable, never an implied zero or a successful stop. */
@@ -74,6 +85,12 @@ data class FollowStatus(
     val fault: String? = null,
     val processExited: Boolean = false,
     val targetDetected: Boolean? = null,
+    val finalStatusPending: Boolean = false,
+    val startup: FollowStartup? = null,
+    val logDir: String? = null,
+    val exitCode: Int? = null,
+    val commandStop: Boolean? = null,
+    val commandSimulated: Boolean? = null,
 )
 
 data class FollowReply(val status: FollowStatus, val terminal: Boolean)
@@ -81,11 +98,14 @@ data class FollowReady(val runId: String, val dryRun: Boolean, val execute: Bool
 data class FollowAvailability(val controlAvailable: Boolean, val reason: String?)
 
 /** The launcher may print camera diagnostics before its one, complete configuration object. */
-internal fun parseFollowConfiguration(stdout: String, camera: FollowCamera): FollowConfiguration {
+internal fun parseFollowConfiguration(
+    stdout: String, camera: FollowCamera, expectedExecute: Boolean = false,
+): FollowConfiguration {
     val json = followJsonObject(stdout, allowPrefix = true)
     followRequire(json.strictString("chain") == "continuous", "配置不是 continuous 跟随链")
     followRequire(!json.strictBoolean("hardware_opened"), "配置检查意外打开了硬件")
-    followRequire(!json.strictBoolean("execute"), "配置检查不能处于实车执行模式")
+    val execute = json.strictBoolean("execute")
+    followRequire(execute == expectedExecute, "配置检查与请求的实车/影子模式不一致")
     val controller = json.strictObject("controller")
     val targetDistance = json.strictNumber("effective_target_distance_m")
     val maxRpm = controller.strictNumber("max_rpm")
@@ -123,6 +143,7 @@ internal fun parseFollowConfiguration(stdout: String, camera: FollowCamera): Fol
         models = models,
         cameraDetails = cameraDetails,
         rawJson = json.toString(2),
+        execute = execute,
     )
 }
 
@@ -141,7 +162,8 @@ internal fun parseFollowStatus(json: JSONObject): FollowStatus {
     val trackId = target?.let {
         when (val id = it.valueOrNull("trackId")) {
             null -> null // A fresh SEARCH observation can have no selected person.
-            is String -> id.takeIf(String::isNotBlank) ?: throw IOException("跟随目标编号无效")
+            is String -> id.takeIf(String::isNotBlank)?.let { Diagnostics.safeText(it, 200) }
+                ?: throw IOException("跟随目标编号无效")
             is Int -> id.toString()
             is Long -> id.toString()
             else -> throw IOException("跟随目标编号无效")
@@ -149,13 +171,22 @@ internal fun parseFollowStatus(json: JSONObject): FollowStatus {
     }
     val distance = range?.strictNumber("distanceM")
     followRequire(distance == null || distance >= 0, "跟随目标距离无效")
-    if (command != null) command.strictBoolean("simulated")
+    val startup = json.optionalObject("startup")?.let {
+        FollowStartup(
+            stage = Diagnostics.safeText(it.strictString("stage"), 120),
+            stageElapsedMs = it.strictAge("stageElapsedMs"),
+            totalElapsedMs = it.strictAge("totalElapsedMs"),
+            stageTimeoutMs = it.strictAge("stageTimeoutMs"),
+            totalTimeoutMs = it.strictAge("totalTimeoutMs"),
+            completed = it.strictBoolean("completed"),
+        )
+    }
     return FollowStatus(
         runState = runState,
         execute = json.strictBoolean("execute"),
         camera = camera,
-        behavior = json.optionalString("behavior"),
-        reason = json.optionalString("reason"),
+        behavior = json.optionalString("behavior")?.let { Diagnostics.safeText(it, 200) },
+        reason = json.optionalString("reason")?.let { Diagnostics.safeText(it, 600) },
         targetTrackId = trackId,
         targetAgeMs = target?.strictAge("ageMs"),
         distanceMeters = distance,
@@ -169,16 +200,23 @@ internal fun parseFollowStatus(json: JSONObject): FollowStatus {
         stopAcknowledged = stop.optionalBoolean("acknowledged"),
         physicalStopped = null,
         statusAgeMs = if (json.valueOrNull("statusAgeMs") == null) null else json.strictAge("statusAgeMs"),
-        fault = json.optionalString("fault"),
+        fault = json.optionalString("fault")?.let { Diagnostics.safeText(it, 600) },
         processExited = json.strictBoolean("processExited"),
         targetDetected = target?.optionalBoolean("detected"),
+        finalStatusPending = json.optionalBoolean("finalStatusPending") ?: false,
+        startup = startup,
+        logDir = json.optionalString("logDir")?.let { Diagnostics.safeText(it, 600) },
+        exitCode = json.optionalInteger("exitCode"),
+        commandStop = command?.optionalBoolean("stop"),
+        commandSimulated = command?.strictBoolean("simulated"),
     )
 }
 
 internal fun parseFollowAvailability(stdout: String): FollowAvailability {
     val json = followJsonObject(stdout, allowPrefix = false)
     followRequire(json.strictString("type") == "availability", "开发板控制占用响应无效")
-    return FollowAvailability(json.strictBoolean("controlAvailable"), json.optionalString("reason"))
+    return FollowAvailability(json.strictBoolean("controlAvailable"),
+        json.optionalString("reason")?.let { Diagnostics.safeText(it, 600) })
 }
 
 private fun followJsonObject(output: String, allowPrefix: Boolean): JSONObject {
@@ -261,6 +299,14 @@ private fun JSONObject.strictAge(key: String): Long {
     val value = valueOrNull(key)
     followRequire(value is Int || value is Long, "跟随字段 $key 不是整数毫秒")
     return (value as Number).toLong().also { followRequire(it >= 0, "跟随数据年龄不能为负数") }
+}
+
+private fun JSONObject.optionalInteger(key: String): Int? {
+    val value = valueOrNull(key) ?: return null
+    followRequire(value is Int || value is Long, "跟随字段 $key 不是整数")
+    val number = (value as Number).toLong()
+    followRequire(number in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong(), "跟随字段 $key 超出整数范围")
+    return number.toInt()
 }
 
 private fun JSONObject.strictObject(key: String): JSONObject = optionalObject(key)

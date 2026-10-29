@@ -9,7 +9,7 @@ class FollowPresentationTest {
     private fun running() = BoardUiState(connected = true, followActive = true,
         followStatus = FollowStatus("RUNNING", true, FollowCamera.CONFIG, behavior = "FOLLOW",
             targetDetected = true, targetTrackId = "7", targetAgeMs = 50,
-            distanceMeters = 1.5, rangeAgeMs = 50, statusAgeMs = 20))
+            distanceMeters = 1.5, rangeAgeMs = 50, statusAgeMs = 20, commandStop = false))
 
     @Test fun pendingRecoveryOverridesEvenFreshRunningTelemetry() {
         listOf(true, false).forEach { connected ->
@@ -24,14 +24,17 @@ class FollowPresentationTest {
         assertEquals("连接中断", disconnected.title)
         assertNoCurrentTelemetry(disconnected)
         val inactive = followPresentation(running().copy(followActive = false))
-        assertEquals("准备开始跟随", inactive.title)
+        assertEquals("上次会话结果未确认", inactive.title)
         assertNoCurrentTelemetry(inactive)
     }
 
-    @Test fun processExitOverridesContradictoryRunningAndFreshTarget() {
+    @Test fun onlyTerminalAckConfirmsSessionEndAndSurvivesExpectedDisconnection() {
         val state = running()
-        val result = followPresentation(state.copy(followStatus = state.followStatus!!.copy(processExited = true)))
-        assertEquals("本次跟随已结束", result.title)
+        val exited = state.followStatus!!.copy(processExited = true)
+        val pending = followPresentation(state.copy(followStatus = exited))
+        assertEquals("等待会话结束确认", pending.title)
+        val result = followPresentation(state.copy(followStatus = exited, followTerminal = true, connected = false))
+        assertEquals("跟随程序已退出", result.title)
         assertTrue(result.subtitle.contains("不代表车轮已经停稳"))
         assertNoCurrentTelemetry(result)
     }
@@ -42,7 +45,9 @@ class FollowPresentationTest {
         val active = followPresentation(state.copy(followStatus = fault))
         assertEquals("跟随出现异常", active.title)
         assertNoCurrentTelemetry(active)
-        val exited = followPresentation(state.copy(followStatus = fault.copy(processExited = true)))
+        val pending = followPresentation(state.copy(followStatus = fault.copy(processExited = true)))
+        assertEquals("故障，等待关闭结果", pending.title)
+        val exited = followPresentation(state.copy(followStatus = fault.copy(processExited = true), followTerminal = true))
         assertEquals("跟随异常结束", exited.title)
         assertNoCurrentTelemetry(exited)
     }
@@ -108,6 +113,62 @@ class FollowPresentationTest {
             status.copy(targetDetected = false)).forEach {
             assertFalse(followPresentation(state.copy(followStatus = it)).rangeFresh)
         }
+    }
+
+    @Test fun readyAndFinalIpcWaitAreNotTerminalEvenWhenProcessExited() {
+        val state = running()
+        val exited = state.followStatus!!.copy(runState = "STOPPED", processExited = true)
+        assertEquals("已连接，等待开始", followPresentation(state.copy(followStatus = exited)).title)
+        val pending = followPresentation(state.copy(followStatus = exited.copy(finalStatusPending = true)))
+        assertEquals("正在确认退出结果", pending.title)
+        assertNoCurrentTelemetry(pending)
+    }
+
+    @Test fun startupStagesAreOptionalAndNeverOverrideLifecycle() {
+        val state = running()
+        val startup = FollowStartup("camera", 1_200, 4_600, 15_000, 30_000, false)
+        val starting = state.followStatus!!.copy(runState = "STARTING", statusAgeMs = null, startup = startup)
+        assertTrue(followPresentation(state.copy(followStatus = starting)).subtitle.contains("打开相机"))
+        assertEquals("正在启动跟随", followPresentation(state.copy(followStatus = starting.copy(startup = null))).title)
+        assertTrue(followPresentation(state.copy(followStatus = starting.copy(startup = startup.copy(stage = "future_stage")))).subtitle.contains("启动中"))
+        assertEquals("跟随出现异常", followPresentation(state.copy(followStatus = starting.copy(runState = "FAULT", fault = "startup deadline"))).title)
+        assertEquals("正在停止跟随", followPresentation(state.copy(followStatus = starting.copy(runState = "STOPPING", startup = startup.copy(completed = true)))).title)
+    }
+
+    @Test fun phoneElapsedTimeAgesTelemetryWithoutComparingBoardClocks() {
+        val state = running().copy(followLastReplyElapsedMs = 10_000)
+        assertTrue(followPresentation(state, 10_550).rangeFresh)
+        assertFalse(followPresentation(state, 10_551).rangeFresh)
+        assertEquals("状态已过期", followPresentation(state, 11_981).title)
+        assertEquals("状态已过期", followPresentation(state, 9_999).title)
+        assertEquals("状态已过期", followPresentation(state).title)
+    }
+
+    @Test fun stopAndUnknownCommandDoNotClaimActiveFollowing() {
+        val state = running()
+        assertEquals("运行中，已发停止指令", followPresentation(state.copy(followStatus = state.followStatus!!.copy(commandStop = true))).title)
+        assertEquals("运行中", followPresentation(state.copy(followStatus = state.followStatus!!.copy(commandStop = null))).title)
+    }
+
+    @Test fun releasedControlRetainsHistoricalFaultWithoutClaimingCurrentMonitoring() {
+        val state = running().copy(followActive = false,
+            followStatus = running().followStatus!!.copy(runState = "FAULT", fault = "close failed", processExited = true))
+        val result = followPresentation(state)
+        assertEquals("上次跟随异常", result.title)
+        assertTrue(result.subtitle.contains("上次记录"))
+        assertNoCurrentTelemetry(result)
+    }
+
+    @Test fun cancellationNeedsAConfirmedLocalOrProtocolOutcomeAndCannotHideFaults() {
+        val localCancelled = BoardUiState(connected = true, followStartCancelled = true)
+        assertEquals("启动已取消", followPresentation(localCancelled).title)
+        val terminalCancelled = localCancelled.copy(followTerminal = true,
+            followStatus = FollowStatus("STOPPED", false, FollowCamera.ASTRA_PRO, processExited = true))
+        assertEquals("启动已取消", followPresentation(terminalCancelled).title)
+        assertEquals("跟随异常结束", followPresentation(terminalCancelled.copy(
+            followStatus = terminalCancelled.followStatus!!.copy(fault = "close failed"))).title)
+        assertEquals("状态待确认", followPresentation(localCancelled.copy(followUncertain = true)).title)
+        assertEquals("上次操作未完成", followPresentation(localCancelled.copy(followError = "close failed")).title)
     }
 }
 

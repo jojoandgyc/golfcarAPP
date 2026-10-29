@@ -1,7 +1,9 @@
 package com.example.followingcar
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
@@ -17,6 +19,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Rule
@@ -171,7 +175,7 @@ class FollowControlsTest {
     @Test fun processExitAndStopAckNeverClaimMechanicalStop() {
         val finished = status().copy(runState = "STOPPED", processExited = true,
             stopRequested = true, stopAcknowledged = true, physicalStopped = null)
-        compose.setContent { TestPage(ready().copy(followStatus = finished)) }
+        compose.setContent { TestPage(ready().copy(followStatus = finished, followTerminal = true)) }
         openDetails()
         compose.onNodeWithTag("followRunState").assertTextEquals("软件状态：已结束")
         compose.onNodeWithTag("followProcessExited").assertTextEquals("跟随进程：已退出")
@@ -186,6 +190,42 @@ class FollowControlsTest {
         compose.onNodeWithTag("followRunState").assertTextEquals("软件状态：已过期或未知（上次运行中）")
         compose.onNodeWithTag("followBehavior").assertTextEquals("控制行为与原因：未知或已过期")
         compose.onNodeWithTag("followDistance").assertTextEquals("距离：未知或已过期")
+    }
+
+    @Test fun startupProgressAndFinalIpcWaitDoNotReleaseStartOrClaimSuccess() {
+        val state = mutableStateOf(ready().copy(followActive = true, followStatus = status().copy(
+            runState = "STARTING", statusAgeMs = null,
+            startup = FollowStartup("camera", 1_200, 4_600, 15_000, 30_000, false))))
+        compose.setContent { TestPage(state.value) }
+        compose.onNodeWithTag("followStatusTitle").assertTextEquals("正在启动跟随")
+        compose.onNodeWithTag("followStartupProgress").assertTextEquals("启动已用 4.6 s · 总期限 30 s")
+        compose.onNodeWithTag("followProgressMessage").assertDoesNotExist()
+        compose.onNodeWithTag("stopFollow").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("startFollow").assertDoesNotExist()
+        saveUiSnapshot("follow-handoff-startup.png")
+        compose.runOnIdle { state.value = state.value.copy(followStopping = true,
+            followStatus = state.value.followStatus!!.copy(runState = "STOPPED", processExited = true,
+                finalStatusPending = true, stopRequested = true)) }
+        compose.onNodeWithTag("followStatusTitle").assertTextEquals("正在确认退出结果")
+        compose.onNodeWithTag("startFollow").assertDoesNotExist()
+        saveUiSnapshot("follow-handoff-final-pending.png")
+        openDetails()
+        compose.onNodeWithTag("followFinalStatusPending").performScrollTo().assertTextEquals("最终关闭状态：正在等待")
+        compose.onNodeWithTag("followTerminal").performScrollTo().assertTextEquals("会话终态：未收到")
+    }
+
+    @Test fun faultWhileWorkerLivesAndFaultAfterTerminalStayDistinct() {
+        val state = mutableStateOf(ready().copy(followActive = true, followStatus = status().copy(
+            runState = "FAULT", fault = "close timeout", processExited = false)))
+        compose.setContent { TestPage(state.value) }
+        compose.onNodeWithTag("followStatusTitle").assertTextEquals("跟随出现异常")
+        compose.onNodeWithTag("startFollow").assertDoesNotExist()
+        compose.runOnIdle { state.value = state.value.copy(followActive = false, followTerminal = true,
+            followStatus = state.value.followStatus!!.copy(processExited = true)) }
+        compose.onNodeWithTag("followStatusTitle").assertTextEquals("跟随异常结束")
+        openDetails()
+        compose.onNodeWithTag("followRunState").assertTextEquals("软件状态：故障退出")
+        compose.onNodeWithTag("followPhysicalStopped").performScrollTo().assertTextEquals("机械停稳：未知")
     }
 
     @Test fun configurationOnlyLoadsAfterExplicitExpansionAndRead() {
@@ -229,6 +269,21 @@ class FollowControlsTest {
 
     private fun openDetails() { compose.onNodeWithTag("followDetailsToggle").performScrollTo().performClick() }
 
+    /** Optional visual evidence, separate from semantic assertions and test pass/fail. */
+    private fun saveUiSnapshot(name: String) {
+        runCatching {
+            compose.waitForIdle()
+            val instrumentation = InstrumentationRegistry.getInstrumentation()
+            val bitmap = instrumentation.uiAutomation.takeScreenshot() ?: return
+            try {
+                val directory = instrumentation.targetContext.externalCacheDir ?: return
+                File(directory, name).outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            } finally {
+                bitmap.recycle()
+            }
+        }
+    }
+
     @Composable
     private fun TestPage(
         state: BoardUiState,
@@ -238,7 +293,7 @@ class FollowControlsTest {
         onOpenConnection: () -> Unit = {},
     ) {
         MaterialTheme {
-            Box(Modifier.fillMaxSize()) {
+            Box(Modifier.fillMaxSize().systemBarsPadding()) {
                 FollowPage(state, onExecuteChange, onStart, onStop, onInspect, onOptionsChange,
                     onCameraChange, onRefreshConfiguration, onOpenConnection, Modifier.fillMaxSize())
             }

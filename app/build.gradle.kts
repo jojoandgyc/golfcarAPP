@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 9
-        versionName = "1.7.1-bluetooth-check"
+        versionCode = 10
+        versionName = "1.7.2-follow-lifecycle"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

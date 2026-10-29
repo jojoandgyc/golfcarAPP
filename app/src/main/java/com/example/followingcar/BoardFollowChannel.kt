@@ -2,11 +2,16 @@ package com.example.followingcar
 
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.Session
+import android.util.JsonReader
+import android.util.JsonToken
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.StringReader
 import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +49,13 @@ class BoardFollowChannel private constructor(
     @Volatile private var currentCommand = "open"
     @Volatile private var lastAckSequence = 0L
     @Volatile private var lastAckNanos = 0L
+    /** Only validated replies advance freshness; error snapshots are diagnostic evidence. */
+    @Volatile var lastReplyReceivedNanos = 0L
+        private set
+    @Volatile var lastStatus: FollowStatus? = null
+        private set
+    @Volatile var terminalReply: FollowReply? = null
+        private set
     lateinit var ready: FollowReady
         private set
 
@@ -60,6 +72,9 @@ class BoardFollowChannel private constructor(
 
     /** Acknowledges the request promptly; heartbeat continues until the owned process exits. */
     suspend fun requestStop(): FollowReply = transact("stop")
+
+    /** Cancel a ready-but-not-started session without creating a worker. */
+    suspend fun requestClose(): FollowReply = transact("close")
 
     /** EOF asks the supervisor to stop; a lost network also expires the board-side lease. */
     fun close(reason: String = "requested", invalidateTransport: Boolean = false) {
@@ -81,6 +96,8 @@ class BoardFollowChannel private constructor(
         currentCommand = command
         phase = "check_open"
         try {
+            // An already validated terminal reply wins over late EOF and duplicate stop intents.
+            terminalReply?.let { return@withContext it }
             check(isOpen) { "跟随通道已关闭，运行状态未确认" }
             val result = withTimeout(ACK_TIMEOUT_MS) {
                 currentCoroutineContext().ensureActive()
@@ -109,32 +126,42 @@ class BoardFollowChannel private constructor(
                 requireMessage(nextToken != previousToken, "跟随控制令牌未更新")
                 val terminal = reply.opt("terminal")
                 requireMessage(terminal is Boolean, "跟随回执缺少结束状态")
-                val status = parseFollowStatus(reply.getJSONObject("status"))
+                val status = preserveFault(parseFollowStatus(reply.getJSONObject("status")))
                 requireMessage(status.execute == ready.execute && status.camera == ready.camera,
                     "跟随回执模式或相机不匹配")
                 if (terminal == true) {
-                    requireMessage(status.processExited && status.runState in setOf("STOPPED", "FAULT"),
+                    requireMessage(status.processExited && !status.finalStatusPending &&
+                        status.runState in setOf("STOPPED", "FAULT"),
                         "跟随进程结束回执不一致")
                 }
                 token = nextToken
                 lastAckSequence = sentSequence
                 lastAckNanos = System.nanoTime()
+                lastReplyReceivedNanos = lastAckNanos
+                lastStatus = status
                 Diagnostics.event("follow.ack", diagnosticContext, fields = mapOf(
                     "commandType" to command, "seq" to sentSequence, "elapsedMs" to elapsedMillis(started),
                     "terminal" to terminal, "runState" to status.runState,
                     "processExited" to status.processExited, "stopRequested" to status.stopRequested,
-                    "stopAcknowledged" to status.stopAcknowledged, "statusAgeMs" to status.statusAgeMs),
+                    "stopAcknowledged" to status.stopAcknowledged, "statusAgeMs" to status.statusAgeMs) +
+                    statusDiagnosticFields(status),
                     critical = terminal == true || command != "heartbeat" || status.fault != null)
                 status.fault?.let { fault ->
                     Diagnostics.failure(diagnosticContext, "follow.board_fault", IOException(fault),
                         diagnosticFields())
                 }
                 phase = "idle"
-                FollowReply(status, terminal as Boolean)
+                FollowReply(status, terminal as Boolean).also {
+                    if (it.terminal) terminalReply = it
+                }
             }
             if (result.terminal) close("terminal_ack")
             result
         } catch (timeout: TimeoutCancellationException) {
+            terminalReply?.let {
+                close("terminal_ack")
+                return@withContext it
+            }
             val failure = SocketTimeoutException("跟随回执超时；板端将请求停止，车辆状态未确认")
             Diagnostics.failure(diagnosticContext, "follow.ack_timeout", failure,
                 diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to ACK_TIMEOUT_MS))
@@ -143,6 +170,11 @@ class BoardFollowChannel private constructor(
             close("ack_timeout", invalidateTransport = true)
             throw failure
         } catch (failure: Exception) {
+            terminalReply?.let {
+                close("terminal_ack")
+                if (failure is CancellationException) throw failure
+                return@withContext it
+            }
             val safeFailure = protocolDiagnosticFailure(failure)
             if (failure is CancellationException) {
                 Diagnostics.event("follow.transaction_cancelled", diagnosticContext,
@@ -169,7 +201,7 @@ class BoardFollowChannel private constructor(
                 if (value < 0) throw endedError()
                 if (value == '\n'.code) {
                     val message = try {
-                        JSONObject(bytes.toString(Charsets.UTF_8.name()))
+                        parseFollowWireMessage(bytes.toByteArray())
                     } catch (failure: Exception) {
                         // A parser's exception can echo the raw protocol, including its token.
                         Diagnostics.event("follow.protocol_error", diagnosticContext,
@@ -178,7 +210,7 @@ class BoardFollowChannel private constructor(
                         throw IOException("开发板跟随响应不是有效 JSON")
                     }
                     if (message.opt("type") == "error") {
-                        throw IOException(message.optString("error", "开发板跟随程序报错").take(600))
+                        throw sessionError(message)
                     }
                     return message
                 }
@@ -192,9 +224,30 @@ class BoardFollowChannel private constructor(
 
     private fun endedError(): IOException {
         Diagnostics.event("follow.eof", diagnosticContext, fields = diagnosticFields(), critical = true)
-        val detail = stderr.text().trim().take(600)
+        val detail = Diagnostics.safeText(stderr.text().trim(), 600)
         return IOException(if (detail.isNotBlank()) "跟随控制程序退出：$detail"
             else "跟随控制通道已结束，未确认车辆停止；请检查控制占用")
+    }
+
+    private fun preserveFault(status: FollowStatus): FollowStatus = status.copy(
+        fault = lastStatus?.fault ?: status.fault?.let { Diagnostics.safeText(it) },
+    )
+
+    private fun sessionError(message: JSONObject): FollowSessionException {
+        val reported = message.optJSONObject("status")?.let { json ->
+            runCatching { parseFollowStatus(json) }.getOrNull()?.takeIf { status ->
+                !::ready.isInitialized || status.execute == ready.execute && status.camera == ready.camera &&
+                    (!message.has("runId") || message.opt("runId") == ready.runId)
+            }?.let(::preserveFault)
+        }
+        reported?.let { lastStatus = it }
+        val detail = (message.opt("error") as? String)?.takeIf(String::isNotBlank)
+            ?: "开发板跟随会话失败"
+        val failure = FollowSessionException(Diagnostics.safeText(detail, 600), reported)
+        Diagnostics.failure(diagnosticContext, "follow.session_error", failure,
+            diagnosticFields() + statusDiagnosticFields(reported) + mapOf(
+                "errorStatusPresent" to (reported != null), "terminal" to false))
+        return failure
     }
 
     private suspend fun blockingCall(action: () -> Unit) {
@@ -259,6 +312,7 @@ class BoardFollowChannel private constructor(
             abortTransport: (reason: String, diagnostic: DiagnosticContext) -> Unit,
         ): BoardFollowChannel = withContext(Dispatchers.IO) {
             options.validate(camera)
+            require(!dryRun || !execute) { "纯模拟会话不能启用实车执行" }
             val started = System.nanoTime()
             var opened: BoardFollowChannel? = null
             Diagnostics.event("follow.channel_open_requested", diagnostic,
@@ -298,6 +352,13 @@ class BoardFollowChannel private constructor(
                     control.requireMessage(reply.opt("heartbeatMs") == 500 && reply.opt("watchdogMs") == 2000,
                         "开发板跟随心跳参数不匹配")
                     control.ready = FollowReady(runId, dryRun, execute, camera)
+                    reply.optJSONObject("status")?.let { json ->
+                        val status = parseFollowStatus(json)
+                        control.requireMessage(status.execute == execute && status.camera == camera,
+                            "跟随初始状态的模式或相机不匹配")
+                        control.lastStatus = control.preserveFault(status)
+                    }
+                    control.lastReplyReceivedNanos = System.nanoTime()
                     control.phase = "idle"
                     Diagnostics.event("follow.ready", control.diagnosticContext,
                         fields = mapOf("camera" to camera.argument, "execute" to execute, "dryRun" to dryRun,
@@ -356,13 +417,68 @@ private fun JSONObject.numberMatches(key: String, expected: Double?): Boolean {
 
 internal fun followConfigurationCommand(
     camera: FollowCamera, options: FollowLaunchOptions = FollowLaunchOptions(),
+    execute: Boolean = false,
 ): String {
     options.validate(camera)
-    if (options != FollowLaunchOptions()) {
-        return "python3 -u $FOLLOW_PROJECT_ROOT/app_follow_bridge.py --camera ${camera.argument}" +
-            followLaunchArguments(options) + " --check-config"
+    return "python3 -u $FOLLOW_PROJECT_ROOT/app_follow_bridge.py --camera ${camera.argument}" +
+        followLaunchArguments(options) + (if (execute) " --execute" else "") + " --check-config"
+}
+
+/** An error response ends the protocol; its optional snapshot never proves a terminal ACK. */
+class FollowSessionException(message: String, val status: FollowStatus?) : IOException(message)
+
+/** Explicit fields only: never serialize the entire status or response into diagnostics. */
+private fun statusDiagnosticFields(status: FollowStatus?): Map<String, Any?> = mapOf(
+    "runState" to status?.runState,
+    "processExited" to status?.processExited,
+    "stopRequested" to status?.stopRequested,
+    "stopAcknowledged" to status?.stopAcknowledged,
+    "statusAgeMs" to status?.statusAgeMs,
+    "boardFault" to status?.fault,
+    "finalStatusPending" to status?.finalStatusPending,
+    "exitCode" to status?.exitCode,
+    "logDir" to status?.logDir,
+    "startupStage" to status?.startup?.stage,
+    "startupStageElapsedMs" to status?.startup?.stageElapsedMs,
+    "startupTotalElapsedMs" to status?.startup?.totalElapsedMs,
+    "startupStageTimeoutMs" to status?.startup?.stageTimeoutMs,
+    "startupTotalTimeoutMs" to status?.startup?.totalTimeoutMs,
+    "startupCompleted" to status?.startup?.completed,
+)
+
+/** Android JSONObject alone also accepts trailing text and duplicate keys; neither is a frame. */
+internal fun parseFollowWireMessage(bytes: ByteArray): JSONObject {
+    val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()
+    JsonReader(StringReader(text)).use { reader ->
+        reader.isLenient = false
+        require(reader.peek() == JsonToken.BEGIN_OBJECT)
+        validateFollowJsonValue(reader, 0)
+        require(reader.peek() == JsonToken.END_DOCUMENT)
     }
-    return "cd $FOLLOW_PROJECT_ROOT && exec ./run_request_0428_modular.sh --chain continuous " +
-        "--config car_control_modular/config/reid_runtime.ini --camera ${camera.argument} " +
-        "--settings continuous_follow/baseline.ini --no-gestures --avoidance off --no-reverse-follow --check-config"
+    return JSONObject(text)
+}
+
+private fun validateFollowJsonValue(reader: JsonReader, depth: Int) {
+    require(depth <= 32)
+    when (reader.peek()) {
+        JsonToken.BEGIN_OBJECT -> {
+            val keys = HashSet<String>()
+            reader.beginObject()
+            while (reader.hasNext()) {
+                require(keys.add(reader.nextName()))
+                validateFollowJsonValue(reader, depth + 1)
+            }
+            reader.endObject()
+        }
+        JsonToken.BEGIN_ARRAY -> {
+            reader.beginArray()
+            while (reader.hasNext()) validateFollowJsonValue(reader, depth + 1)
+            reader.endArray()
+        }
+        JsonToken.STRING, JsonToken.NUMBER -> reader.nextString()
+        JsonToken.BOOLEAN -> reader.nextBoolean()
+        JsonToken.NULL -> reader.nextNull()
+        else -> throw IOException("开发板跟随响应不是有效 JSON")
+    }
 }

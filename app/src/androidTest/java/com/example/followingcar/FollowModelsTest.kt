@@ -73,6 +73,15 @@ class FollowModelsTest {
     }
 
     @Test
+    fun realModeStaticPreflightRequiresMatchingModeAndNeverOpenedHardware() {
+        val real = configuration().put("execute", true)
+        val parsed = parseFollowConfiguration(real.toString(), FollowCamera.ASTRA_PRO, expectedExecute = true)
+        assertTrue(parsed.execute)
+        assertRejected { parseFollowConfiguration(configuration().toString(), FollowCamera.ASTRA_PRO, expectedExecute = true) }
+        assertRejected { parseFollowConfiguration(real.put("hardware_opened", true).toString(), FollowCamera.ASTRA_PRO, expectedExecute = true) }
+    }
+
+    @Test
     fun configurationRejectsMissingMistypedAndOutOfRangeValues() {
         val invalid = listOf(
             configuration().put("effective_target_distance_m", "1.2"),
@@ -184,6 +193,74 @@ class FollowModelsTest {
             "{\"type\":\"availability\",\"controlAvailable\":true} extra",
         ).forEach { assertRejected { parseFollowAvailability(it) } }
     }
+
+    @Test
+    fun startupAndFinalStatusWaitAreCompatibleAdditionsNotTerminalEvidence() {
+        val old = parseFollowStatus(status())
+        assertNull(old.startup)
+        assertFalse(old.finalStatusPending)
+        assertNull(old.exitCode)
+        assertNull(old.logDir)
+        val json = status().put("runState", "STOPPING").put("processExited", true)
+            .put("finalStatusPending", true).put("exitCode", -15).put("logDir", "/logs/run-123")
+            .put("startup", startup().put("stage", "future_stage").put("futureField", "ignored"))
+            .put("futureResponseField", JSONObject().put("value", true))
+        val parsed = parseFollowStatus(json)
+        assertEquals("future_stage", parsed.startup!!.stage)
+        assertEquals(1_200L, parsed.startup!!.stageElapsedMs)
+        assertEquals(30_000L, parsed.startup!!.totalTimeoutMs)
+        assertFalse(parsed.startup!!.completed)
+        assertTrue(parsed.finalStatusPending)
+        assertTrue(parsed.processExited)
+        assertEquals(-15, parsed.exitCode)
+        assertEquals("/logs/run-123", parsed.logDir)
+        assertNull(parseFollowStatus(status().put("startup", JSONObject.NULL)).startup)
+    }
+
+    @Test
+    fun malformedStartupAndLifecycleTypesDoNotBecomePlausibleProgress() {
+        listOf(
+            status().put("finalStatusPending", "true"),
+            status().put("exitCode", 1.5),
+            status().put("exitCode", Long.MAX_VALUE),
+            status().put("logDir", 12),
+            status().put("startup", "camera"),
+            status().put("startup", startup().put("stageElapsedMs", -1)),
+            status().put("startup", startup().put("totalElapsedMs", 0.5)),
+            status().put("startup", startup().put("completed", "false")),
+            status().put("startup", startup().apply { remove("stageTimeoutMs") }),
+        ).forEach { assertRejected { parseFollowStatus(it) } }
+    }
+
+    @Test
+    fun commandStopAndSimulationRemainSeparateFromRealWheelFeedback() {
+        val parsed = parseFollowStatus(status().put("command", JSONObject()
+            .put("leftRpm", 0).put("rightRpm", 0).put("simulated", true).put("stop", true)))
+        assertEquals(true, parsed.commandStop)
+        assertEquals(true, parsed.commandSimulated)
+        assertNull(parsed.feedbackLeftRpm)
+        assertNull(parsed.physicalStopped)
+        assertRejected { parseFollowStatus(status().put("command", JSONObject()
+            .put("leftRpm", 0).put("rightRpm", 0).put("simulated", false).put("stop", "true"))) }
+    }
+
+    @Test
+    fun diagnosticTextIsRedactedBeforeItCanReachTheUi() {
+        val secret = "model-test-secret-73912"
+        Diagnostics.protectSecret(secret)
+        val parsed = parseFollowStatus(status().put("fault", "close failed with $secret")
+            .put("reason", "unknown_reason $secret").put("logDir", "/logs/$secret"))
+        assertFalse(parsed.fault!!.contains(secret))
+        assertFalse(parsed.reason!!.contains(secret))
+        assertFalse(parsed.logDir!!.contains(secret))
+        assertTrue(parsed.reason!!.contains("unknown_reason"))
+        assertFalse(parseFollowAvailability(JSONObject().put("type", "availability")
+            .put("controlAvailable", false).put("reason", "busy $secret").toString()).reason!!.contains(secret))
+    }
+
+    private fun startup() = JSONObject().put("stage", "camera").put("stageElapsedMs", 1_200)
+        .put("totalElapsedMs", 4_600).put("stageTimeoutMs", 15_000).put("totalTimeoutMs", 30_000)
+        .put("completed", false)
 
     private fun configuration() = JSONObject(
         """{

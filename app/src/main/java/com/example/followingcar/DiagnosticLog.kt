@@ -80,6 +80,9 @@ object Diagnostics {
     fun newContext(connectionId: String? = null) = DiagnosticContext(UUID.randomUUID().toString(), connectionId)
     fun protectSecret(value: String) { redactor.protect(value) }
 
+    /** Use the same registered secrets for protocol error text shown in the UI. */
+    fun safeText(value: String, limit: Int = 2_000): String = redactor.text(value, limit)
+
     fun event(
         event: String,
         context: DiagnosticContext = DiagnosticContext.NONE,

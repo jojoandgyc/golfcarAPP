@@ -54,6 +54,7 @@ internal fun FollowConfigurationCard(
                     Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("followConfigurationError"))
                 }
                 state.followConfiguration?.let { configuration ->
+                    Text("静态预检：${if (configuration.execute) "实车模式" else "影子模式"} · 未打开硬件")
                     Text("目标距离：${configuration.targetDistanceMeters.display()} m")
                     Text("速度上限：${configuration.maxRpm.display()} RPM；前进 ${configuration.forwardMaxRpm.display()} RPM")
                     Text("跟随启动驻车电流：${configuration.parkingCurrentAmps.display()} A")
@@ -118,25 +119,47 @@ private fun cameraParameterNote(name: String, configuration: FollowConfiguration
 }
 
 @Composable
-internal fun FollowStatusDetails(state: BoardUiState) {
+internal fun FollowStatusDetails(
+    state: BoardUiState,
+    presentation: FollowPresentation = followPresentation(state),
+    nowElapsedMs: Long? = null,
+) {
     val status = state.followStatus ?: return
-    val freshSnapshot = state.connected && state.followActive && !state.followUncertain && status.statusAgeMs?.let { it in 0..2_000 } == true
-    val presentation = followPresentation(state)
+    val receivedAgeMs = followReceivedAgeMs(state, nowElapsedMs)
+    val freshSnapshot = state.connected && state.followActive && !state.followUncertain &&
+        followAgeIsFresh(status.statusAgeMs, receivedAgeMs, 2_000)
+    val currentLifecycle = state.connected && state.followActive && !state.followUncertain &&
+        receivedAgeMs?.let { it in 0..2_000 } == true &&
+        (status.runState in setOf("STARTING", "STOPPING", "FAULT") || freshSnapshot)
     val freshStatus = presentation.fresh
     val targetFresh = presentation.targetFresh
     val rangeFresh = presentation.rangeFresh
-    val feedbackFresh = freshStatus && status.feedbackAgeMs?.let { it in 0..600 } == true
-    val lifecycle = if (status.processExited) "已结束" else when (status.runState) {
+    val feedbackFresh = freshStatus && followAgeIsFresh(status.feedbackAgeMs, receivedAgeMs, 600)
+    val lifecycle = when {
+        state.followTerminal -> if (status.runState == "FAULT" || !status.fault.isNullOrBlank()) "故障退出" else "已结束"
+        status.finalStatusPending -> "等待最终关闭状态"
+        status.runState == "FAULT" -> if (status.processExited) "故障，终态未确认" else "故障，进程尚未退出"
+        status.processExited && status.runState == "STOPPED" && !status.stopRequested -> "等待开始"
+        status.processExited -> "进程已退出，终态未确认"
+        else -> when (status.runState) {
         "STARTING" -> "启动中"
         "RUNNING" -> "运行中"
         "STOPPING" -> "停止中"
         "STOPPED" -> "已停止"
-        "FAULT" -> "故障"
         else -> "未知"
+        }
     }
-    Text(if (!freshSnapshot && !status.processExited) "软件状态：已过期或未知（上次$lifecycle）"
+    Text(if (!currentLifecycle && !status.processExited && !state.followTerminal) "软件状态：已过期或未知（上次$lifecycle）"
         else "软件状态：$lifecycle", fontWeight = FontWeight.Bold, modifier = Modifier.testTag("followRunState"))
     Text("本次会话：${if (status.execute) "实车" else "影子"} · ${status.camera.label}")
+    status.startup?.let { startup ->
+        Text("启动阶段：${startup.stage.startupStageLabel()}（${startup.stage}）",
+            style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followStartupStage"))
+        Text("阶段已用 ${startup.stageElapsedMs} ms / 预算 ${startup.stageTimeoutMs} ms；总计 ${startup.totalElapsedMs} ms / 期限 ${startup.totalTimeoutMs} ms",
+            style = MaterialTheme.typography.bodySmall)
+        Text("初始化：${if (startup.completed) "已完成" else "未完成"}；运行与退出以会话状态为准。",
+            style = MaterialTheme.typography.bodySmall)
+    }
     Text(if (freshStatus) "控制行为：${status.behavior ?: "未知"}；原因：${status.reason ?: "未知"}"
         else if (status.processExited) "结束原因：${status.reason ?: "未知"}"
         else "控制行为与原因：未知或已过期", style = MaterialTheme.typography.bodySmall,
@@ -158,7 +181,16 @@ internal fun FollowStatusDetails(state: BoardUiState) {
         style = MaterialTheme.typography.bodySmall)
     Text("停止请求：${if (status.stopRequested) "已受理" else if (freshSnapshot) "未请求" else "未知"}")
     Text("停车通信回执：${status.stopAcknowledged.confirmation()}", modifier = Modifier.testTag("followStopAck"))
-    Text("跟随进程：${if (status.processExited) "已退出" else "未确认退出"}", modifier = Modifier.testTag("followProcessExited"))
+    Text("跟随进程：${when {
+        status.processExited && (state.followTerminal || status.stopRequested || status.finalStatusPending) -> "已退出"
+        status.processExited -> "尚未创建或已退出"
+        else -> "未确认退出"
+    }}", modifier = Modifier.testTag("followProcessExited"))
+    Text("会话终态：${if (state.followTerminal) "已收到" else "未收到"}", modifier = Modifier.testTag("followTerminal"))
+    Text("最终关闭状态：${if (status.finalStatusPending) "正在等待" else if (state.followTerminal) "已收到" else "尚未确认"}",
+        modifier = Modifier.testTag("followFinalStatusPending"))
+    status.exitCode?.let { Text("进程退出码：$it", style = MaterialTheme.typography.bodySmall) }
+    status.logDir?.let { Text("板端日志目录：$it", style = MaterialTheme.typography.bodySmall) }
     Text("机械停稳：${if (freshStatus) status.physicalStopped.confirmation() else "未知"}", modifier = Modifier.testTag("followPhysicalStopped"))
 }
 

@@ -313,11 +313,12 @@ class BoardSshClient {
     suspend fun readFollowConfiguration(
         camera: FollowCamera, options: FollowLaunchOptions = FollowLaunchOptions(),
         diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+        execute: Boolean = false,
     ): FollowConfiguration {
-        val result = execute(followConfigurationCommand(camera, options), timeoutMillis = 30_000L,
+        val result = execute(followConfigurationCommand(camera, options, execute), timeoutMillis = 30_000L,
             kind = "follow_config", diagnostic = diagnostic)
         requireFollowResult(result, "跟随配置检查失败")
-        return parseFollowConfiguration(result.stdout, camera)
+        return parseFollowConfiguration(result.stdout, camera, expectedExecute = execute)
     }
 
     /** Checks ownership after a lost session without opening devices or restarting a run. */

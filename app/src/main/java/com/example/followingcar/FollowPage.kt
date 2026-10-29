@@ -1,5 +1,6 @@
 package com.example.followingcar
 
+import android.os.SystemClock
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -27,6 +28,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -37,6 +40,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 /** Settings and details stay in this window: opening a dialog would trigger focus-loss stop. */
 @Composable
@@ -55,11 +60,19 @@ internal fun FollowPage(
 ) {
     var settingsExpanded by rememberSaveable { mutableStateOf(!state.followActive && !state.followUncertain) }
     var detailsExpanded by rememberSaveable { mutableStateOf(false) }
+    var nowElapsedMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(state.followActive, state.followStopping, state.followLastReplyElapsedMs) {
+        nowElapsedMs = SystemClock.elapsedRealtime()
+        while (isActive && (state.followActive || state.followStopping)) {
+            delay(200)
+            nowElapsedMs = SystemClock.elapsedRealtime()
+        }
+    }
     LaunchedEffect(state.followActive, state.followUncertain) {
         settingsExpanded = !state.followActive && !state.followUncertain
         if (state.followActive) scrollState.scrollTo(0)
     }
-    val presentation = followPresentation(state)
+    val presentation = followPresentation(state, nowElapsedMs)
     val options = state.followLaunchOptions
     val distance = if (options.reverseEnabled) options.reverseDistanceMeters ?: options.targetDistanceMeters ?: 1.5
         else options.targetDistanceMeters ?: 1.5
@@ -87,9 +100,16 @@ internal fun FollowPage(
                     fontWeight = FontWeight.Bold, modifier = Modifier.testTag("followStatusTitle"),
                     color = if (hasProblem) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
                 Text(presentation.subtitle, style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (state.followStopping || (state.followActive &&
-                        (state.followStatus == null || state.followStatus.runState == "STARTING"))) {
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("followStatusSubtitle"))
+                if (state.followActive && !state.followUncertain && state.followStatus?.runState == "STARTING") {
+                    state.followStatus.startup?.let { startup ->
+                        Text("启动已用 ${(startup.totalElapsedMs / 1_000.0).display()} s · 总期限 ${(startup.totalTimeoutMs / 1_000.0).display()} s",
+                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followStartupProgress"))
+                    }
+                }
+                // Once a board snapshot exists its lifecycle/phase text above is authoritative.
+                if (state.followStatus == null && (state.followActive || state.followStopping)) {
                     Text(state.followMessage, style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.testTag("followProgressMessage"))
                 }
@@ -131,7 +151,7 @@ internal fun FollowPage(
                     }
                     if (detailsExpanded) {
                         HorizontalDivider()
-                        FollowStatusDetails(state)
+                        FollowStatusDetails(state, presentation, nowElapsedMs)
                         state.followStatus?.fault?.let { Text("程序异常：$it", color = MaterialTheme.colorScheme.error) }
                         state.followFirstFailure?.let {
                             Text("首次故障时间：${it.time}\n会话：${it.context.runId ?: "尚未建立"}",

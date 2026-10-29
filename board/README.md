@@ -7,6 +7,12 @@ runtime's configuration check. It does not open hardware.
 
 ## Deployment
 
+For the current 2026-10-29 follow lifecycle contract, deploy the complete revision
+from the board runtime repository, including `app_follow_options.py`,
+`app_follow_lifecycle.py`, and the matching `continuous_follow/runtime.py`.
+The follow bridge/worker copies in this directory predate that update and must
+not overwrite the current board installation. See the [App adaptation record](../docs/follow-handoff-adaptation-2026-10-30.md).
+
 - `app_joystick_bridge.py` belongs in `/home/topeet/lianzhan/scripts/`.
 - `app_follow_bridge.py`, `app_follow_worker.py`, and `app_diagnostic_log.py` belong together in
   `/home/topeet/Desktop/rk_car_runtime_module/`.
