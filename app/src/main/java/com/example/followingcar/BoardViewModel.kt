@@ -87,6 +87,8 @@ data class BoardUiState(
     val canStartFollow: Boolean
         get() = canInspectFollow && !followUncertain && !followConfigurationLoading &&
             runCatching { followLaunchOptions.validate(followCamera) }.isSuccess
+    val canConfigureMotor: Boolean get() = connected && !busy && !manualActive &&
+        !followBlocksControl && !videoServiceBusy && !parkingUpdating && !pairingBusy && !pairingUnconfirmed
     val canConfigureParking: Boolean
         get() = connected && driveEnabled && driveConfirmedStopped && driveLeft == 0 && driveRight == 0 &&
             !busy && !driveStarting && !driveStopping && !parkingUpdating && parkingSupported && parkingSettings != null &&
@@ -119,6 +121,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         )
     )
     val state = mutableState.asStateFlow()
+    private val mutableMotorConfiguration = MutableStateFlow(MotorConfigurationUiState())
+    val motorConfiguration = mutableMotorConfiguration.asStateFlow()
     private val wifiDirectDelegate = lazy {
         WifiDirectController(application) { state.value.canManageWifiDirect }
     }
@@ -167,6 +171,16 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         Diagnostics.event("viewmodel.created", ownerDiagnostic)
+        viewModelScope.launch {
+            state.collect { current ->
+                if (!current.connected || current.manualActive || current.followBlocksControl) {
+                    mutableMotorConfiguration.update { motor ->
+                        if (motor.snapshot == null || motor.requiresRead) motor else motor.copy(requiresRead = true,
+                            message = "连接或控制状态已变化，请重新读取电机配置")
+                    }
+                }
+            }
+        }
         viewModelScope.launch {
             pairing.state.collect { pair ->
                 mutableState.update { it.copy(pairingBusy = pair.busy,
@@ -448,6 +462,90 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } finally {
                 if (!disconnecting) mutableState.update { it.copy(busy = false) }
+            }
+        }
+    }
+
+    fun refreshMotorConfiguration() {
+        if (disconnecting || !state.value.canConfigureMotor || motorConfiguration.value.busy) return
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        mutableState.update { it.copy(busy = true, status = "正在读取电机配置…") }
+        mutableMotorConfiguration.update { it.copy(reading = true, error = null) }
+        Diagnostics.event("motor_config.read_requested", diagnostic, source = "USER_MOTOR_CONFIG")
+        operation = viewModelScope.launch {
+            try {
+                val reply = client.motorConfigurationRequest(diagnostic = diagnostic)
+                mutableMotorConfiguration.value = MotorConfigurationUiState(snapshot = reply.snapshot,
+                    requiresRead = !reply.ok, message = if (reply.ok) "已读取当前配置；电机状态为本次读取时的观测" else null,
+                    error = reply.error ?: if (!reply.ok) "读取未完成，请重试" else null)
+                Diagnostics.event("motor_config.read_completed", diagnostic, fields = mapOf("ok" to reply.ok), critical = true)
+            } catch (cancelled: CancellationException) {
+                mutableMotorConfiguration.update { it.copy(requiresRead = true, error = "读取已取消，请重新读取") }
+                throw cancelled
+            } catch (failure: Exception) {
+                Diagnostics.failure(diagnostic, "motor_config.read_failed", failure)
+                mutableMotorConfiguration.update { it.copy(requiresRead = true, error = describeFailure(failure)) }
+                mutableState.update { it.withTransportState(client.isConnected) }
+            } finally {
+                mutableMotorConfiguration.update { it.copy(reading = false) }
+                if (!disconnecting) mutableState.update { it.copy(busy = false,
+                    status = if (client.isConnected) "已连接" else "连接已断开") }
+            }
+        }
+    }
+
+    fun editMotorConfiguration(field: MotorConfigurationField, text: String) {
+        if (!state.value.canConfigureMotor || motorConfiguration.value.busy) return
+        mutableMotorConfiguration.update { current ->
+            if (current.snapshot == null || current.requiresRead) current else current.copy(
+                draftValues = current.draftValues + (field to text.take(24)), error = null)
+        }
+    }
+
+    fun discardMotorConfigurationChanges() {
+        if (motorConfiguration.value.busy) return
+        mutableMotorConfiguration.update { it.copy(draftValues = emptyMap()) }
+    }
+
+    fun applyMotorConfiguration(plan: MotorConfigurationWritePlan) {
+        if (disconnecting || !state.value.canConfigureMotor ||
+            plan != motorConfigurationWritePlan(motorConfiguration.value)) return
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        mutableState.update { it.copy(busy = true, status = "正在保存电机配置…") }
+        mutableMotorConfiguration.update { it.copy(applying = true, requiresRead = true,
+            writeResults = emptyList(), error = null, message = "正在写入并核对回读，请等待结果") }
+        Diagnostics.event("motor_config.write_requested", diagnostic, source = "USER_MOTOR_CONFIG",
+            fields = mapOf("fields" to plan.changes.map { it.field.id }, "count" to plan.changes.size), critical = true)
+        operation = viewModelScope.launch {
+            try {
+                val reply = client.motorConfigurationRequest(plan, diagnostic)
+                val results = plan.changes.map { change ->
+                    reply.results.singleOrNull { it.field == change.field } ?: MotorConfigurationWriteResult(
+                        change.field, change.raw, if (reply.writeMayHaveOccurred)
+                            MotorConfigurationWriteOutcome.WRITE_OUTCOME_UNKNOWN else MotorConfigurationWriteOutcome.NOT_ATTEMPTED)
+                }
+                mutableMotorConfiguration.update { current -> current.copy(snapshot = reply.snapshot ?: current.snapshot,
+                    draftValues = if (reply.ok) emptyMap() else current.draftValues, requiresRead = !reply.ok,
+                    writeResults = results,
+                    message = if (reply.ok) "已写入并回读确认，使用驱动器的断电保存指令" else "本次保存未全部确认，请先重新读取；不会自动重试",
+                    error = reply.error ?: if (!reply.ok) "请核对下方每项结果" else null) }
+                Diagnostics.event("motor_config.write_completed", diagnostic,
+                    fields = mapOf("ok" to reply.ok, "writeMayHaveOccurred" to reply.writeMayHaveOccurred,
+                        "results" to results.map { "${it.field.id}:${it.outcome.name}" }), critical = true)
+            } catch (failure: Exception) {
+                // Once dispatched, a lost SSH reply cannot prove the controller did not write.
+                mutableMotorConfiguration.update { it.copy(requiresRead = true,
+                    writeResults = plan.changes.map { change -> MotorConfigurationWriteResult(change.field,
+                        change.raw, MotorConfigurationWriteOutcome.WRITE_OUTCOME_UNKNOWN) },
+                    message = "保存结果未确认，请重新连接并读取；不会自动重复写入",
+                    error = if (failure is CancellationException) "保存等待已取消，驱动器参数可能已更改" else describeFailure(failure)) }
+                Diagnostics.failure(diagnostic, "motor_config.write_unconfirmed", failure)
+                if (failure is CancellationException) throw failure
+                mutableState.update { it.withTransportState(client.isConnected) }
+            } finally {
+                mutableMotorConfiguration.update { it.copy(applying = false) }
+                if (!disconnecting) mutableState.update { it.copy(busy = false,
+                    status = if (client.isConnected) "已连接" else "连接已断开") }
             }
         }
     }

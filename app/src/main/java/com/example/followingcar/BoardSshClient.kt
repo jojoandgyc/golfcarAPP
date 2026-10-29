@@ -157,11 +157,13 @@ class BoardSshClient {
     suspend fun execute(
         command: String, timeoutMillis: Long = 15_000L, kind: String = "terminal",
         diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+        input: ByteArray? = null,
     ): CommandResult =
         withContext(Dispatchers.IO) {
             operations.withLock {
                 require(command.isNotBlank()) { "请输入要执行的命令" }
                 require(timeoutMillis in 1..300_000) { "命令超时必须在 1 毫秒到 5 分钟之间" }
+                require(input == null || input.size <= 16 * 1024) { "请求内容过长" }
                 val active = synchronized(stateLock) {
                     connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
                 } ?: throw IOException("尚未连接开发板，请先连接")
@@ -178,7 +180,9 @@ class BoardSshClient {
                     currentCoroutineContext().ensureActive()
                     channel = (active.session.openChannel("exec") as ChannelExec).apply {
                         setCommand(command)
-                        setInputStream(null)
+                        // Structured configuration requests go through stdin, never shell interpolation.
+                        // No input body is included in diagnostics or the terminal result.
+                        setInputStream(input?.inputStream())
                         setPty(false)
                         setAgentForwarding(false)
                         // JSch drains both streams on its reader thread. The bounded sinks keep
@@ -458,7 +462,7 @@ internal class BoundedOutputStream(private val limit: Int) : OutputStream() {
 /** Never let caller-provided command labels or terminal exceptions leak command contents. */
 internal fun safeDiagnosticCommandKind(kind: String): String = when (kind) {
     "board_status", "memory", "disk", "network", "video_inspect", "video_start", "video_stop",
-    "follow_config", "follow_availability" -> kind
+    "follow_config", "follow_availability", "motor_config_read", "motor_config_write" -> kind
     else -> "terminal"
 }
 

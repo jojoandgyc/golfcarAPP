@@ -119,6 +119,7 @@ private enum class BoardPage(val label: String, val tag: String) {
     CONNECTION("连接", "pageConnection"),
     FOLLOW("自动跟随", "pageFollow"),
     JOYSTICK("手动", "pageJoystick"),
+    MOTOR("电机配置", "pageMotorConfiguration"),
     TERMINAL("终端", "pageTerminal"),
 }
 
@@ -130,10 +131,11 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val wireless by viewModel.wifiDirect.state.collectAsStateWithLifecycle()
     val pairing by viewModel.pairing.state.collectAsStateWithLifecycle()
+    val motorConfiguration by viewModel.motorConfiguration.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
     val view = LocalView.current
-    var selectedPageIndex by rememberSaveable { mutableStateOf(BoardPage.CONNECTION.ordinal) }
+    var selectedPageIndex by rememberSaveable("motor-configuration-pages") { mutableStateOf(BoardPage.CONNECTION.ordinal) }
     var useWifiDirect by rememberSaveable { mutableStateOf(false) }
     val connectionScroll = rememberScrollState()
     val followScroll = rememberScrollState()
@@ -203,7 +205,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     val page = BoardPage.entries[selectedPageIndex]
     Scaffold { padding ->
         Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
-            if (page != BoardPage.JOYSTICK && page != BoardPage.FOLLOW) {
+            if (page != BoardPage.JOYSTICK && page != BoardPage.FOLLOW && page != BoardPage.MOTOR) {
                 Column(Modifier.padding(horizontal = 20.dp, vertical = 10.dp).testTag("boardHeader"),
                     verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text("FollowingCar", style = MaterialTheme.typography.headlineLarge,
@@ -248,7 +250,11 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     Tab(
                         selected = selectedPageIndex == page.ordinal,
                         onClick = { selectPage(page) },
-                        text = { Text(page.label) },
+                        text = { Text(when (page) {
+                            BoardPage.FOLLOW -> "跟随"
+                            BoardPage.MOTOR -> "电机"
+                            else -> page.label
+                        }, maxLines = 1, softWrap = false) },
                         modifier = Modifier.testTag(page.tag),
                     )
                 }
@@ -266,12 +272,30 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     onRefreshConfiguration = viewModel::inspectFollowConfiguration,
                     onOpenConnection = { selectPage(BoardPage.CONNECTION) },
                     modifier = Modifier.fillMaxWidth().weight(1f), scrollState = followScroll)
+            } else if (page == BoardPage.MOTOR) {
+                MotorConfigurationPage(state = motorConfiguration, connected = state.connected,
+                    accessAllowed = state.canConfigureMotor,
+                    blockedReason = when {
+                        !state.connected -> "请先在连接页连接开发板"
+                        state.manualActive -> "请先停用手动驾驶，再读取或修改电机配置"
+                        state.followBlocksControl -> "自动跟随尚未确认结束，电机配置保持锁定"
+                        state.pairingBusy || state.pairingUnconfirmed -> "网络配对操作尚未确认结束，请先完成连接恢复"
+                        state.videoServiceBusy -> "视频操作进行中，请稍后再试"
+                        state.busy && !motorConfiguration.busy -> "其他操作进行中，请稍后再试"
+                        else -> null
+                    },
+                    onRead = viewModel::refreshMotorConfiguration,
+                    onEdit = viewModel::editMotorConfiguration,
+                    onDiscard = viewModel::discardMotorConfigurationChanges,
+                    onApply = viewModel::applyMotorConfiguration,
+                    modifier = Modifier.fillMaxWidth().weight(1f))
             } else {
                 val scroll = when (page) {
                     BoardPage.CONNECTION -> connectionScroll
                     BoardPage.FOLLOW -> followScroll
                     BoardPage.JOYSTICK -> error("Manual page has no scroll state")
                     BoardPage.TERMINAL -> terminalScroll
+                    BoardPage.MOTOR -> error("Motor configuration owns its scroll state")
                 }
                 Column(
                     Modifier.fillMaxWidth().weight(1f).verticalScroll(scroll).padding(20.dp),
@@ -330,6 +354,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                         }
                         BoardPage.FOLLOW -> Unit
                         BoardPage.JOYSTICK -> Unit
+                        BoardPage.MOTOR -> Unit
                         BoardPage.TERMINAL -> {
                             DiagnosticLogCard(controlActive = state.manualActive || state.followActive || state.followStopping)
                             Card(modifier = Modifier.fillMaxWidth()) {
