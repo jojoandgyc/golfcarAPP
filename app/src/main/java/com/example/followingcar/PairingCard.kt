@@ -26,7 +26,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 internal fun PairingCard(state: PairingState, canManage: Boolean, sshConnected: Boolean,
     onPair: (String) -> Unit, onCancel: () -> Unit, onCheck: () -> Unit, onStopHotspot: () -> Unit,
-    modifier: Modifier = Modifier) {
+    modifier: Modifier = Modifier, onCheckBluetooth: ((String) -> Unit)? = null) {
     var advanced by rememberSaveable { mutableStateOf(false) }
     var address by rememberSaveable { mutableStateOf(state.selectedAddress) }
     Card(modifier.fillMaxWidth().testTag("pairingCard"),
@@ -61,6 +61,11 @@ internal fun PairingCard(state: PairingState, canManage: Boolean, sshConnected: 
                     modifier = Modifier.fillMaxWidth().testTag("reconnectPairedBoard")) { Text("核对并重新连接") }
                 OutlinedButton(onClick = onStopHotspot, enabled = canManage,
                     modifier = Modifier.fillMaxWidth().testTag("stopPairingHotspot")) { Text("关闭配对热点") }
+            }
+            if (!state.hotspotActive && !state.busy && !state.confirmationRequired && onCheckBluetooth != null) {
+                OutlinedButton(onClick = { onCheckBluetooth(address) }, enabled = canManage,
+                    modifier = Modifier.fillMaxWidth().testTag("checkBluetooth")) { Text("检查蓝牙连接") }
+                Text("只检查蓝牙服务，不切换小车的 Wi-Fi。", style = MaterialTheme.typography.bodySmall)
             }
             if (!canManage && !state.busy) Text(if (sshConnected) "断开 SSH 后可重新配对或关闭热点。"
                 else "控制或网络操作尚未结束，暂不能更改连接。", style = MaterialTheme.typography.bodySmall)

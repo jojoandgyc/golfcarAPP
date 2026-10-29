@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 8
-        versionName = "1.7-remote-relay"
+        versionCode = 9
+        versionName = "1.7.1-bluetooth-check"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

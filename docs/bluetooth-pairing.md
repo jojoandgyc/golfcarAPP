@@ -4,6 +4,8 @@ App 使用 Android 公开的 LocalOnlyHotspot API 创建供小车通信的热点
 
 首次 Android 蓝牙配对可能显示系统确认框，App 不绕过这个确认。后续已配对设备可直接建立安全 RFCOMM 通道。当前设备地址由现场只读检查取得，App 的目标板配置仍允许以后更换。
 
+连接页的“检查蓝牙连接”只连接上述服务并发送 `status`，成功后显示“蓝牙服务正常，可开始配网”。它不会创建热点、发送配网凭据或连接 SSH；已有热点或配网结果未确认时不提供这个入口。诊断日志区分连接、发送和读取，保留失败发生时的阶段、耗时、配对状态和异常类型，不保存异常消息、帧内容或凭据。
+
 ## 板端服务与首次登记
 
 新增服务独立于自动跟随运行目录，不修改桥接层、worker、蓝牙守护进程或 NetworkManager 服务。文件安装于 `/opt/followingcar-pairing/`：
@@ -29,6 +31,8 @@ sudo /usr/bin/python3 -B /opt/followingcar-pairing/app_bluetooth_provision.py --
 这个命令检查私有配置及控制占用，不扫描、配对、建热点或改变 Wi-Fi。
 
 ## v1 协议
+
+板端配网服务同时管理支持的 `fast-connectable` 设置：启动时开启快速接听，正常退出时先恢复本实例修改的快速接听标志，再恢复本实例修改的 `connectable`。已有开启状态不归本服务所有；不支持快速接听的适配器继续使用普通接听。快速接听增加扫描占空比和蓝牙耗电，换取更短的连接建立时间，详见 [BlueZ 管理协议](https://github.com/bluez/bluez/blob/master/doc/mgmt-protocol.rst)。该设置不改变 Wi-Fi 网络、电机参数、可发现性或已绑定设备。2026-10-30 的现场对照与部署记录见 [蓝牙连接修复记录](bluetooth-connection-fix-2026-10-30.md)。
 
 每帧为 UTF-8 JSON 加换行，最多 4096 字节；拒绝重复字段、额外字段、未知命令和非规范 UUID。没有任意命令执行入口。密码仅存在内存和激活期间 `/run` 的 `0600` 临时密码文件，不放入 argv、错误、协议回复、持久历史或日志。
 

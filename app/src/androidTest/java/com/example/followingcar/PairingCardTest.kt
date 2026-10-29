@@ -14,6 +14,26 @@ import org.junit.Test
 class PairingCardTest {
     @get:Rule val compose = createComposeRule()
 
+    @Test fun bluetoothCheckDoesNotTriggerProvisioning() {
+        var provisions = 0
+        var checked: String? = null
+        compose.setContent { FollowingCarTheme {
+            PairingCard(PairingState(supported = true), true, false, { provisions++ }, {}, {}, {},
+                onCheckBluetooth = { checked = it })
+        } }
+        compose.onNodeWithTag("checkBluetooth").performClick()
+        assertEquals(DEFAULT_PAIRING_BOARD_ADDRESS, checked)
+        assertEquals(0, provisions)
+    }
+
+    @Test fun bluetoothCheckCannotRunDuringUnknownProvisioning() {
+        compose.setContent { FollowingCarTheme {
+            PairingCard(PairingState(confirmationRequired = true), true, false, {}, {}, {}, {},
+                onCheckBluetooth = {})
+        } }
+        compose.onNodeWithTag("checkBluetooth").assertDoesNotExist()
+    }
+
     @Test fun singleButtonUsesConfiguredBoardWithoutShowingCredentials() {
         var selected: String? = null
         compose.setContent { FollowingCarTheme {

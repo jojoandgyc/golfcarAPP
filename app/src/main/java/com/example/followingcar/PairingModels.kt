@@ -4,6 +4,8 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 
 enum class PairingStage {
     IDLE, DISCOVERING, PAIRING_BLUETOOTH, CONNECTING_BLUETOOTH, CHECKING_BOARD,
@@ -37,7 +39,50 @@ const val DEFAULT_PAIRING_BOARD_ADDRESS = "88:49:2D:14:07:61"
 const val PAIRING_SERVICE_UUID = "6d4f3a10-8f71-4c5e-9c2a-7b36f0e1d842"
 internal const val MAX_PAIRING_FRAME_BYTES = 4096
 
-internal class PairingFailure(val code: String) : Exception(code)
+internal class PairingFailure(val code: String, cause: Throwable? = null) : Exception(code, cause)
+
+internal enum class PairingIoPhase { CONNECT, READ, WRITE }
+internal enum class PairingBondState { UNKNOWN, NOT_BONDED, BONDING, BONDED }
+
+internal fun pairingFailureCode(failure: Exception): String = when (failure) {
+    is TimeoutCancellationException -> "bluetooth_timeout"
+    is CancellationException -> "cancelled"
+    is PairingFailure -> failure.code
+    is SecurityException -> "permission_denied"
+    else -> "bluetooth_failed"
+}
+
+/** Only fixed enums, class names and durations cross the diagnostic boundary. Never Throwable text. */
+internal fun pairingFailureFields(
+    failure: Exception, failedStage: PairingStage, ioPhase: PairingIoPhase?,
+    elapsedMs: Long, ioElapsedMs: Long?, bondState: PairingBondState,
+): Map<String, Any?> = mapOf(
+    "stage" to failedStage.name,
+    "ioPhase" to ioPhase?.name?.lowercase(),
+    "exceptionType" to failure.javaClass.name,
+    "causeTypes" to generateSequence(failure.cause) { it.cause }.take(8)
+        .map { it.javaClass.name }.distinct().joinToString(" > "),
+    "elapsedMs" to elapsedMs.coerceAtLeast(0),
+    "ioElapsedMs" to ioElapsedMs?.coerceAtLeast(0),
+    "bondState" to bondState.name,
+)
+
+internal fun pairingFailureMessage(code: String, stage: PairingStage, ioPhase: PairingIoPhase?): String {
+    if (code in setOf("bluetooth_failed", "bluetooth_timeout", "bluetooth_eof", "partial_reply")) {
+        if (stage == PairingStage.PAIRING_BLUETOOTH)
+            return "蓝牙配对未完成，请确认手机系统的配对提示后重试。"
+        return when (ioPhase) {
+            PairingIoPhase.CONNECT -> "无法连接小车蓝牙，请先靠近小车，确认小车已开机且蓝牙服务开启后重试。"
+            PairingIoPhase.READ -> "蓝牙服务已连接，但读取小车响应失败或超时；配网结果未确认时请先查询结果。"
+            PairingIoPhase.WRITE -> "蓝牙服务已连接，但发送蓝牙请求失败；配网结果未确认时请先查询结果。"
+            null -> pairingErrorMessage(code)
+        }
+    }
+    if (code == "protocol_error") return if (stage == PairingStage.CHECKING_BOARD)
+        "蓝牙服务已连接，但小车状态响应格式不正确，请检查配网服务版本。"
+    else "蓝牙配网响应格式不正确；配网结果未确认时请先查询结果。"
+    return pairingErrorMessage(code)
+}
 
 internal fun pairingRequestAllowed(state: PairingState, canMutate: Boolean): String? = when {
     !canMutate -> "请先结束控制并断开 SSH，再配对网络。"
@@ -73,7 +118,7 @@ internal fun readPairingFrame(input: InputStream): String {
     return try {
         Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
             .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes.toByteArray())).toString()
-    } catch (_: Exception) { throw PairingFailure("invalid_reply_encoding") }
+    } catch (failure: Exception) { throw PairingFailure("invalid_reply_encoding", failure) }
 }
 
 internal data class PairingLocalAddress(val ip: String, val prefixLength: Int)

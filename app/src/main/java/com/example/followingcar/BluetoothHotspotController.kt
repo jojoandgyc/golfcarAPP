@@ -24,13 +24,11 @@ import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -67,7 +65,11 @@ class BluetoothHotspotController(
     private var bondingAddress: String? = null
     private var credentialsMayHaveBeenSent = false
     private var definitiveResultReceived = false
+    private var readOnlyOperation = false
     private var diagnostic = DiagnosticContext.NONE
+    private var operationStartedNanos = 0L
+    private var ioPhase: PairingIoPhase? = null
+    private var ioElapsedMs: Long? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -200,6 +202,30 @@ class BluetoothHotspotController(
         }
     }
 
+    /** Board read-only probe. No hotspot reservation, provision request or SSH connection. */
+    fun checkBluetooth(address: String? = null) = onMain {
+        refresh()
+        // Do not inspect through a lease that is active or awaits recovery confirmation.
+        val lease = HotspotLease.state.value
+        pairingRequestAllowed(state.value.copy(hotspotActive = lease.active,
+            confirmationRequired = lease.unconfirmed), canMutate())?.let { reject(it); return@onMain }
+        val target = address ?: state.value.selectedAddress
+        if (!BluetoothAdapter.checkBluetoothAddress(target)) { reject("开发板蓝牙地址无效。"); return@onMain }
+        mutableState.value = state.value.copy(selectedAddress = target)
+        beginOperation(readOnly = true) {
+            connectBluetooth(target, allowBond = true)
+            stage(PairingStage.CHECKING_BOARD, "正在只读检查小车蓝牙服务…")
+            val status = requestStatus()
+            ensureCanMutate()
+            val available = status.opt("controlAvailable") == true && status.opt("operationInProgress") != true
+            mutableState.value = state.value.copy(stage = PairingStage.IDLE, error = null,
+                status = if (available) "蓝牙服务正常，可开始配网" else "蓝牙服务正常，小车控制尚未空闲")
+            log("bluetooth_check_completed", fields = mapOf("readOnly" to true,
+                "controlAvailable" to status.optBoolean("controlAvailable"),
+                "operationInProgress" to status.optBoolean("operationInProgress")))
+        }
+    }
+
     /** Read-only recovery of the exact request after a lost reply; never resends credentials. */
     fun retryStatus() = onMain {
         refresh()
@@ -241,8 +267,10 @@ class BluetoothHotspotController(
     /** Detaches this observer. A live or unconfirmed network remains owned by the process lease. */
     fun close() = onMain {
         closed = true
-        if (credentialsMayHaveBeenSent && !definitiveResultReceived) HotspotLease.markUnknown()
-        else if (state.value.busy && HotspotLease.state.value.boardIp == null) HotspotLease.stop()
+        if (!readOnlyOperation) {
+            if (credentialsMayHaveBeenSent && !definitiveResultReceived) HotspotLease.markUnknown()
+            else if (state.value.busy && HotspotLease.state.value.boardIp == null) HotspotLease.stop()
+        }
         operation?.cancel()
         closeSocket()
         discoveryDeadline?.cancel()
@@ -253,44 +281,55 @@ class BluetoothHotspotController(
         if (!HotspotLease.state.value.active) notifyLease(false)
     }
 
-    private fun beginOperation(block: suspend () -> Unit) {
+    private fun beginOperation(readOnly: Boolean = false, block: suspend () -> Unit) {
+        readOnlyOperation = readOnly
         credentialsMayHaveBeenSent = false
         definitiveResultReceived = false
         diagnostic = Diagnostics.newContext()
-        mutableState.value = state.value.copy(busy = true, error = null)
+        operationStartedNanos = System.nanoTime()
+        ioPhase = null
+        ioElapsedMs = null
+        mutableState.value = state.value.copy(busy = true, stage = PairingStage.IDLE, error = null,
+            status = if (readOnly) "正在准备蓝牙服务检查…" else "正在准备配网…")
         try {
             // Start while the explicit click is still foreground, before a system pairing dialog.
             onHotspotLeaseChanged(true)
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
+            val fields = pairingFailureFields(failure, state.value.stage, ioPhase,
+                elapsedMillis(operationStartedNanos), ioElapsedMs, bondState())
             mutableState.value = state.value.copy(busy = false, stage = PairingStage.ERROR,
                 error = "无法保持配对连接服务，请返回 App 后重试。")
+            log("failed", "service_unavailable", fields + mapOf("readOnly" to readOnly))
+            readOnlyOperation = false
             return
         }
         operation = scope.launch {
             try {
                 block()
             } catch (failure: Exception) {
-                val code = when (failure) {
-                    is TimeoutCancellationException -> "bluetooth_timeout"
-                    is CancellationException -> "cancelled"
-                    is PairingFailure -> failure.code
-                    is SecurityException -> "permission_denied"
-                    else -> "bluetooth_failed"
+                val failedStage = state.value.stage
+                val code = pairingFailureCode(failure)
+                val failureFields = pairingFailureFields(failure, failedStage, ioPhase,
+                    elapsedMillis(operationStartedNanos), ioElapsedMs, bondState())
+                val unknown = !readOnly && pairingFailureRequiresConfirmation(credentialsMayHaveBeenSent, definitiveResultReceived)
+                if (!readOnly) {
+                    if (unknown) HotspotLease.markUnknown()
+                    else if (!definitiveResultReceived) HotspotLease.stop()
                 }
-                val unknown = pairingFailureRequiresConfirmation(credentialsMayHaveBeenSent, definitiveResultReceived)
-                if (unknown) HotspotLease.markUnknown()
-                else if (!definitiveResultReceived) HotspotLease.stop()
                 if (!closed) mutableState.value = state.value.copy(
                     stage = if (unknown) PairingStage.UNKNOWN else PairingStage.ERROR,
-                    confirmationRequired = unknown,
-                    status = if (unknown) "配网结果尚未确认，请通过蓝牙查询" else "配对未完成",
-                    error = pairingErrorMessage(code))
-                log("failed", code)
+                    confirmationRequired = if (readOnly) state.value.confirmationRequired else unknown,
+                    status = if (unknown) "配网结果尚未确认，请通过蓝牙查询"
+                        else if (readOnly) "蓝牙检查未完成" else "配对未完成",
+                    error = pairingFailureMessage(code, failedStage, ioPhase))
+                // Keep the originating stage; the UI has already transitioned to ERROR/UNKNOWN.
+                log("failed", code, failureFields + mapOf("readOnly" to readOnly))
             } finally {
                 closeSocket()
                 if (!closed) mutableState.value = state.value.copy(busy = false)
                 if (!HotspotLease.state.value.active) notifyLease(false)
                 operation = null
+                readOnlyOperation = false
             }
         }
     }
@@ -317,7 +356,7 @@ class BluetoothHotspotController(
         stage(PairingStage.CONNECTING_BLUETOOTH, "正在连接开发板蓝牙服务…")
         val link = device.createRfcommSocketToServiceRecord(UUID.fromString(PAIRING_SERVICE_UUID))
         socket = link
-        socketCall(25_000) { link.connect() }
+        socketCall(PairingIoPhase.CONNECT, 25_000) { link.connect() }
     }
 
     private suspend fun requestStatus(queryRequestId: String? = null): JSONObject {
@@ -415,42 +454,71 @@ class BluetoothHotspotController(
             } catch (failure: Exception) {
                 HotspotLease.cancelRequest(leaseToken)
                 if (continuation.isActive) continuation.resumeWithException(
-                    PairingFailure(if (failure is SecurityException) "permission_denied" else "hotspot_failed"))
+                    PairingFailure(if (failure is SecurityException) "permission_denied" else "hotspot_failed", failure))
             }
         }
     }
 
     private suspend fun writeFrame(frame: JSONObject) {
+        ioPhase = PairingIoPhase.WRITE
+        ioElapsedMs = null
         val bytes = (frame.toString() + "\n").toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_PAIRING_FRAME_BYTES) throw PairingFailure("request_too_large")
         val link = socket ?: throw PairingFailure("bluetooth_eof")
-        socketCall(10_000) { link.outputStream.write(bytes); link.outputStream.flush() }
+        socketCall(PairingIoPhase.WRITE, 10_000) { link.outputStream.write(bytes); link.outputStream.flush() }
     }
 
     private suspend fun readReply(requestId: String, timeout: Long = 100_000): JSONObject {
+        ioPhase = PairingIoPhase.READ
+        ioElapsedMs = null
         val link = socket ?: throw PairingFailure("bluetooth_eof")
-        val text = socketCall(timeout) { readPairingFrame(link.inputStream) }
-        val reply = try { JSONObject(text) } catch (_: Exception) { throw PairingFailure("protocol_error") }
+        val text = socketCall(PairingIoPhase.READ, timeout) { readPairingFrame(link.inputStream) }
+        val reply = try { JSONObject(text) } catch (failure: Exception) { throw PairingFailure("protocol_error", failure) }
         if (reply.opt("v") != 1 || reply.opt("requestId") != requestId) throw PairingFailure("protocol_error")
         return reply
     }
 
     /** Timeout/cancel closes the socket from another thread, including a blocked Bluetooth write. */
-    private suspend fun <T> socketCall(timeout: Long, action: () -> T): T = withTimeout(timeout) {
-        val ownedSocket = socket
-        suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation { IO.execute { runCatching { ownedSocket?.close() } } }
-            IO.execute {
-                try {
-                    val result = action()
-                    if (continuation.isActive) continuation.resume(result)
-                } catch (failure: Exception) {
-                    if (continuation.isActive) continuation.resumeWithException(
-                        if (failure is PairingFailure) failure else PairingFailure("bluetooth_failed"))
+    private suspend fun <T> socketCall(phase: PairingIoPhase, timeout: Long, action: () -> T): T {
+        ioPhase = phase
+        ioElapsedMs = null
+        val started = System.nanoTime()
+        var completed = false
+        log("io_started", fields = mapOf("ioPhase" to phase.name.lowercase(), "timeoutMs" to timeout,
+            "bondState" to bondState().name))
+        try {
+            return withTimeout(timeout) {
+                val ownedSocket = socket
+                suspendCancellableCoroutine { continuation ->
+                    continuation.invokeOnCancellation { IO.execute { runCatching { ownedSocket?.close() } } }
+                    IO.execute {
+                        try {
+                            val result = action()
+                            if (continuation.isActive) continuation.resume(result)
+                        } catch (failure: Exception) {
+                            if (continuation.isActive) continuation.resumeWithException(
+                                if (failure is PairingFailure) failure else PairingFailure(
+                                    if (failure is SecurityException) "permission_denied" else "bluetooth_failed", failure))
+                        }
+                    }
                 }
-            }
+            }.also { completed = true }
+        } finally {
+            ioElapsedMs = elapsedMillis(started)
+            log("io_finished", fields = mapOf("ioPhase" to phase.name.lowercase(),
+                "elapsedMs" to ioElapsedMs, "completed" to completed, "bondState" to bondState().name))
         }
     }
+
+    private fun bondState(): PairingBondState = runCatching {
+        if (!hasPermissions() || !BluetoothAdapter.checkBluetoothAddress(state.value.selectedAddress)) PairingBondState.UNKNOWN
+        else when (adapter?.getRemoteDevice(state.value.selectedAddress)?.bondState) {
+            BluetoothDevice.BOND_NONE -> PairingBondState.NOT_BONDED
+            BluetoothDevice.BOND_BONDING -> PairingBondState.BONDING
+            BluetoothDevice.BOND_BONDED -> PairingBondState.BONDED
+            else -> PairingBondState.UNKNOWN
+        }
+    }.getOrDefault(PairingBondState.UNKNOWN)
 
     private fun localAddresses(): List<PairingLocalAddress> = runCatching {
         NetworkInterface.getNetworkInterfaces().toList().flatMap { device ->
@@ -506,8 +574,9 @@ class BluetoothHotspotController(
         }
     }
     private fun closeSocket() { val old = socket; socket = null; IO.execute { runCatching { old?.close() } } }
-    private fun log(event: String, code: String? = null) = Diagnostics.event("pairing.$event", diagnostic,
-        source = "bluetooth_hotspot", fields = mapOf("stage" to state.value.stage.name, "code" to code), critical = true)
+    private fun log(event: String, code: String? = null, fields: Map<String, Any?> = emptyMap()) =
+        Diagnostics.event("pairing.$event", diagnostic, source = "bluetooth_hotspot",
+            fields = mapOf("stage" to state.value.stage.name, "code" to code) + fields, critical = true)
     private fun onMain(action: () -> Unit) {
         if (closed) return
         if (Looper.myLooper() == main.looper) action() else main.post { if (!closed) action() }

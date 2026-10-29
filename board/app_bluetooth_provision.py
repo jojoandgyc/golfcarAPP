@@ -36,10 +36,11 @@ DEFAULT_STATE = Path("/var/lib/followingcar-pairing/state.json")
 
 
 class PageScanLease:
-    """Enable incoming BR/EDR connections, without discoverability or power changes."""
+    """Own only the page-scan/fast-connectable changes made by this daemon."""
     def __init__(self, runner=None):
         self.runner = runner or self.run
         self.changed = False
+        self.fast_changed = False
 
     @staticmethod
     def run(arguments):
@@ -64,33 +65,54 @@ class PageScanLease:
             raise JoinError("bluetooth_management_failed")
         return output
 
-    def flags(self):
+    def settings(self):
         output = self.runner(["/usr/bin/btmgmt", "--index", "0", "info"])
-        found = re.findall(r"^\s*current settings:\s*(.*?)\s*$", output, re.MULTILINE)
-        if len(found) != 1:
+        current = re.findall(r"^[ \t]*current settings:[ \t]*(.*?)[ \t\r]*$", output, re.MULTILINE)
+        supported = re.findall(r"^[ \t]*supported settings:[ \t]*(.*?)[ \t\r]*$", output, re.MULTILINE)
+        if len(current) != 1 or len(supported) > 1:
             raise JoinError("bluetooth_state_unconfirmed")
-        return set(found[0].split())
+        # Older management output may omit capabilities. Preserve basic page
+        # scan in that case; never guess support for an optional controller bit.
+        return set(current[0].split()), set(supported[0].split()) if supported else set()
+
+    def flags(self):
+        return self.settings()[0]
 
     def open(self):
-        settings = self.flags()
+        settings, supported = self.settings()
         if not {"powered", "br/edr"} <= settings:
             raise JoinError("bluetooth_not_ready")
-        if "connectable" not in settings:
-            self.changed = True
-            self.runner(["/usr/bin/btmgmt", "--index", "0", "connectable", "on"])
-            if "connectable" not in self.flags():
-                raise JoinError("bluetooth_page_scan_unconfirmed")
+        try:
+            if "connectable" not in settings:
+                # Mark ownership before sending: a timed-out command may still
+                # have reached the controller and therefore needs rollback.
+                self.changed = True
+                self.runner(["/usr/bin/btmgmt", "--index", "0", "connectable", "on"])
+                if "connectable" not in self.flags():
+                    raise JoinError("bluetooth_page_scan_unconfirmed")
+            if "fast-connectable" in supported and "fast-connectable" not in settings:
+                self.fast_changed = True
+                self.runner(["/usr/bin/btmgmt", "--index", "0", "fast-conn", "on"])
+                if "fast-connectable" not in self.flags():
+                    raise JoinError("bluetooth_fast_connectable_unconfirmed")
+        except Exception:
+            self.close()
+            raise
 
     def close(self):
-        if not self.changed:
-            return
-        try:
-            if "connectable" in self.flags():
-                self.runner(["/usr/bin/btmgmt", "--index", "0", "connectable", "off"])
-        except Exception:
-            pass  # Cleanup cannot block the completed network transaction indefinitely.
-        finally:
-            self.changed = False
+        # Restore fast scan while page scan is still available, then restore
+        # connectability only if we enabled it. Existing true flags are not ours.
+        # Restoration does not depend on another info query succeeding.
+        for owned, command in (("fast_changed", "fast-conn"), ("changed", "connectable")):
+            if not getattr(self, owned):
+                continue
+            try:
+                self.runner(["/usr/bin/btmgmt", "--index", "0", command, "off"])
+            except Exception:
+                # Each command is bounded. Still attempt the other restoration;
+                # retain ownership so a subsequent close/atexit can retry it.
+                continue
+            setattr(self, owned, False)
 
 
 def code(error):

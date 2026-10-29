@@ -415,18 +415,25 @@ class AddressTests(unittest.TestCase):
 
 
 class PageScanTests(unittest.TestCase):
-    def lease(self, settings):
+    def lease(self, settings, supported=None, fail_after=None, ignore=()):
         current, calls = set(settings), []
         def run(arguments):
             calls.append(arguments[-2:])
             if arguments[-1] == "info":
-                return "hci0:\n\tcurrent settings: " + " ".join(sorted(current)) + "\n"
-            if arguments[-2:] == ["connectable", "on"]:
-                current.add("connectable")
-            elif arguments[-2:] == ["connectable", "off"]:
-                current.discard("connectable")
-            else:
+                capabilities = "" if supported is None else "\tsupported settings: " + " ".join(sorted(supported)) + "\n"
+                return "hci0:\n" + capabilities + "\tcurrent settings: " + " ".join(sorted(current)) + "\n"
+            command, enabled = arguments[-2:]
+            if command not in ("connectable", "fast-conn") or enabled not in ("on", "off"):
                 self.fail("Unexpected Bluetooth mutation")
+            action = (command, enabled)
+            if action not in ignore:
+                flag = "connectable" if command == "connectable" else "fast-connectable"
+                if enabled == "on":
+                    current.add(flag)
+                else:
+                    current.discard(flag)
+            if action == fail_after:
+                raise pair.JoinError("bluetooth_management_unavailable")
             return ""
         return pair.PageScanLease(run), current, calls
 
@@ -452,6 +459,92 @@ class PageScanTests(unittest.TestCase):
         with self.assertRaises(pair.JoinError):
             lease.open()
         self.assertNotIn("powered", current)
+        self.assertEqual([["0", "info"]], calls)
+
+    def test_supported_fast_scan_is_enabled_and_restored_without_disabling_existing_page_scan(self):
+        initial = {"powered", "br/edr", "connectable", "bondable"}
+        lease, current, calls = self.lease(initial, supported=initial | {"fast-connectable"})
+        lease.open()
+        self.assertEqual(initial | {"fast-connectable"}, current)
+        lease.close()
+        lease.close()
+        self.assertEqual(initial, current)
+        self.assertEqual([["fast-conn", "on"], ["fast-conn", "off"]], [c for c in calls if c[-1] != "info"])
+
+    def test_both_owned_flags_are_restored_in_reverse_order(self):
+        initial = {"powered", "br/edr", "bondable"}
+        lease, current, calls = self.lease(initial, supported=initial | {"connectable", "fast-connectable"})
+        lease.open()
+        lease.close()
+        self.assertEqual(initial, current)
+        self.assertEqual([["connectable", "on"], ["fast-conn", "on"], ["fast-conn", "off"],
+                          ["connectable", "off"]], [c for c in calls if c[-1] != "info"])
+
+    def test_existing_fast_and_discoverable_settings_are_never_claimed_or_changed(self):
+        initial = {"powered", "br/edr", "connectable", "fast-connectable", "discoverable", "bondable"}
+        lease, current, calls = self.lease(initial, supported=initial)
+        lease.open()
+        lease.close()
+        self.assertEqual(initial, current)
+        self.assertEqual([["0", "info"]], calls)
+
+    def test_unsupported_or_missing_capability_retains_basic_page_scan(self):
+        for supported in (None, set(), {"powered", "br/edr", "connectable"}):
+            with self.subTest(supported=supported):
+                initial = {"powered", "br/edr"}
+                lease, current, calls = self.lease(initial, supported=supported)
+                lease.open()
+                self.assertIn("connectable", current)
+                self.assertNotIn(["fast-conn", "on"], calls)
+                lease.close()
+                self.assertEqual(initial, current)
+
+    def test_fast_command_timeout_after_hardware_change_rolls_back_both_flags(self):
+        initial = {"powered", "br/edr"}
+        lease, current, calls = self.lease(initial, supported={"fast-connectable"},
+                                           fail_after=("fast-conn", "on"))
+        with self.assertRaisesRegex(pair.JoinError, "bluetooth_management_unavailable"):
+            lease.open()
+        self.assertEqual(initial, current)
+        self.assertEqual([["fast-conn", "off"], ["connectable", "off"]], calls[-2:])
+        self.assertFalse(lease.changed or lease.fast_changed)
+
+    def test_unconfirmed_fast_setting_is_rejected_and_owned_state_restored(self):
+        initial = {"powered", "br/edr", "connectable"}
+        lease, current, calls = self.lease(initial, supported={"fast-connectable"},
+                                           ignore={("fast-conn", "on")})
+        with self.assertRaisesRegex(pair.JoinError, "bluetooth_fast_connectable_unconfirmed"):
+            lease.open()
+        self.assertEqual(initial, current)
+        self.assertEqual(["fast-conn", "off"], calls[-1])
+        self.assertNotIn(["connectable", "off"], calls)
+
+    def test_partial_cleanup_failure_does_not_skip_page_scan_and_can_retry(self):
+        initial = {"powered", "br/edr"}
+        lease, current, calls = self.lease(initial, supported={"fast-connectable"})
+        lease.open()
+        runner = lease.runner
+        failures = [True]
+        def flaky(arguments):
+            if arguments[-2:] == ["fast-conn", "off"] and failures:
+                failures.pop()
+                raise pair.JoinError("bluetooth_management_unavailable")
+            return runner(arguments)
+        lease.runner = flaky
+        lease.close()
+        self.assertNotIn("connectable", current)
+        self.assertTrue(lease.fast_changed)
+        lease.close()
+        self.assertEqual(initial, current)
+        self.assertFalse(lease.changed or lease.fast_changed)
+
+    def test_malformed_capabilities_never_mutate_controller(self):
+        calls = []
+        def ambiguous(arguments):
+            calls.append(arguments[-2:])
+            return "current settings: powered br/edr\nsupported settings: fast-connectable\nsupported settings: connectable\n"
+        with self.assertRaisesRegex(pair.JoinError, "bluetooth_state_unconfirmed"):
+            pair.PageScanLease(ambiguous).open()
         self.assertEqual([["0", "info"]], calls)
 
 

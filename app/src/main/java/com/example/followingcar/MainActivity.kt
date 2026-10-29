@@ -155,14 +155,19 @@ private fun BoardScreen(viewModel: BoardViewModel) {
         viewModel.wifiDirect.refreshStatus()
     }
     var pendingPairAddress by rememberSaveable { mutableStateOf(DEFAULT_PAIRING_BOARD_ADDRESS) }
+    var pendingBluetoothCheck by rememberSaveable { mutableStateOf(false) }
+    val runPendingPairingAction: () -> Unit = {
+        if (pendingBluetoothCheck) viewModel.pairing.checkBluetooth(pendingPairAddress)
+        else viewModel.startPairing(pendingPairAddress)
+    }
     val enableBluetoothLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         viewModel.pairing.refresh()
-        if (viewModel.pairing.state.value.bluetoothEnabled) viewModel.startPairing(pendingPairAddress)
+        if (viewModel.pairing.state.value.bluetoothEnabled) runPendingPairingAction()
     }
     val pairAfterPermission: () -> Unit = {
         viewModel.pairing.refresh()
         if (viewModel.state.value.canManagePairing && !viewModel.pairing.state.value.busy) {
-            if (viewModel.pairing.state.value.bluetoothEnabled) viewModel.startPairing(pendingPairAddress)
+            if (viewModel.pairing.state.value.bluetoothEnabled) runPendingPairingAction()
             else enableBluetoothLauncher.launch(Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_ENABLE))
         }
     }
@@ -175,16 +180,18 @@ private fun BoardScreen(viewModel: BoardViewModel) {
             pairAfterPermission()
         else viewModel.pairing.refresh()
     }
-    val pair: (String) -> Unit = { address ->
+    val beginPairingAction: (String, Boolean) -> Unit = { address, checkOnly ->
         if (viewModel.state.value.canManagePairing && !viewModel.pairing.state.value.busy) {
             viewModel.setRemoteMode(false)
             useWifiDirect = false
             pendingPairAddress = address
+            pendingBluetoothCheck = checkOnly
             keyboard?.hide()
             val missing = pairingPermissions.filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
             if (missing.isEmpty()) pairAfterPermission() else pairingPermissionLauncher.launch(missing.toTypedArray())
         }
     }
+    val pair: (String) -> Unit = { address -> beginPairingAction(address, false) }
     val connect: () -> Unit = {
         val current = viewModel.state.value
         val currentWireless = viewModel.wifiDirect.state.value
@@ -333,7 +340,8 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                 } })
                             else PairingCard(state = pairing, canManage = state.canManagePairing && !viewModel.wifiDirect.mutationPending,
                                 sshConnected = state.connected, onPair = pair, onCancel = viewModel.pairing::cancel,
-                                onCheck = viewModel.pairing::retryStatus, onStopHotspot = viewModel.pairing::stopHotspot)
+                                onCheck = viewModel.pairing::retryStatus, onStopHotspot = viewModel.pairing::stopHotspot,
+                                onCheckBluetooth = { address -> beginPairingAction(address, true) })
                             if (!useWifiDirect && wireless.confirmationRequired) {
                                 Text("上次直连操作结果尚未确认，请先刷新无线状态再连接 SSH。", style = MaterialTheme.typography.bodySmall)
                                 OutlinedButton(onClick = viewModel.wifiDirect::refresh, enabled = !wireless.busy,
