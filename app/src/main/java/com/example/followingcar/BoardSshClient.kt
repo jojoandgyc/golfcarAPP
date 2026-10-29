@@ -158,16 +158,18 @@ class BoardSshClient {
         command: String, timeoutMillis: Long = 15_000L, kind: String = "terminal",
         diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
         input: ByteArray? = null,
+        outputLimitBytes: Int = OUTPUT_LIMIT_PER_STREAM,
     ): CommandResult =
         withContext(Dispatchers.IO) {
             operations.withLock {
                 require(command.isNotBlank()) { "请输入要执行的命令" }
                 require(timeoutMillis in 1..300_000) { "命令超时必须在 1 毫秒到 5 分钟之间" }
                 require(input == null || input.size <= 16 * 1024) { "请求内容过长" }
+                require(outputLimitBytes in 1..128 * 1024) { "响应缓存必须在 1 字节到 128 KB 之间" }
                 val active = synchronized(stateLock) {
                     connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
                 } ?: throw IOException("尚未连接开发板，请先连接")
-                val stdout = BoundedOutputStream(OUTPUT_LIMIT_PER_STREAM)
+                val stdout = BoundedOutputStream(outputLimitBytes)
                 val stderr = BoundedOutputStream(OUTPUT_LIMIT_PER_STREAM)
                 var channel: ChannelExec? = null
                 val started = System.nanoTime()
@@ -462,7 +464,7 @@ internal class BoundedOutputStream(private val limit: Int) : OutputStream() {
 /** Never let caller-provided command labels or terminal exceptions leak command contents. */
 internal fun safeDiagnosticCommandKind(kind: String): String = when (kind) {
     "board_status", "memory", "disk", "network", "video_inspect", "video_start", "video_stop",
-    "follow_config", "follow_availability", "motor_config_read", "motor_config_write" -> kind
+    "follow_config", "follow_availability", "motor_config_read", "motor_config_write", "motor_action" -> kind
     else -> "terminal"
 }
 

@@ -1,0 +1,1739 @@
+{
+  "schemaVersion": 2,
+  "fields": [
+    {
+      "id": "max_output_current",
+      "address": 88,
+      "label": "最大输出电流（单路）",
+      "group": "limits",
+      "unit": "A",
+      "words": 1,
+      "signed": false,
+      "divisor": 100,
+      "minRaw": 50,
+      "maxRaw": 6000,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "max_forward_speed",
+      "address": 89,
+      "label": "正转最大速度",
+      "group": "limits",
+      "unit": "RPM",
+      "words": 2,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 110000,
+      "choices": [],
+      "note": "临时设置分两帧 FC06 写入，过程中保持中间值合法；异常后结果可能不完整，必须重新读取，不自动重试。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "max_reverse_speed",
+      "address": 91,
+      "label": "反转最大速度",
+      "group": "limits",
+      "unit": "RPM",
+      "words": 2,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 110000,
+      "choices": [],
+      "note": "临时设置分两帧 FC06 写入，过程中保持中间值合法；异常后结果可能不完整，必须重新读取，不自动重试。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "min_speed",
+      "address": 93,
+      "label": "最小转速",
+      "group": "limits",
+      "unit": "RPM",
+      "words": 2,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 110000,
+      "choices": [],
+      "note": "临时设置分两帧 FC06 写入，过程中保持中间值合法；异常后结果可能不完整，必须重新读取，不自动重试。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "closed_loop_acceleration",
+      "address": 95,
+      "label": "闭环加速度",
+      "group": "limits",
+      "unit": "RPM/s",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 10,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "closed_loop_deceleration",
+      "address": 96,
+      "label": "闭环减速度",
+      "group": "limits",
+      "unit": "RPM/s",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 10,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "automatic_reversal_mode",
+      "address": 100,
+      "label": "自动换向模式",
+      "group": "motor",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "正常换向"
+        },
+        {
+          "value": 1,
+          "label": "急停换向"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "hall_electrical_angle",
+      "address": 101,
+      "label": "霍尔电角度",
+      "group": "motor",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "60°"
+        },
+        {
+          "value": 1,
+          "label": "120°"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "sensor_type",
+      "address": 102,
+      "label": "传感器类型",
+      "group": "motor",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "霍尔"
+        },
+        {
+          "value": 1,
+          "label": "霍尔 + AB 编码器"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_pole_pairs",
+      "address": 104,
+      "label": "右电机极对数",
+      "group": "right",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "手册允许 0–65535；0 的实际含义未说明。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_phase_1_2",
+      "address": 105,
+      "label": "右电机第 1/2 相相序",
+      "group": "right",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1542,
+      "choices": [],
+      "note": "低字节为第 1 相，高字节为第 2 相；两个字节各为 0–6。",
+      "supportsTemporary": true,
+      "packedPhase": true
+    },
+    {
+      "id": "right_phase_3_4",
+      "address": 106,
+      "label": "右电机第 3/4 相相序",
+      "group": "right",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1542,
+      "choices": [],
+      "note": "低字节为第 3 相，高字节为第 4 相；两个字节各为 0–6。",
+      "supportsTemporary": true,
+      "packedPhase": true
+    },
+    {
+      "id": "right_phase_5_6",
+      "address": 107,
+      "label": "右电机第 5/6 相相序",
+      "group": "right",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1542,
+      "choices": [],
+      "note": "低字节为第 5 相，高字节为第 6 相；两个字节各为 0–6。",
+      "supportsTemporary": true,
+      "packedPhase": true
+    },
+    {
+      "id": "right_phase_learning_state",
+      "address": 108,
+      "label": "右电机相序学习状态",
+      "group": "right",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "未学习"
+        },
+        {
+          "value": 1,
+          "label": "已经学习"
+        }
+      ],
+      "note": "写入标志不会执行相序学习；学习操作位于测试控制。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_parking_current",
+      "address": 109,
+      "label": "右电机电子驻车最大电流",
+      "group": "right",
+      "unit": "A",
+      "words": 1,
+      "signed": false,
+      "divisor": 100,
+      "minRaw": 0,
+      "maxRaw": 6000,
+      "choices": [],
+      "note": "必须不超过最大输出电流。手册 0 值原文为“0：不停机锁相”，不据此宣称机械抱闸状态。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_foc_compensation_angle",
+      "address": 110,
+      "label": "右电机 FOC 相位补偿角",
+      "group": "right",
+      "unit": "°",
+      "words": 1,
+      "signed": true,
+      "divisor": 100,
+      "minRaw": -18000,
+      "maxRaw": 18000,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_foc_advance_angle",
+      "address": 111,
+      "label": "右电机 FOC 超前角",
+      "group": "right",
+      "unit": "°",
+      "words": 1,
+      "signed": true,
+      "divisor": 100,
+      "minRaw": -18000,
+      "maxRaw": 18000,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_reverse",
+      "address": 112,
+      "label": "右电机反向",
+      "group": "right",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "无"
+        },
+        {
+          "value": 1,
+          "label": "反向"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_pole_pairs",
+      "address": 113,
+      "label": "左电机极对数",
+      "group": "left",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "手册允许 0–65535；0 的实际含义未说明。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_phase_1_2",
+      "address": 114,
+      "label": "左电机第 1/2 相相序",
+      "group": "left",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1542,
+      "choices": [],
+      "note": "低字节为第 1 相，高字节为第 2 相；两个字节各为 0–6。",
+      "supportsTemporary": true,
+      "packedPhase": true
+    },
+    {
+      "id": "left_phase_3_4",
+      "address": 115,
+      "label": "左电机第 3/4 相相序",
+      "group": "left",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1542,
+      "choices": [],
+      "note": "低字节为第 3 相，高字节为第 4 相；两个字节各为 0–6。",
+      "supportsTemporary": true,
+      "packedPhase": true
+    },
+    {
+      "id": "left_phase_5_6",
+      "address": 116,
+      "label": "左电机第 5/6 相相序",
+      "group": "left",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1542,
+      "choices": [],
+      "note": "低字节为第 5 相，高字节为第 6 相；两个字节各为 0–6。",
+      "supportsTemporary": true,
+      "packedPhase": true
+    },
+    {
+      "id": "left_phase_learning_state",
+      "address": 117,
+      "label": "左电机相序学习状态",
+      "group": "left",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "未学习"
+        },
+        {
+          "value": 1,
+          "label": "已经学习"
+        }
+      ],
+      "note": "写入标志不会执行相序学习；学习操作位于测试控制。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_parking_current",
+      "address": 118,
+      "label": "左电机电子驻车最大电流",
+      "group": "left",
+      "unit": "A",
+      "words": 1,
+      "signed": false,
+      "divisor": 100,
+      "minRaw": 0,
+      "maxRaw": 6000,
+      "choices": [],
+      "note": "必须不超过最大输出电流。手册 0 值原文为“0：不停机锁相”，不据此宣称机械抱闸状态。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_foc_compensation_angle",
+      "address": 119,
+      "label": "左电机 FOC 相位补偿角",
+      "group": "left",
+      "unit": "°",
+      "words": 1,
+      "signed": true,
+      "divisor": 100,
+      "minRaw": -18000,
+      "maxRaw": 18000,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_foc_advance_angle",
+      "address": 120,
+      "label": "左电机 FOC 超前角",
+      "group": "left",
+      "unit": "°",
+      "words": 1,
+      "signed": true,
+      "divisor": 100,
+      "minRaw": -18000,
+      "maxRaw": 18000,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_reverse",
+      "address": 121,
+      "label": "左电机反向",
+      "group": "left",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "无"
+        },
+        {
+          "value": 1,
+          "label": "反向"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "overvoltage_threshold",
+      "address": 132,
+      "label": "过压保护电压",
+      "group": "system",
+      "unit": "V",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 8,
+      "maxRaw": 60,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "undervoltage_threshold",
+      "address": 133,
+      "label": "欠压保护电压",
+      "group": "system",
+      "unit": "V",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 8,
+      "maxRaw": 60,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "voltage_protection_enabled",
+      "address": 134,
+      "label": "电压保护",
+      "group": "system",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "不保护"
+        },
+        {
+          "value": 1,
+          "label": "保护"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "system_mode",
+      "address": 135,
+      "label": "系统模式",
+      "group": "system",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 4,
+      "choices": [
+        {
+          "value": 1,
+          "label": "独立速度闭环"
+        },
+        {
+          "value": 3,
+          "label": "同源速度闭环"
+        },
+        {
+          "value": 4,
+          "label": "差速闭环"
+        }
+      ],
+      "note": "配置值 0/2 在本版手册中保留；状态寄存器可能报告这两个旧模式。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "foc_closed_loop_mode",
+      "address": 137,
+      "label": "FOC 闭环模式",
+      "group": "system",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "单速度闭环"
+        },
+        {
+          "value": 1,
+          "label": "速度电流双闭环"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "differential_turn_max_speed",
+      "address": 138,
+      "label": "差速转弯最大速度",
+      "group": "system",
+      "unit": "RPM",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "手册写 0–110000。手册上限超过单个 16 位寄存器；仅接受可编码的 0–65535，上限冲突仍需厂家确认。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "stall_stop_time",
+      "address": 139,
+      "label": "堵转停机时间",
+      "group": "system",
+      "unit": "ms",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "手册写 0–66635。手册上限超过单个 16 位寄存器；仅接受可编码的 0–65535，上限冲突仍需厂家确认。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "phase_overcurrent_threshold",
+      "address": 140,
+      "label": "相过流关闭电流",
+      "group": "system",
+      "unit": "A",
+      "words": 1,
+      "signed": false,
+      "divisor": 100,
+      "minRaw": 100,
+      "maxRaw": 8000,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_brake_output_type",
+      "address": 176,
+      "label": "右电机抱闸输出类型",
+      "group": "brakes",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 2,
+      "choices": [
+        {
+          "value": 0,
+          "label": "不输出"
+        },
+        {
+          "value": 1,
+          "label": "停机自动刹车"
+        },
+        {
+          "value": 2,
+          "label": "通讯控制"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "right_stop_brake_enabled",
+      "address": 177,
+      "label": "右电机停车刹车",
+      "group": "brakes",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "不生效"
+        },
+        {
+          "value": 1,
+          "label": "停止刹车生效"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_brake_output_type",
+      "address": 178,
+      "label": "左电机抱闸输出类型",
+      "group": "brakes",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 2,
+      "choices": [
+        {
+          "value": 0,
+          "label": "不输出"
+        },
+        {
+          "value": 1,
+          "label": "停机自动刹车"
+        },
+        {
+          "value": 2,
+          "label": "通讯控制"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "left_stop_brake_enabled",
+      "address": 179,
+      "label": "左电机停车刹车",
+      "group": "brakes",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 1,
+      "choices": [
+        {
+          "value": 0,
+          "label": "不生效"
+        },
+        {
+          "value": 1,
+          "label": "停止刹车生效"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "rs485_address",
+      "address": 200,
+      "label": "RS485 从站地址",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 255,
+      "choices": [],
+      "note": "配置表为 0–255，帧地址说明为 1–254；0/255 写入后本工具不能据普通单播确认。修改会影响当前 RS485 链路，请单项保存并使用新参数重新连接。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "rs485_baud_rate_code",
+      "address": 201,
+      "label": "RS485 波特率",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 4,
+      "choices": [
+        {
+          "value": 0,
+          "label": "9600"
+        },
+        {
+          "value": 1,
+          "label": "19200"
+        },
+        {
+          "value": 2,
+          "label": "38400"
+        },
+        {
+          "value": 3,
+          "label": "57600"
+        },
+        {
+          "value": 4,
+          "label": "115200"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "rs485_parity_code",
+      "address": 202,
+      "label": "RS485 校验及停止位",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 3,
+      "choices": [
+        {
+          "value": 0,
+          "label": "N1"
+        },
+        {
+          "value": 1,
+          "label": "E1"
+        },
+        {
+          "value": 2,
+          "label": "O1"
+        },
+        {
+          "value": 3,
+          "label": "N2"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "rs485_timeout_s",
+      "address": 203,
+      "label": "RS485 通信中断制动时间",
+      "group": "communication",
+      "unit": "s",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "手册单位为秒、上限 66635。手册上限超过单个 16 位寄存器；仅接受可编码的 0–65535，上限冲突仍需厂家确认。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "can_node_id",
+      "address": 205,
+      "label": "CAN 节点 ID",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 127,
+      "choices": [],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "can_baud_rate_code",
+      "address": 206,
+      "label": "CAN 波特率",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 13,
+      "choices": [
+        {
+          "value": 0,
+          "label": "10 kbps"
+        },
+        {
+          "value": 1,
+          "label": "20 kbps"
+        },
+        {
+          "value": 2,
+          "label": "40 kbps"
+        },
+        {
+          "value": 3,
+          "label": "50 kbps"
+        },
+        {
+          "value": 4,
+          "label": "80 kbps"
+        },
+        {
+          "value": 5,
+          "label": "100 kbps"
+        },
+        {
+          "value": 6,
+          "label": "125 kbps"
+        },
+        {
+          "value": 7,
+          "label": "200 kbps"
+        },
+        {
+          "value": 8,
+          "label": "250 kbps"
+        },
+        {
+          "value": 9,
+          "label": "400 kbps"
+        },
+        {
+          "value": 10,
+          "label": "500 kbps"
+        },
+        {
+          "value": 11,
+          "label": "600 kbps"
+        },
+        {
+          "value": 12,
+          "label": "800 kbps"
+        },
+        {
+          "value": 13,
+          "label": "1 Mbps"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "can_timeout_s",
+      "address": 207,
+      "label": "CAN 通信中断制动时间",
+      "group": "communication",
+      "unit": "s",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "手册单位为秒、上限 66635。手册上限超过单个 16 位寄存器；仅接受可编码的 0–65535，上限冲突仍需厂家确认。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "ttl_address",
+      "address": 210,
+      "label": "TTL 从站地址",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 255,
+      "choices": [],
+      "note": "配置表为 0–255，帧地址说明为 1–254；0/255 写入后本工具不能据普通单播确认。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "ttl_baud_rate_code",
+      "address": 211,
+      "label": "TTL 波特率",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 4,
+      "choices": [
+        {
+          "value": 0,
+          "label": "9600"
+        },
+        {
+          "value": 1,
+          "label": "19200"
+        },
+        {
+          "value": 2,
+          "label": "38400"
+        },
+        {
+          "value": 3,
+          "label": "57600"
+        },
+        {
+          "value": 4,
+          "label": "115200"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "ttl_parity_code",
+      "address": 212,
+      "label": "TTL 校验及停止位",
+      "group": "communication",
+      "unit": "",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 3,
+      "choices": [
+        {
+          "value": 0,
+          "label": "N1"
+        },
+        {
+          "value": 1,
+          "label": "E1"
+        },
+        {
+          "value": 2,
+          "label": "O1"
+        },
+        {
+          "value": 3,
+          "label": "N2"
+        }
+      ],
+      "note": "",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "ttl_timeout_s",
+      "address": 213,
+      "label": "TTL 通信中断制动时间",
+      "group": "communication",
+      "unit": "s",
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 65535,
+      "choices": [],
+      "note": "手册单位为秒、上限 66635。手册上限超过单个 16 位寄存器；仅接受可编码的 0–65535，上限冲突仍需厂家确认。",
+      "supportsTemporary": true,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_speed_p",
+      "address": 224,
+      "label": "速度环 P",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–327680，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_speed_i",
+      "address": 226,
+      "label": "速度环 I",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_speed_d",
+      "address": 228,
+      "label": "速度环 D",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_d_axis_p",
+      "address": 230,
+      "label": "D 轴 P",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–327680，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_d_axis_i",
+      "address": 232,
+      "label": "D 轴 I",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_d_axis_d",
+      "address": 234,
+      "label": "D 轴 D",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_q_axis_p",
+      "address": 236,
+      "label": "Q 轴 P",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–327680，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_q_axis_i",
+      "address": 238,
+      "label": "Q 轴 I",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_q_axis_d",
+      "address": 240,
+      "label": "Q 轴 D",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_speed_p",
+      "address": 242,
+      "label": "编码器驻车速度环 P",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_speed_i",
+      "address": 244,
+      "label": "编码器驻车速度环 I",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_speed_d",
+      "address": 246,
+      "label": "编码器驻车速度环 D",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_d_axis_p",
+      "address": 248,
+      "label": "编码器驻车 D 轴 P",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_d_axis_i",
+      "address": 250,
+      "label": "编码器驻车 D 轴 I",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_d_axis_d",
+      "address": 252,
+      "label": "编码器驻车 D 轴 D",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_q_axis_p",
+      "address": 254,
+      "label": "编码器驻车 Q 轴 P",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_q_axis_i",
+      "address": 256,
+      "label": "编码器驻车 Q 轴 I",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_parking_q_axis_d",
+      "address": 258,
+      "label": "编码器驻车 Q 轴 D",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 32768,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。实际值 = 原始值 / 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    },
+    {
+      "id": "pid_hall_parking_speed_p",
+      "address": 260,
+      "label": "霍尔驻车速度环 P",
+      "group": "pid",
+      "unit": "",
+      "words": 2,
+      "signed": false,
+      "divisor": 1,
+      "minRaw": 0,
+      "maxRaw": 4294967295,
+      "choices": [],
+      "note": "手册建议原始值 1–326780，是建议而非硬限制。此项直接使用原始值，不除以 32768。",
+      "supportsTemporary": false,
+      "packedPhase": false
+    }
+  ],
+  "readOnlyFields": [
+    {
+      "id": "device_id",
+      "address": 0,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "设备标识号",
+      "unit": ""
+    },
+    {
+      "id": "device_version",
+      "address": 1,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "设备版本",
+      "unit": "",
+      "note": "高字节主版本、低字节副版本"
+    },
+    {
+      "id": "device_max_current",
+      "address": 2,
+      "words": 1,
+      "signed": false,
+      "divisor": 100,
+      "label": "设备最大电流",
+      "unit": "A"
+    },
+    {
+      "id": "right_current",
+      "address": 8,
+      "words": 1,
+      "signed": false,
+      "divisor": 100,
+      "label": "右电机实时相电流",
+      "unit": "A",
+      "note": ""
+    },
+    {
+      "id": "right_speed",
+      "address": 9,
+      "words": 2,
+      "signed": true,
+      "divisor": 1,
+      "label": "右电机实时速度",
+      "unit": "RPM",
+      "note": ""
+    },
+    {
+      "id": "right_error",
+      "address": 11,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "右电机错误状态",
+      "unit": "",
+      "note": ""
+    },
+    {
+      "id": "right_pwm",
+      "address": 12,
+      "words": 1,
+      "signed": false,
+      "divisor": 10,
+      "label": "右电机实时 PWM",
+      "unit": "%",
+      "note": "手册原值 0–10000、每单位 0.1%，存在百分比上限冲突；同时保留原始值。"
+    },
+    {
+      "id": "right_temperature",
+      "address": 13,
+      "words": 1,
+      "signed": true,
+      "divisor": 1,
+      "label": "右电机电路板温度",
+      "unit": "℃",
+      "note": ""
+    },
+    {
+      "id": "right_displacement",
+      "address": 15,
+      "words": 2,
+      "signed": true,
+      "divisor": 1,
+      "label": "右电机位移",
+      "unit": "°",
+      "note": ""
+    },
+    {
+      "id": "right_reverse_status",
+      "address": 17,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "右电机反向状态",
+      "unit": "",
+      "note": ""
+    },
+    {
+      "id": "left_current",
+      "address": 18,
+      "words": 1,
+      "signed": false,
+      "divisor": 100,
+      "label": "左电机实时相电流",
+      "unit": "A",
+      "note": ""
+    },
+    {
+      "id": "left_speed",
+      "address": 19,
+      "words": 2,
+      "signed": true,
+      "divisor": 1,
+      "label": "左电机实时速度",
+      "unit": "RPM",
+      "note": ""
+    },
+    {
+      "id": "left_error",
+      "address": 21,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "左电机错误状态",
+      "unit": "",
+      "note": ""
+    },
+    {
+      "id": "left_pwm",
+      "address": 22,
+      "words": 1,
+      "signed": false,
+      "divisor": 10,
+      "label": "左电机实时 PWM",
+      "unit": "%",
+      "note": "手册原值 0–10000、每单位 0.1%，存在百分比上限冲突；同时保留原始值。"
+    },
+    {
+      "id": "left_temperature",
+      "address": 23,
+      "words": 1,
+      "signed": true,
+      "divisor": 1,
+      "label": "左电机电路板温度",
+      "unit": "℃",
+      "note": ""
+    },
+    {
+      "id": "left_displacement",
+      "address": 25,
+      "words": 2,
+      "signed": true,
+      "divisor": 1,
+      "label": "左电机位移",
+      "unit": "°",
+      "note": ""
+    },
+    {
+      "id": "left_reverse_status",
+      "address": 27,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "左电机反向状态",
+      "unit": "",
+      "note": ""
+    },
+    {
+      "id": "supply_voltage",
+      "address": 28,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "电源电压",
+      "unit": "V"
+    },
+    {
+      "id": "runtime_system_mode",
+      "address": 29,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "实时系统模式",
+      "unit": ""
+    },
+    {
+      "id": "control_mode",
+      "address": 30,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "控制模式",
+      "unit": ""
+    },
+    {
+      "id": "input_1",
+      "address": 31,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "IN1 电平",
+      "unit": ""
+    },
+    {
+      "id": "input_2",
+      "address": 32,
+      "words": 1,
+      "signed": false,
+      "divisor": 1,
+      "label": "IN2 电平",
+      "unit": ""
+    }
+  ],
+  "actions": [
+    {
+      "id": "right_stop",
+      "address": 64,
+      "words": 1,
+      "minimum": 0,
+      "maximum": 2,
+      "label": "右电机停止",
+      "choices": [
+        [
+          0,
+          "正常停止"
+        ],
+        [
+          1,
+          "紧急停止"
+        ],
+        [
+          2,
+          "自由停止"
+        ]
+      ],
+      "bounded": false
+    },
+    {
+      "id": "right_target_speed",
+      "address": 65,
+      "words": 2,
+      "minimum": -110000,
+      "maximum": 110000,
+      "label": "右 / 直行目标速度",
+      "choices": [],
+      "bounded": true
+    },
+    {
+      "id": "right_brake",
+      "address": 67,
+      "words": 1,
+      "minimum": 0,
+      "maximum": 1,
+      "label": "右电机抱闸控制",
+      "choices": [
+        [
+          0,
+          "断开抱闸"
+        ],
+        [
+          1,
+          "闭合抱闸"
+        ]
+      ],
+      "bounded": false
+    },
+    {
+      "id": "left_stop",
+      "address": 68,
+      "words": 1,
+      "minimum": 0,
+      "maximum": 2,
+      "label": "左电机停止",
+      "choices": [
+        [
+          0,
+          "正常停止"
+        ],
+        [
+          1,
+          "紧急停止"
+        ],
+        [
+          2,
+          "自由停止"
+        ]
+      ],
+      "bounded": false
+    },
+    {
+      "id": "left_target_speed",
+      "address": 69,
+      "words": 2,
+      "minimum": -110000,
+      "maximum": 110000,
+      "label": "左 / 转弯目标速度",
+      "choices": [],
+      "bounded": true
+    },
+    {
+      "id": "left_brake",
+      "address": 71,
+      "words": 1,
+      "minimum": 0,
+      "maximum": 1,
+      "label": "左电机抱闸控制",
+      "choices": [
+        [
+          0,
+          "打开抱闸"
+        ],
+        [
+          1,
+          "关闭抱闸"
+        ]
+      ],
+      "bounded": false
+    },
+    {
+      "id": "factory_reset",
+      "address": 72,
+      "words": 1,
+      "minimum": 1,
+      "maximum": 1,
+      "label": "恢复出厂参数",
+      "choices": [
+        [
+          1,
+          "恢复出厂"
+        ]
+      ],
+      "bounded": false
+    },
+    {
+      "id": "phase_learning",
+      "address": 73,
+      "words": 1,
+      "minimum": 0,
+      "maximum": 2,
+      "label": "相序学习 / 取消测试",
+      "choices": [
+        [
+          0,
+          "取消测试"
+        ],
+        [
+          1,
+          "左电机相序学习"
+        ],
+        [
+          2,
+          "右电机相序学习"
+        ]
+      ],
+      "bounded": true
+    }
+  ]
+}

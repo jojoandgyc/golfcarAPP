@@ -7,11 +7,13 @@
     <cloud-backup>
         <exclude domain="sharedpref" path="board_credentials.xml" />
         <exclude domain="sharedpref" path="follow_recovery.xml" />
+        <exclude domain="sharedpref" path="motor_recovery.xml" />
         <exclude domain="file" path="diagnostics/" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="board_credentials.xml" />
         <exclude domain="sharedpref" path="follow_recovery.xml" />
+        <exclude domain="sharedpref" path="motor_recovery.xml" />
         <exclude domain="file" path="diagnostics/" />
     </device-transfer>
 </data-extraction-rules>

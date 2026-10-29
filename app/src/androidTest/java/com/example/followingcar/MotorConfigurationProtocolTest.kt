@@ -13,7 +13,7 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class MotorConfigurationProtocolTest {
     private fun fixture(): JSONObject = InstrumentationRegistry.getInstrumentation().context.assets
-        .open("motor-config-snapshot-v1.json").bufferedReader(Charsets.UTF_8).use { JSONObject(it.readText()) }
+        .open("motor-config-snapshot-v2.json").bufferedReader(Charsets.UTF_8).use { JSONObject(it.readText()) }
 
     private fun command(root: JSONObject, exitCode: Int = 0) = CommandResult(
         command = "offline-motor-config-fixture", stdout = root.toString(), stderr = "", exitCode = exitCode)
@@ -41,7 +41,7 @@ class MotorConfigurationProtocolTest {
         MotorConfigurationChange(MotorConfigurationField.MAX_REVERSE_SPEED, 100, 200)))
 
     private fun words(field: MotorConfigurationField, raw: Long) = JSONArray().apply {
-        if (field.maxRaw > 65535) put((raw ushr 16).toInt())
+        if (field.words == 2) put((raw ushr 16).toInt())
         put((raw and 65535).toInt())
     }
 
@@ -61,29 +61,26 @@ class MotorConfigurationProtocolTest {
         return root.put("results", results)
     }
 
-    @Test fun simulatedBridgeFixtureParsesFiveFieldsAndReadOnlyPhaseWords() {
+    @Test fun simulatedBridgeFixtureParsesEveryConfigurationAndTelemetryField() {
         val reply = parse()
         assertTrue(reply.ok)
         assertFalse(reply.writeMayHaveOccurred)
         assertTrue(reply.results.isEmpty())
         val snapshot = requireNotNull(reply.snapshot)
-        assertEquals(setOf(MotorConfigurationField.MAX_OUTPUT_CURRENT, MotorConfigurationField.MAX_FORWARD_SPEED,
-            MotorConfigurationField.MAX_REVERSE_SPEED, MotorConfigurationField.CLOSED_LOOP_ACCELERATION,
-            MotorConfigurationField.CLOSED_LOOP_DECELERATION), snapshot.values.keys)
+        assertEquals(69, snapshot.values.size)
+        assertEquals(MotorConfigurationField.entries.toSet(), snapshot.values.keys)
+        assertEquals(7, snapshot.leftMotorInfo.size)
+        assertEquals(7, snapshot.rightMotorInfo.size)
+        assertTrue(snapshot.deviceInfo.any { it.address == 0x1f })
+        assertTrue(snapshot.deviceInfo.any { it.address == 0x20 })
         assertEquals(1000L, snapshot.values[MotorConfigurationField.MAX_OUTPUT_CURRENT])
-        assertEquals(100L, snapshot.values[MotorConfigurationField.MAX_FORWARD_SPEED])
-        assertEquals(200L, snapshot.values[MotorConfigurationField.CLOSED_LOOP_ACCELERATION])
-        assertEquals(300L, snapshot.values[MotorConfigurationField.CLOSED_LOOP_DECELERATION])
         assertEquals(0L, snapshot.leftParkingCurrentRaw)
-        assertEquals(0L, snapshot.rightParkingCurrentRaw)
         assertTrue(snapshot.writeAllowed)
-
-        val root = fixture()
-        field(root, "left_phase_sequence").put("raw", JSONArray(listOf(0x1234, 0xabcd, 0x00ff)))
-        field(root, "right_phase_sequence").put("raw", JSONArray(listOf(0x1111, 0x2222, 0x3333)))
-        val phaseDetails = requireNotNull(parse(root).snapshot).readOnlyInfo.map { it.value.orEmpty() }
-        assertTrue(phaseDetails.any { it.contains("0x1234 · 0xABCD · 0x00FF") })
-        assertTrue(phaseDetails.any { it.contains("0x1111 · 0x2222 · 0x3333") })
+        assertTrue(snapshot.stopAllowed)
+        val signed = fixture()
+        field(signed, "left_foc_compensation_angle").put("raw", JSONArray(listOf(0xb9b0)))
+        assertEquals(-18000L, parse(signed).snapshot!!.values[MotorConfigurationField.LEFT_FOC_COMPENSATION_ANGLE])
+        assertEquals("1,2", MotorConfigurationField.LEFT_PHASE_1_2.display(0x0201))
     }
 
     @Test fun requestUsesExactCurrentAndHighWordFirstForMaximumSpeed() {
@@ -98,8 +95,51 @@ class MotorConfigurationProtocolTest {
         assertEquals("[1251]", changes.getJSONObject(0).getJSONArray("raw").toString())
         assertEquals("[0,100]", changes.getJSONObject(1).getJSONArray("expectedRaw").toString())
         assertEquals("[1,44464]", changes.getJSONObject(1).getJSONArray("raw").toString())
+        assertEquals("persistent", encoded.getString("writeMode"))
+        assertEquals(2, encoded.getInt("schemaVersion"))
         assertFalse("Read requests must contain no mutation data",
             JSONObject(String(motorConfigurationRequest(REQUEST_ID), Charsets.UTF_8)).has("changes"))
+    }
+
+    @Test fun temporaryDoubleWordSpeedsUseCompleteLogicalValuesAndPartialFailureIsUnknown() {
+        val source = parse().snapshot!!
+        val changes = listOf(MotorConfigurationField.MAX_FORWARD_SPEED,
+            MotorConfigurationField.MAX_REVERSE_SPEED, MotorConfigurationField.MIN_SPEED).map { field ->
+            MotorConfigurationChange(field, source.values.getValue(field), 110000)
+        }
+        val plan = MotorConfigurationWritePlan(source.snapshotId, changes, MotorConfigurationWriteMode.TEMPORARY)
+        val request = JSONObject(String(motorConfigurationRequest(REQUEST_ID, plan), Charsets.UTF_8))
+        assertEquals("temporary", request.getString("writeMode"))
+        val encoded = request.getJSONArray("changes")
+        changes.forEachIndexed { index, change ->
+            assertEquals(change.field.id, encoded.getJSONObject(index).getString("id"))
+            assertEquals("[1,44464]", encoded.getJSONObject(index).getJSONArray("raw").toString())
+        }
+        assertTrue(parse(successfulWrite(plan), plan).ok)
+
+        // A bridge may have written only one word before losing an ACK. Never expose a
+        // verified value, retain a usable baseline, or silently retry that logical field.
+        val partial = fixture().put("op", "write").put("ok", false).put("snapshot", JSONObject.NULL)
+            .put("writeMayHaveOccurred", true).put("error", JSONObject().put("code", "write_outcome_unknown"))
+            .put("results", JSONArray().put(result(changes[0], "write_outcome_unknown"))
+                .put(result(changes[1], "not_attempted")).put(result(changes[2], "not_attempted")))
+        val reply = parse(partial, plan)
+        assertFalse(reply.ok)
+        assertTrue(reply.writeMayHaveOccurred)
+        assertNull(reply.snapshot)
+        assertEquals(MotorConfigurationWriteOutcome.WRITE_OUTCOME_UNKNOWN, reply.results[0].outcome)
+        assertNull(reply.results[0].observedRaw)
+        assertEquals(listOf(MotorConfigurationWriteOutcome.NOT_ATTEMPTED,
+            MotorConfigurationWriteOutcome.NOT_ATTEMPTED), reply.results.drop(1).map { it.outcome })
+
+        val pid = MotorConfigurationField.PID_SPEED_P
+        val pidPlan = MotorConfigurationWritePlan(source.snapshotId,
+            listOf(MotorConfigurationChange(pid, source.values.getValue(pid), 32769)),
+            MotorConfigurationWriteMode.TEMPORARY)
+        try {
+            motorConfigurationRequest(REQUEST_ID, pidPlan)
+            fail("PID entries support FC10 only")
+        } catch (_: IllegalArgumentException) { }
     }
 
     @Test fun responseCorrelationAndSimulationCannotBeConfused() {
@@ -107,7 +147,7 @@ class MotorConfigurationProtocolTest {
         assertRejected(fixture().put("op", "write"))
         assertRejected(fixture().put("simulation", false))
         assertRejected(fixture(), simulation = false)
-        assertRejected(fixture().put("schemaVersion", 2))
+        assertRejected(fixture().put("schemaVersion", 1))
         assertRejected(fixture().put("ok", "true"))
     }
 
@@ -183,6 +223,98 @@ class MotorConfigurationProtocolTest {
         val missingSnapshot = fixture()
         missingSnapshot.remove("snapshot")
         assertRejected(missingSnapshot)
+    }
+
+    @Test fun signedWordEncodingAndSerialIdentityAreStrict() {
+        val field = MotorConfigurationField.RIGHT_FOC_COMPENSATION_ANGLE
+        assertEquals("[47536]", motorWords(field, -18000).toString())
+        val source = parse().snapshot!!
+        val plan = MotorConfigurationWritePlan(source.snapshotId, listOf(
+            MotorConfigurationChange(field, source.values.getValue(field), -18000)))
+        val encoded = JSONObject(String(motorConfigurationRequest(REQUEST_ID, plan,
+            MotorSerialSettings(12, 38400, 3)), Charsets.UTF_8))
+        val connection = encoded.getJSONObject("connection")
+        assertEquals(12, connection.getInt("slave"))
+        assertEquals(38400, connection.getInt("baudRate"))
+        assertEquals("N", connection.getString("parity"))
+        assertEquals(2, connection.getInt("stopBits"))
+        val mismatch = fixture()
+        mismatch.getJSONObject("connection").put("slave", 2)
+        assertRejected(mismatch)
+        val falseWidth = fixture()
+        field(falseWidth, "max_output_current").put("address", 0x59)
+        assertRejected(falseWidth)
+    }
+
+    @Test fun actionRequestIsConfirmedCorrelatedAndBounded() {
+        val plan = MotorActionPlan(parse().snapshot!!.snapshotId, MotorAction.RIGHT_TARGET_SPEED, -100, 200)
+        val encoded = JSONObject(String(motorActionRequest(REQUEST_ID, plan), Charsets.UTF_8))
+        assertEquals("action", encoded.getString("op"))
+        assertEquals("right_target_speed", encoded.getString("actionId"))
+        assertEquals(-100, encoded.getInt("value"))
+        assertEquals(200, encoded.getInt("durationMs"))
+        assertTrue(encoded.getBoolean("confirmed"))
+        val root = fixture().put("op", "action").put("writeMayHaveOccurred", true)
+            .put("actionResult", JSONObject().put("actionId", plan.action.id).put("value", plan.value)
+                .put("durationMs", plan.durationMs).put("outcome", "acknowledged")
+                .put("cleanupConfirmed", true).put("reconnectRequired", false).put("error", JSONObject.NULL))
+        val reply = parseMotorActionReply(command(root), REQUEST_ID, plan, simulation = true)
+        assertTrue(reply.ok)
+        assertEquals(MotorActionOutcome.ACKNOWLEDGED, reply.actionResult!!.outcome)
+        assertEquals(true, reply.actionResult.cleanupConfirmed)
+        root.getJSONObject("actionResult").put("cleanupConfirmed", false)
+        try {
+            parseMotorActionReply(command(root), REQUEST_ID, plan, simulation = true)
+            fail("Bounded action cannot succeed without its cleanup acknowledgement")
+        } catch (_: IOException) { }
+    }
+
+    @Test fun changedCommunicationRequiresReconnectAndNeverPretendsToHaveReadBack() {
+        val source = parse().snapshot!!
+        val field = MotorConfigurationField.RS485_ADDRESS
+        val plan = MotorConfigurationWritePlan(source.snapshotId, listOf(
+            MotorConfigurationChange(field, source.values.getValue(field), 2)))
+        val root = fixture().put("op", "write").put("ok", false).put("snapshot", JSONObject.NULL)
+            .put("reconnectRequired", true).put("writeMayHaveOccurred", true)
+            .put("error", JSONObject().put("code", "communication_reconnect_required"))
+            .put("results", JSONArray().put(result(plan.changes.single(), "acknowledged_unverified")))
+        val reply = parse(root, plan)
+        assertTrue(reply.reconnectRequired)
+        assertFalse(reply.ok)
+        assertNull(reply.snapshot)
+        assertEquals(MotorConfigurationWriteOutcome.ACKNOWLEDGED_UNVERIFIED, reply.results.single().outcome)
+    }
+
+    @Test fun factoryResetAcknowledgementRetainsReconnectAndUnknownState() {
+        val plan = MotorActionPlan(parse().snapshot!!.snapshotId, MotorAction.FACTORY_RESET, 1, 0)
+        val root = fixture().put("op", "action").put("snapshot", JSONObject.NULL)
+            .put("reconnectRequired", true).put("writeMayHaveOccurred", true)
+            .put("actionResult", JSONObject().put("actionId", plan.action.id).put("value", 1)
+                .put("durationMs", 0).put("outcome", "acknowledged").put("cleanupConfirmed", JSONObject.NULL)
+                .put("reconnectRequired", true).put("error", JSONObject.NULL))
+        val acknowledged = parseMotorActionReply(command(root), REQUEST_ID, plan, simulation = true)
+        assertTrue(acknowledged.ok)
+        assertTrue(acknowledged.reconnectRequired)
+        assertNull(acknowledged.snapshot)
+        root.put("ok", false).put("error", JSONObject().put("code", "write_outcome_unknown"))
+        root.getJSONObject("actionResult").put("outcome", "write_outcome_unknown")
+        val unknown = parseMotorActionReply(command(root), REQUEST_ID, plan, simulation = true)
+        assertFalse(unknown.ok)
+        assertTrue(unknown.reconnectRequired)
+        assertEquals(MotorActionOutcome.WRITE_OUTCOME_UNKNOWN, unknown.actionResult!!.outcome)
+    }
+
+    @Test fun maximumCatalogRequestFitsBoundedBridgeInput() {
+        val snapshot = parse().snapshot!!
+        val changes = MotorConfigurationField.entries.map { field ->
+            val old = snapshot.values.getValue(field)
+            val replacement = if (old != field.minRaw && field.accepts(field.minRaw)) field.minRaw
+                else if (field.choices.isNotEmpty()) field.choices.keys.first { it != old }
+                else if (field.phasePair) 0x0606L else field.maxRaw
+            MotorConfigurationChange(field, old, replacement)
+        }
+        assertTrue(motorConfigurationRequest(REQUEST_ID,
+            MotorConfigurationWritePlan(snapshot.snapshotId, changes)).size <= 8192)
     }
 
     companion object { private const val REQUEST_ID = "android-fixture" }

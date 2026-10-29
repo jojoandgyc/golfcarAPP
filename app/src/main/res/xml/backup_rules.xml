@@ -8,5 +8,6 @@
 <full-backup-content>
     <exclude domain="sharedpref" path="board_credentials.xml" />
     <exclude domain="sharedpref" path="follow_recovery.xml" />
+    <exclude domain="sharedpref" path="motor_recovery.xml" />
     <exclude domain="file" path="diagnostics/" />
 </full-backup-content>

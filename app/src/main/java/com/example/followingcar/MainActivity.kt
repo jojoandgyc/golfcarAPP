@@ -195,7 +195,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     val connect: () -> Unit = {
         val current = viewModel.state.value
         val currentWireless = viewModel.wifiDirect.state.value
-        if (current.canManagePairing && !current.pairingBusy && !current.pairingUnconfirmed && !currentWireless.busy && !currentWireless.confirmationRequired &&
+        if (current.canRecoverConnection && !current.pairingBusy && !current.pairingUnconfirmed && !currentWireless.busy && !currentWireless.confirmationRequired &&
             (!useWifiDirect || !currentWireless.discovering)) {
             keyboard?.hide()
             if (!current.remoteMode && Build.VERSION.SDK_INT >= 37 &&
@@ -207,7 +207,8 @@ private fun BoardScreen(viewModel: BoardViewModel) {
         if (next.ordinal != selectedPageIndex) {
             viewModel.recordUiEvent("ui.page_changed", "${BoardPage.entries[selectedPageIndex].name}->${next.name}")
             val leavingControl = (selectedPageIndex == BoardPage.FOLLOW.ordinal && state.followActive) ||
-                (selectedPageIndex == BoardPage.JOYSTICK.ordinal && state.manualActive)
+                (selectedPageIndex == BoardPage.JOYSTICK.ordinal && state.manualActive) ||
+                (selectedPageIndex == BoardPage.MOTOR.ordinal && state.motorActionCancellable)
             if (leavingControl) viewModel.onControlSurfaceHidden("已离开控制页面", ControlStopSource.PAGE_CHANGED)
             selectedPageIndex = next.ordinal
         }
@@ -256,6 +257,15 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     }
                 }
             }
+            if (state.motorActionUnconfirmed && page != BoardPage.MOTOR) {
+                Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        Text("电机操作状态待核对，驾驶、跟随、终端及视频保持锁定。可恢复网络并连接 SSH 后，到电机页主动读取恢复。",
+                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("motorRecoveryBanner"))
+                        TextButton(onClick = { selectPage(BoardPage.MOTOR) }) { Text("打开电机状态核对") }
+                    }
+                }
+            }
             PrimaryTabRow(selectedTabIndex = selectedPageIndex) {
                 BoardPage.entries.forEach { page ->
                     Tab(
@@ -285,7 +295,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     modifier = Modifier.fillMaxWidth().weight(1f), scrollState = followScroll)
             } else if (page == BoardPage.MOTOR) {
                 MotorConfigurationPage(state = motorConfiguration, connected = state.connected,
-                    accessAllowed = state.canConfigureMotor,
+                    accessAllowed = state.canReadMotorConfiguration,
                     blockedReason = when {
                         !state.connected -> "请先在连接页连接开发板"
                         state.manualActive -> "请先停用手动驾驶，再读取或修改电机配置"
@@ -299,7 +309,13 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     onEdit = viewModel::editMotorConfiguration,
                     onDiscard = viewModel::discardMotorConfigurationChanges,
                     onApply = viewModel::applyMotorConfiguration,
-                    modifier = Modifier.fillMaxWidth().weight(1f))
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    onConnectionChange = viewModel::editMotorConnection,
+                    onWriteModeChange = viewModel::setMotorWriteMode,
+                    onAction = viewModel::applyMotorAction,
+                    actionUnconfirmed = state.motorActionUnconfirmed,
+                    actionCancellationAllowed = state.motorActionCancellable,
+                    onCancelAction = { viewModel.cancelMotorAction() })
             } else {
                 val scroll = when (page) {
                     BoardPage.CONNECTION -> connectionScroll
@@ -378,12 +394,11 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                         BoardPage.JOYSTICK -> Unit
                         BoardPage.MOTOR -> Unit
                         BoardPage.TERMINAL -> {
-                            DiagnosticLogCard(controlActive = state.manualActive || state.followActive || state.followStopping)
+                            DiagnosticLogCard(controlActive = state.manualActive || state.followActive || state.followStopping || motorConfiguration.actioning)
                             Card(modifier = Modifier.fillMaxWidth()) {
                                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                     Text("快捷查询", style = MaterialTheme.typography.titleMedium)
-                                    val enabled = state.connected && !state.busy &&
-                                        !state.manualActive && !state.followBlocksControl
+                                    val enabled = state.canExecuteTerminal
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         OutlinedButton(onClick = { viewModel.execute(BoardViewModel.BOARD_STATUS_COMMAND) },
                                             enabled = enabled, modifier = Modifier.weight(1f)) { Text("系统状态") }
@@ -411,8 +426,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                         style = MaterialTheme.typography.bodySmall)
                                     Button(
                                         onClick = { keyboard?.hide(); viewModel.execute() },
-                                        enabled = state.connected && !state.busy && !state.manualActive &&
-                                            !state.followBlocksControl && state.command.isNotBlank(),
+                                        enabled = state.canExecuteTerminal && state.command.isNotBlank(),
                                         modifier = Modifier.fillMaxWidth().testTag("execute")
                                     ) { Text("执行命令") }
                                     if (state.busy && state.connected) {

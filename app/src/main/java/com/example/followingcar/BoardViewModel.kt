@@ -36,6 +36,8 @@ data class BoardUiState(
     val command: String = "whoami",
     val connected: Boolean = false,
     val busy: Boolean = false,
+    val motorActionUnconfirmed: Boolean = false,
+    val motorActionCancellable: Boolean = false,
     val pairingBusy: Boolean = false,
     val pairingUnconfirmed: Boolean = false,
     val pairingHotspotActive: Boolean = false,
@@ -86,33 +88,39 @@ data class BoardUiState(
 ) {
     val connectionHost: String get() = if (remoteMode) remoteProfile?.host ?: DEFAULT_REMOTE_HOST else host
     val connectionPort: String get() = if (remoteMode) (remoteProfile?.controlPort ?: DEFAULT_REMOTE_CONTROL_PORT).toString() else port
-    val canManageConnectionMode: Boolean get() = canManagePairing && !pairingBusy &&
+    val canManageConnectionMode: Boolean get() = canRecoverConnection && !pairingBusy &&
         !pairingUnconfirmed && !remoteProfileLoading
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followStopping || followUncertain
-    val canEnableDrive: Boolean get() = connected && !busy && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
+    val canEnableDrive: Boolean get() = connected && !busy && !motorActionUnconfirmed && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
     val canToggleVideoService: Boolean
-        get() = connected && !busy && !videoServiceBusy && !driveStarting && !driveStopping && !followBlocksControl
+        get() = connected && !busy && !motorActionUnconfirmed && !videoServiceBusy && !driveStarting && !driveStopping && !followBlocksControl
     val canInspectFollow: Boolean get() = connected && !busy && !pairingBusy && !pairingUnconfirmed && !manualActive && !followActive && !followStopping && !videoServiceBusy
     // Restoring a lost wireless group must remain possible while the old control lock awaits SSH inspection.
-    val canManagePairing: Boolean get() = !connected && !busy && !manualActive &&
+    val canRecoverConnection: Boolean get() = !connected && !busy && !manualActive &&
         !followActive && !followStopping && !videoServiceBusy
+    // Rebuilding a lost wireless group is recovery, not permission to control the motors.
+    val canManagePairing: Boolean get() = canRecoverConnection
     val canManageWifiDirect: Boolean get() = canManagePairing && !pairingBusy && !pairingHotspotActive && !pairingUnconfirmed
     val canStartFollow: Boolean
-        get() = canInspectFollow && !followUncertain && !followConfigurationLoading &&
+        get() = canInspectFollow && !motorActionUnconfirmed && !followUncertain && !followConfigurationLoading &&
             runCatching { followLaunchOptions.validate(followCamera) }.isSuccess
-    val canConfigureMotor: Boolean get() = connected && !busy && !manualActive &&
+    val canReadMotorConfiguration: Boolean get() = connected && !busy && !manualActive &&
         !followBlocksControl && !videoServiceBusy && !parkingUpdating && !pairingBusy && !pairingUnconfirmed
+    val canConfigureMotor: Boolean get() = canReadMotorConfiguration && !motorActionUnconfirmed
+    val canExecuteTerminal: Boolean get() = connected && !busy && !motorActionUnconfirmed &&
+        !videoServiceBusy && !manualActive && !followBlocksControl
     val canConfigureParking: Boolean
         get() = connected && driveEnabled && driveConfirmedStopped && driveLeft == 0 && driveRight == 0 &&
             !busy && !driveStarting && !driveStopping && !parkingUpdating && parkingSupported && parkingSettings != null &&
-            !followBlocksControl
+            !followBlocksControl && !motorActionUnconfirmed
 }
 
 class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("board_connection", 0)
     private val credentialPreferences = application.getSharedPreferences("board_credentials", 0)
     private val recoveryPreferences = application.getSharedPreferences("follow_recovery", 0)
+    private val motorRecoveryPreferences = application.getSharedPreferences("motor_recovery", 0)
     private val remoteCredentials = RemoteCredentials(application)
     private val mutableRemoteVideo = MutableStateFlow<RemoteVideoEndpoint?>(null)
     internal val remoteVideo = mutableRemoteVideo.asStateFlow()
@@ -127,11 +135,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private var firstDriveStopSource: ControlStopSource? = null
     private val mutableState = MutableStateFlow(
         BoardUiState(
-            host = preferences.getString("host", null) ?: "172.16.16.82",
+            host = preferences.getString("host", null)?.takeIf { it.isNotBlank() } ?: "172.16.16.82",
             port = preferences.getString("port", null) ?: "22",
             username = preferences.getString("username", null) ?: "topeet",
             password = credentialPreferences.getString("password", null).orEmpty(),
             remoteMode = preferences.getBoolean("remote_mode", false),
+            motorActionUnconfirmed = runCatching {
+                motorRecoveryPreferences.getBoolean(MOTOR_ACTION_RECOVERY_KEY, false)
+            }.getOrDefault(true),
             remoteProfileLoading = true,
             followUncertain = followRecovery != null || preferences.getBoolean("follow_unconfirmed", false),
             followFirstFailure = followRecovery?.firstFailure,
@@ -140,7 +151,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         )
     )
     val state = mutableState.asStateFlow()
-    private val mutableMotorConfiguration = MutableStateFlow(MotorConfigurationUiState())
+    private val mutableMotorConfiguration = MutableStateFlow(MotorConfigurationUiState(connection =
+        MotorSerialSettings(preferences.getInt("motor_slave", 1), preferences.getInt("motor_baud", 115200),
+            preferences.getInt("motor_parity", 0)).takeIf { it.isValid } ?: MotorSerialSettings()))
     val motorConfiguration = mutableMotorConfiguration.asStateFlow()
     private val wifiDirectDelegate = lazy {
         WifiDirectController(application) { state.value.canManageWifiDirect }
@@ -169,6 +182,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private var directConnectionGroup: DirectNetworkLease? = null
     private var connectingDirect = false
     private var operation: Job? = null
+    private var motorActionJob: Job? = null
+    private var activeMotorAction: MotorActionPlan? = null
+    private var motorActionDiagnostic: DiagnosticContext? = null
     // Service commands must finish before a competing start/stop. Cancelling an SSH command
     // closes the shared session, so motor stop uses its own channel and never cancels this job.
     private val videoServiceMutex = Mutex()
@@ -277,7 +293,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private fun activeDiagnostic(): DiagnosticContext = when {
         state.value.followActive -> followDiagnostic
         state.value.manualActive -> driveDiagnostic
-        else -> ownerDiagnostic.copy(connectionId = client.diagnosticConnectionId)
+        else -> motorActionDiagnostic ?: ownerDiagnostic.copy(connectionId = client.diagnosticConnectionId)
     }
 
     private fun persistFollowRecovery(first: DiagnosticFailure? = state.value.followFirstFailure) {
@@ -309,7 +325,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             "manualActive" to state.value.manualActive))
     }
 
-    fun updateHost(value: String) = editConnection { copy(host = value) }
+    fun updateHost(value: String) {
+        if (!canEditConnection()) return
+        editConnection { copy(host = value) }
+        // Remember an explicit edit even if SSH is unavailable or authentication fails.
+        preferences.edit().putString("host", value.trim().ifBlank { "172.16.16.82" }).apply()
+    }
     fun updatePort(value: String) = editConnection { copy(port = value.filter(Char::isDigit).take(5)) }
     fun updateUsername(value: String) = editConnection { copy(username = value) }
     fun updatePassword(value: String) = editConnection { copy(password = value) }
@@ -400,12 +421,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             usableWifiDirectClientAddress(it.ipAddress, wireless.ownerAddress)
         }.firstOrNull { it == address } ?: return
         if (wireless.discovering) wifiDirect.stopDiscovery()
-        updateHost(actualAddress)
+        // Group addresses are temporary; keep the user's saved LAN address.
+        editConnection { copy(host = actualAddress) }
     }
 
+    private fun canEditConnection() = !state.value.busy && !state.value.connected && !state.value.manualActive &&
+        !state.value.followActive && !state.value.videoServiceBusy
+
     private fun editConnection(edit: BoardUiState.() -> BoardUiState) {
-        if (!state.value.busy && !state.value.connected && !state.value.manualActive &&
-            !state.value.followActive && !state.value.videoServiceBusy) mutableState.update { it.edit().copy(error = null) }
+        if (canEditConnection()) mutableState.update { it.edit().copy(error = null) }
     }
 
     fun permissionDenied() {
@@ -476,7 +500,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 sshEstablished = true
                 preferences.edit().apply {
-                    if (!input.remoteMode) putString("host", host).putString("port", port.toString())
+                    if (!input.remoteMode && directGroup == null && pairedAddress == null)
+                        putString("host", host).putString("port", port.toString())
                     putString("username", username)
                 }.apply()
                 credentialPreferences.edit().putString("password", input.password).apply()
@@ -518,8 +543,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun execute(command: String = state.value.command) {
-        if (!state.value.connected || state.value.busy || state.value.videoServiceBusy || state.value.driveStarting ||
-            state.value.driveEnabled || state.value.driveStopping || state.value.followBlocksControl || command.isBlank()) return
+        if (!state.value.canExecuteTerminal || command.isBlank()) return
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         Diagnostics.event("terminal.requested", diagnostic, fields = mapOf("commandLength" to command.length))
         mutableState.update { it.copy(busy = true, error = null, result = null, status = "正在执行…") }
@@ -546,22 +570,34 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshMotorConfiguration() {
-        if (disconnecting || !state.value.canConfigureMotor || motorConfiguration.value.busy) return
+        if (disconnecting || !state.value.canReadMotorConfiguration || motorConfiguration.value.busy) return
+        val recoveringAction = state.value.motorActionUnconfirmed
+        val connection = motorConfiguration.value.connection
+        val writeMode = motorConfiguration.value.writeMode
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         mutableState.update { it.copy(busy = true, status = "正在读取电机配置…") }
         mutableMotorConfiguration.update { it.copy(reading = true, error = null) }
         Diagnostics.event("motor_config.read_requested", diagnostic, source = "USER_MOTOR_CONFIG")
         operation = viewModelScope.launch {
             try {
-                val reply = client.motorConfigurationRequest(diagnostic = diagnostic)
+                val reply = client.motorConfigurationRequest(diagnostic = diagnostic, connection = connection)
+                val recovered = recoveringAction && motorActionRecoveryReadConfirmed(reply) && persistMotorActionLock(false)
                 mutableMotorConfiguration.value = MotorConfigurationUiState(snapshot = reply.snapshot,
-                    requiresRead = !reply.ok, message = if (reply.ok) "已读取当前配置；电机状态为本次读取时的观测" else null,
+                    connection = connection, writeMode = writeMode,
+                    requiresRead = !reply.ok, message = when {
+                        recovered -> "板端占用、零转速/输出及通讯控制来源已核对，恢复控制；这是读取观测，不代表物理停稳"
+                        recoveringAction -> "电机操作状态仍未确认，控制保持锁定；需读取到空闲、零转速/输出及通讯控制来源"
+                        reply.ok -> "已读取当前配置；电机状态为本次读取时的观测"
+                        else -> null
+                    },
                     error = reply.error ?: if (!reply.ok) "读取未完成，请重试" else null)
                 Diagnostics.event("motor_config.read_completed", diagnostic, fields = mapOf("ok" to reply.ok), critical = true)
             } catch (cancelled: CancellationException) {
+                if (recoveringAction) retainMotorActionLock()
                 mutableMotorConfiguration.update { it.copy(requiresRead = true, error = "读取已取消，请重新读取") }
                 throw cancelled
             } catch (failure: Exception) {
+                if (recoveringAction) retainMotorActionLock()
                 Diagnostics.failure(diagnostic, "motor_config.read_failed", failure)
                 mutableMotorConfiguration.update { it.copy(requiresRead = true, error = describeFailure(failure)) }
                 mutableState.update { it.withTransportState(client.isConnected) }
@@ -577,7 +613,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         if (!state.value.canConfigureMotor || motorConfiguration.value.busy) return
         mutableMotorConfiguration.update { current ->
             if (current.snapshot == null || current.requiresRead) current else current.copy(
-                draftValues = current.draftValues + (field to text.take(24)), error = null)
+                draftValues = current.draftValues + (field to text.take(32)), error = null)
         }
     }
 
@@ -586,27 +622,51 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         mutableMotorConfiguration.update { it.copy(draftValues = emptyMap()) }
     }
 
+    fun setMotorWriteMode(mode: MotorConfigurationWriteMode) {
+        if (!state.value.canConfigureMotor || motorConfiguration.value.busy) return
+        mutableMotorConfiguration.update { it.copy(writeMode = mode, error = null) }
+    }
+
+    fun editMotorConnection(connection: MotorSerialSettings) {
+        if (!connection.isValid || !state.value.canReadMotorConfiguration || motorConfiguration.value.busy) return
+        if (connection == motorConfiguration.value.connection) return
+        // This only changes the UART settings for the next request, never a controller register.
+        preferences.edit().putInt("motor_slave", connection.slave).putInt("motor_baud", connection.baudRate)
+            .putInt("motor_parity", connection.parityCode).apply()
+        mutableMotorConfiguration.update { it.copy(connection = connection, snapshot = null,
+            draftValues = emptyMap(), writeResults = emptyList(), actionResult = null,
+            requiresRead = true, error = null, message = "连接参数已更新，请重新读取设备") }
+    }
+
     fun applyMotorConfiguration(plan: MotorConfigurationWritePlan) {
         if (disconnecting || !state.value.canConfigureMotor ||
             plan != motorConfigurationWritePlan(motorConfiguration.value)) return
+        val connection = motorConfiguration.value.connection
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         mutableState.update { it.copy(busy = true, status = "正在保存电机配置…") }
         mutableMotorConfiguration.update { it.copy(applying = true, requiresRead = true,
             writeResults = emptyList(), error = null, message = "正在写入并核对回读，请等待结果") }
         Diagnostics.event("motor_config.write_requested", diagnostic, source = "USER_MOTOR_CONFIG",
-            fields = mapOf("fields" to plan.changes.map { it.field.id }, "count" to plan.changes.size), critical = true)
+            fields = mapOf("fields" to plan.changes.map { it.field.id }, "count" to plan.changes.size,
+                "writeMode" to plan.writeMode.name), critical = true)
         operation = viewModelScope.launch {
             try {
-                val reply = client.motorConfigurationRequest(plan, diagnostic)
+                val reply = client.motorConfigurationRequest(plan, diagnostic, connection = connection)
                 val results = plan.changes.map { change ->
                     reply.results.singleOrNull { it.field == change.field } ?: MotorConfigurationWriteResult(
                         change.field, change.raw, if (reply.writeMayHaveOccurred)
                             MotorConfigurationWriteOutcome.WRITE_OUTCOME_UNKNOWN else MotorConfigurationWriteOutcome.NOT_ATTEMPTED)
                 }
                 mutableMotorConfiguration.update { current -> current.copy(snapshot = reply.snapshot ?: current.snapshot,
-                    draftValues = if (reply.ok) emptyMap() else current.draftValues, requiresRead = !reply.ok,
+                    draftValues = if (reply.ok) emptyMap() else current.draftValues,
+                    requiresRead = !reply.ok || reply.reconnectRequired,
                     writeResults = results,
-                    message = if (reply.ok) "已写入并回读确认，使用驱动器的断电保存指令" else "本次保存未全部确认，请先重新读取；不会自动重试",
+                    message = when {
+                        reply.reconnectRequired -> "通讯设置可能已变化，请在通信页核对连接参数并重新读取；不会自动重复写入"
+                        !reply.ok -> "本次写入未全部确认，请先重新读取；不会自动重试"
+                        plan.writeMode == MotorConfigurationWriteMode.TEMPORARY -> "已临时写入并回读确认；重启后恢复保存值"
+                        else -> "已写入并回读确认，使用驱动器的断电保存指令"
+                    },
                     error = reply.error ?: if (!reply.ok) "请核对下方每项结果" else null) }
                 Diagnostics.event("motor_config.write_completed", diagnostic,
                     fields = mapOf("ok" to reply.ok, "writeMayHaveOccurred" to reply.writeMayHaveOccurred,
@@ -627,6 +687,94 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     status = if (client.isConnected) "已连接" else "连接已断开") }
             }
         }
+    }
+
+    fun applyMotorAction(plan: MotorActionPlan) {
+        val current = motorConfiguration.value
+        if (disconnecting || !state.value.canConfigureMotor || current.busy ||
+            plan != motorActionPlan(current, plan.action, plan.value.toString(), plan.durationMs.toString())) return
+        val connection = current.connection
+        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        // Latch synchronously before yielding, and durably before dispatching any command.
+        mutableState.update { it.copy(busy = true, motorActionUnconfirmed = true,
+            motorActionCancellable = motorActionNeedsVisibility(plan), status = "正在执行电机操作…") }
+        activeMotorAction = plan
+        motorActionDiagnostic = diagnostic
+        mutableMotorConfiguration.update { it.copy(actioning = true, requiresRead = true,
+            actionResult = null, error = null, message = "操作请求已确认，正在等待板端回执") }
+        Diagnostics.event("motor_config.action_requested", diagnostic, source = "USER_MOTOR_ACTION",
+            fields = mapOf("action" to plan.action.id, "durationMs" to plan.durationMs), critical = true)
+        val job = viewModelScope.launch {
+            try {
+                check(persistMotorActionLock(true)) { "无法保存电机操作恢复状态，未发送指令；控制保持锁定" }
+                currentCoroutineContext().ensureActive()
+                val reply = client.motorActionRequest(plan, diagnostic = diagnostic, connection = connection)
+                val confirmed = motorActionCompletionConfirmed(plan, reply) && persistMotorActionLock(false)
+                mutableMotorConfiguration.update { it.copy(snapshot = reply.snapshot ?: it.snapshot,
+                    actionResult = reply.actionResult, draftValues = emptyMap(), requiresRead = true,
+                    message = when {
+                        reply.reconnectRequired -> "操作可能改变通讯和配置，控制保持锁定；请核对连接参数后重新读取"
+                        !confirmed -> "操作或停止收尾仍未确认，控制保持锁定；请主动读取电机状态核对"
+                        else -> "操作回执已返回，请重新读取状态；回执不代表车轮停稳或相序学习已完成"
+                    },
+                    error = reply.error) }
+                Diagnostics.event("motor_config.action_completed", diagnostic, critical = true,
+                    fields = mapOf("action" to plan.action.id, "ok" to reply.ok,
+                        "cleanupConfirmed" to reply.actionResult?.cleanupConfirmed,
+                        "reconnectRequired" to reply.reconnectRequired))
+            } catch (failure: Exception) {
+                retainMotorActionLock()
+                mutableMotorConfiguration.update { it.copy(requiresRead = true,
+                    actionResult = MotorActionResult(plan.action, plan.value, plan.durationMs,
+                        MotorActionOutcome.WRITE_OUTCOME_UNKNOWN, error = "操作回执未确认"),
+                    message = "操作结果未确认，请重新连接并读取；不会自动重发",
+                    error = if (failure is CancellationException) "等待已取消，板端操作状态未确认" else describeFailure(failure)) }
+                Diagnostics.failure(diagnostic, "motor_config.action_unconfirmed", failure)
+                mutableState.update { it.withTransportState(client.isConnected) }
+                if (failure is CancellationException) throw failure
+            } finally {
+                activeMotorAction = null
+                motorActionJob = null
+                motorActionDiagnostic = null
+                mutableMotorConfiguration.update { it.copy(actioning = false) }
+                mutableState.update { it.copy(motorActionCancellable = false) }
+                if (!disconnecting) mutableState.update { it.copy(busy = false,
+                    status = if (client.isConnected) "已连接" else "连接已断开") }
+            }
+        }
+        motorActionJob = job
+        operation = job
+    }
+
+    /** A failed persistence write never authorizes dispatch or clears the in-memory latch. */
+    private suspend fun persistMotorActionLock(locked: Boolean): Boolean {
+        val saved = withContext(Dispatchers.IO) {
+            runCatching { motorRecoveryPreferences.edit().putBoolean(MOTOR_ACTION_RECOVERY_KEY, locked).commit() }.getOrDefault(false)
+        }
+        currentCoroutineContext().ensureActive()
+        if (saved) mutableState.update { it.copy(motorActionUnconfirmed = locked) }
+        return saved
+    }
+
+    private suspend fun retainMotorActionLock() {
+        mutableState.update { it.copy(motorActionUnconfirmed = true) }
+        // Also re-arm if cancellation raced a successful commit that was clearing the latch.
+        withContext(NonCancellable + Dispatchers.IO) {
+            runCatching { motorRecoveryPreferences.edit().putBoolean(MOTOR_ACTION_RECOVERY_KEY, true).commit() }
+        }
+    }
+
+    fun cancelMotorAction(reason: String = "用户取消限时电机操作",
+        source: ControlStopSource = ControlStopSource.USER_STOP) {
+        val plan = activeMotorAction
+        if (!motorActionNeedsVisibility(plan) || !motorConfiguration.value.actioning || motorActionJob?.isActive != true) return
+        Diagnostics.event("motor_config.action_cancel_requested", activeDiagnostic(), source = source.name,
+            fields = mapOf("action" to plan?.action?.id), critical = true)
+        // Cancellation closes this SSH execution. The board attempts bounded-action cleanup;
+        // the phone deliberately keeps the durable lock until a new explicit read succeeds.
+        mutableState.update { it.copy(motorActionUnconfirmed = true, motorActionCancellable = false) }
+        mutableMotorConfiguration.update { it.copy(message = "$reason；停止状态待核对，控制保持锁定") }
+        motorActionJob?.cancel(CancellationException(reason))
     }
 
     fun setVideoServiceEnabled(enabled: Boolean) {
@@ -1328,6 +1476,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             fields = mapOf("followActive" to state.value.followActive, "manualActive" to state.value.manualActive), critical = true)
         disableDrive(reason, source = source)
         stopFollow("$reason，正在请求结束跟随", source)
+        cancelMotorAction(reason, source)
     }
 
     private fun followOptionFields(options: FollowLaunchOptions): Map<String, Any?> = mapOf(

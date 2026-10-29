@@ -66,11 +66,12 @@ class MotorConfigurationModelsTest {
         assertFalse("Unknown board gate defaults to denied", MotorConfigurationSnapshot("x", 1, emptyMap()).writeAllowed)
     }
 
-    @Test fun outOfRangeExistingFirmwareValueMustNotBeOverwritten() {
+    @Test fun documentedValueCanRepairOutOfRangeExistingValueWithExpectedSnapshot() {
         val original = snapshot().copy(values = mapOf(MotorConfigurationField.MAX_OUTPUT_CURRENT to 65000L))
         val state = MotorConfigurationUiState(original, mapOf(MotorConfigurationField.MAX_OUTPUT_CURRENT to "20"))
-        assertFalse(analyzeMotorConfigurationDraft(state).errors.isEmpty())
-        assertNull(motorConfigurationWritePlan(state))
+        assertTrue(analyzeMotorConfigurationDraft(state).errors.isEmpty())
+        assertNotNull(motorConfigurationWritePlan(state))
+        assertEquals(65000L, motorConfigurationWritePlan(state)!!.changes.single().expectedRaw)
     }
 
     @Test fun maximumCurrentCannotInvalidateEitherParkingCurrent() {
