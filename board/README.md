@@ -96,9 +96,19 @@ and removes files older than 7 days on subsequent writes. The directory is mode
 over routine heartbeats when the queue fills; a subsequent record reports the
 cumulative `droppedEvents` count. Slow or failed disk writes never block the
 control thread. Failure is reported with `FOLLOW_DIAGNOSTIC_UNAVAILABLE` on
-stderr, never on the protocol stdout stream. Tokens, credential-shaped values
+stderr, never on the protocol stdout stream. Warnings use a separate nonblocking
+Linux pipe/tty descriptor and may be dropped under backpressure or for unsupported
+stderr sinks; they never use Python's buffered stderr lock. Constructor failures
+also report asynchronously. Tokens, credential-shaped values
 and raw protocol messages are not written. Logging remains best effort if the
 process is killed or storage is unavailable.
+
+Fault capture only copies bounded primitive arguments and up to 24 traceback
+file/line/function entries. It retains no exception frames or locals, reads no
+source files, and never invokes exception `__str__`; formatting/redaction runs
+on the writer. Earliest causes are selected by capture monotonic time and an
+ordering counter under a short memory-only lock, so later-queued earlier faults
+and equal-resolution timestamps cannot replace the original trigger with cleanup.
 
 For a reported App session, inspect matching files via SSH, for example:
 

@@ -55,6 +55,7 @@ object Diagnostics {
     @Volatile private var engine: DiagnosticEngine? = null
     private var exportDirectory: File? = null
     private var metadata: Map<String, Any?> = emptyMap()
+    private var recoveryMetadata: () -> Map<String, Any?> = { emptyMap() }
 
     @Synchronized
     fun initialize(context: Context) {
@@ -66,6 +67,10 @@ object Diagnostics {
             "versionCode" to packageInfo.longVersionCode, "schemaVersion" to 1,
             "androidSdk" to android.os.Build.VERSION.SDK_INT)
         exportDirectory = File(app.cacheDir, "diagnostic_exports")
+        recoveryMetadata = {
+            FollowRecoverySnapshot.restore(app.getSharedPreferences("follow_recovery", 0).all)
+                ?.exportMetadata().orEmpty()
+        }
         engine = DiagnosticEngine(DiagnosticFileStore(File(app.filesDir, "diagnostics")),
             redactor, Process.myPid(), onStatus = { mutableStatus.value = it },
             onFailures = { mutableFailures.value = it })
@@ -100,7 +105,7 @@ object Diagnostics {
 
     suspend fun export(): File = withContext(Dispatchers.IO) {
         val active = engine ?: throw IOException("诊断日志尚未初始化")
-        active.export(requireNotNull(exportDirectory), metadata)
+        active.export(requireNotNull(exportDirectory), metadata + recoveryMetadata())
     }
 }
 

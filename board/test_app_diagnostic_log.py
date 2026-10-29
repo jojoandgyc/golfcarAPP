@@ -11,7 +11,9 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
+import app_diagnostic_log as diagnostic_module
 from app_diagnostic_log import DiagnosticLog, safe_value
 from app_follow_bridge import FollowProcess
 
@@ -30,6 +32,168 @@ def wait_for(predicate, timeout=2):
 
 
 class DiagnosticStorageTests(unittest.TestCase):
+    def test_exception_snapshot_never_formats_exception_or_reads_source_on_control_path(self):
+        rows = []
+        class SlowException(RuntimeError):
+            def __str__(self):
+                raise AssertionError("Exception __str__ must not execute in diagnostics")
+        try:
+            raise SlowException("password=hidden token=" + "b" * 32)
+        except SlowException as error:
+            log = DiagnosticLog(Path("unused"), RUN_ID, writer=rows.append)
+            try:
+                with patch("traceback.format_exception", side_effect=AssertionError("reads source")), \
+                     patch("linecache.getline", side_effect=AssertionError("reads source")), \
+                     patch("linecache.getlines", side_effect=AssertionError("reads source")):
+                    began = time.monotonic()
+                    log.failure("input_failed", error)
+                    log.stop_requested("input_eof")
+                    self.assertLess(time.monotonic() - began, .2)
+                    self.assertTrue(log.close(1))
+            finally:
+                log.close(1)
+        failure = next(row["error"] for row in rows if row["event"] == "input_failed")
+        self.assertEqual(failure["errorType"], "SlowException")
+        self.assertIn("test_exception_snapshot", failure["stack"])
+        self.assertNotIn("hidden", json.dumps(rows))
+        self.assertNotIn("b" * 32, json.dumps(rows))
+
+    def test_slow_error_rendering_does_not_delay_failure_or_stop(self):
+        entered, release = threading.Event(), threading.Event()
+        rows = []
+        render = diagnostic_module._FailureSnapshot.render
+        def slow(snapshot):
+            entered.set()
+            release.wait(3)
+            return render(snapshot)
+        with patch.object(diagnostic_module._FailureSnapshot, "render", slow):
+            log = DiagnosticLog(Path("unused"), RUN_ID, writer=rows.append)
+            try:
+                began = time.monotonic()
+                log.failure("input_failed", OSError("EOF"))
+                self.assertLess(time.monotonic() - began, .2)
+                self.assertTrue(entered.wait(1))
+                began = time.monotonic()
+                log.stop_requested("input_eof")
+                for seq in range(20):
+                    log.event("heartbeat", seq=seq)
+                self.assertLess(time.monotonic() - began, .2)
+            finally:
+                release.set()
+                self.assertTrue(log.close(2))
+        self.assertTrue(any(row["event"] == "stop_requested" for row in rows))
+
+    def test_concurrent_failure_keeps_earliest_capture_even_when_later_event_queues_first(self):
+        entered, release = threading.Event(), threading.Event()
+        rows = []
+        snapshot_type = diagnostic_module._FailureSnapshot
+        class DelayedSnapshot(snapshot_type):
+            def __init__(self, event, error, occurred_ns):
+                if event == "earlier":
+                    entered.set()
+                    release.wait(3)
+                super().__init__(event, error, occurred_ns)
+        with patch.object(diagnostic_module, "_FailureSnapshot", DelayedSnapshot):
+            log = DiagnosticLog(Path("unused"), RUN_ID, writer=rows.append)
+            earlier = threading.Thread(target=log.failure, args=("earlier", OSError("first")))
+            try:
+                earlier.start()
+                self.assertTrue(entered.wait(1))
+                log.failure("later", OSError("second"))
+                self.assertEqual(log.first_failure["event"], "later")
+                release.set()
+                earlier.join(1)
+                self.assertFalse(earlier.is_alive())
+                log.failure("cleanup_failed", OSError("third"))
+                log.event("session_finished", critical=True, firstFailure=log.first_failure)
+                self.assertTrue(log.close(2))
+            finally:
+                release.set()
+                earlier.join(1)
+                log.close(1)
+        self.assertEqual(log.first_failure["event"], "earlier")
+        self.assertEqual(rows[-1]["firstFailure"]["event"], "earlier")
+        captured = {row["event"]: (row["error"]["monotonicNs"], row["error"]["causeOrder"])
+                    for row in rows if "error" in row}
+        self.assertLess(captured["earlier"], captured["later"])
+
+    def test_concurrent_stop_cannot_replace_earliest_source(self):
+        entered, release = threading.Event(), threading.Event()
+        log = DiagnosticLog(Path("unused"), RUN_ID, writer=lambda _row: None)
+        remember = log._remember_first
+        def delayed(attribute, detail):
+            if attribute == "first_stop" and detail["source"] == "input_eof":
+                entered.set()
+                release.wait(3)
+            remember(attribute, detail)
+        with patch.object(log, "_remember_first", delayed):
+            earlier = threading.Thread(target=log.stop_requested, args=("input_eof",))
+            try:
+                earlier.start()
+                self.assertTrue(entered.wait(1))
+                log.stop_requested("cleanup")
+                release.set()
+                earlier.join(1)
+                self.assertFalse(earlier.is_alive())
+                self.assertEqual(log.first_stop["source"], "input_eof")
+            finally:
+                release.set()
+                earlier.join(1)
+                self.assertTrue(log.close(1))
+
+    def test_slow_warning_reporter_does_not_block_control_or_bounded_close(self):
+        entered, release = threading.Event(), threading.Event()
+        def fail(_row):
+            raise OSError("disk failure")
+        def slow_report(_message):
+            entered.set()
+            release.wait(3)
+        log = DiagnosticLog(Path("unused"), RUN_ID, writer=fail, report=slow_report)
+        try:
+            log.event("first")
+            self.assertTrue(entered.wait(1))
+            began = time.monotonic()
+            log.stop_requested("input_eof")
+            log.failure("input_failed", OSError("EOF"))
+            self.assertFalse(log.close(.02))
+            self.assertLess(time.monotonic() - began, .2)
+            self.assertEqual(log.first_stop["source"], "input_eof")
+        finally:
+            release.set()
+            self.assertTrue(log.close(1))
+
+    @unittest.skipUnless(os.name == "posix", "Linux independent nonblocking stderr descriptor")
+    def test_full_stderr_pipe_does_not_block_report_or_change_protocol_descriptor_flags(self):
+        code = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from app_diagnostic_log import _stderr_report
+os.set_blocking(2, False)
+try:
+    while True:
+        os.write(2, b'x' * 4096)
+except BlockingIOError:
+    pass
+os.set_blocking(2, True)
+stdout_flags, stderr_flags = os.get_blocking(1), os.get_blocking(2)
+_stderr_report('FOLLOW_DIAGNOSTIC_UNAVAILABLE: deliberately full pipe')
+assert os.get_blocking(1) == stdout_flags
+assert os.get_blocking(2) == stderr_flags
+os.write(1, b'done\n')
+'''
+        process = subprocess.Popen([sys.executable, "-c", code, str(SCRIPT.parent)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # Do not drain stderr until the subprocess exits: retain real backpressure.
+            self.assertEqual(process.wait(timeout=2), 0)
+            self.assertEqual(process.stdout.read(), b"done\n")
+        finally:
+            if process.poll() is None:
+                process.kill()  # Only this isolated pipe test; it never imports a worker.
+                process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
     def test_slow_disk_and_full_queue_never_block_control_and_prioritize_stop(self):
         entered, release = threading.Event(), threading.Event()
         rows = []
@@ -129,6 +293,41 @@ class DiagnosticStorageTests(unittest.TestCase):
 
 
 class DiagnosticSessionTests(unittest.TestCase):
+    def test_logger_initialization_failure_and_blocked_warning_still_allow_ready_eof_exit(self):
+        code = r'''
+import sys, threading
+sys.path.insert(0, sys.argv[1])
+import app_follow_bridge as bridge
+import app_diagnostic_log as diagnostic
+def unavailable(*_args, **_kwargs):
+    raise OSError('diagnostic initialization failed')
+def slow_warning(_message):
+    threading.Event().wait(30)
+bridge.DiagnosticLog = unavailable
+diagnostic._stderr_report = slow_warning
+sys.argv = [bridge.__file__, '--dry-run']
+raise SystemExit(bridge.main())
+'''
+        process = subprocess.Popen([sys.executable, "-c", code, str(SCRIPT.parent)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        replies = []
+        reader = threading.Thread(target=lambda: replies.extend(process.stdout.read().splitlines()), daemon=True)
+        try:
+            reader.start()
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=2), 1)
+            reader.join(1)
+            self.assertFalse(reader.is_alive())
+            decoded = [json.loads(line) for line in replies]
+            self.assertEqual(decoded[0]["type"], "ready")
+            self.assertTrue(any(row["type"] == "error" for row in decoded))
+        finally:
+            if process.poll() is None:
+                process.kill()  # Only this --dry-run test-created bridge.
+                process.wait()
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
     def start(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

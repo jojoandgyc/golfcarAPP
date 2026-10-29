@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 
-from app_diagnostic_log import DiagnosticLog, NullDiagnosticLog
+from app_diagnostic_log import DiagnosticLog, NullDiagnosticLog, report_unavailable_async
 
 RUNTIME_ROOT = Path("/home/topeet/Desktop/rk_car_runtime_module")
 MOTOR_LOCK = Path("/home/topeet/lianzhan/.app_joystick.lock")
@@ -447,8 +447,7 @@ def run_session(process, stopped: threading.Event, diagnostic_directory=None):
     except Exception:
         diagnostic = NullDiagnosticLog()
         # Avoid making a diagnostics initialization failure a control failure.
-        with contextlib.suppress(Exception):
-            print("FOLLOW_DIAGNOSTIC_UNAVAILABLE: initialization failed", file=sys.stderr)
+        report_unavailable_async()
     session.diagnostic = process.diagnostic = diagnostic
     diagnostic.event("session_started", critical=True, camera=process.camera,
                      execute=process.execute, dryRun=process.dry_run,

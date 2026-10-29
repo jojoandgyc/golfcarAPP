@@ -95,7 +95,9 @@ class DiagnosticBoardIntegrationTest {
                 val names = zip.entries().asSequence().map { it.name }.toList()
                 assertTrue(names.all { it in setOf("metadata.json", "first_failures.jsonl") || it.startsWith("events/") })
                 val metadata = JSONObject(zip.getInputStream(zip.getEntry("metadata.json")).bufferedReader().readText())
-                assertEquals("1.1-diagnostics", metadata.getString("versionName"))
+                val target = InstrumentationRegistry.getInstrumentation().targetContext
+                assertEquals(target.packageManager.getPackageInfo(target.packageName, 0).versionName,
+                    metadata.getString("versionName"))
                 val text = names.joinToString("\n") { zip.getInputStream(zip.getEntry(it)).bufferedReader().readText() }
                 assertFalse("Saved credential must not be exported", text.contains(initial.password))
                 assertTrue(runIds.all(text::contains))

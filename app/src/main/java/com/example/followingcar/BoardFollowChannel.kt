@@ -29,7 +29,7 @@ class BoardFollowChannel private constructor(
     private val input: InputStream,
     private val output: OutputStream,
     private val stderr: BoundedOutputStream,
-    private val abortTransport: () -> Unit,
+    private val abortTransport: (reason: String, diagnostic: DiagnosticContext) -> Unit,
     diagnostic: DiagnosticContext,
 ) {
     var diagnosticContext: DiagnosticContext = diagnostic
@@ -62,12 +62,13 @@ class BoardFollowChannel private constructor(
     suspend fun requestStop(): FollowReply = transact("stop")
 
     /** EOF asks the supervisor to stop; a lost network also expires the board-side lease. */
-    fun close(reason: String = "requested") {
+    fun close(reason: String = "requested", invalidateTransport: Boolean = false) {
         if (!closed.compareAndSet(false, true)) return
+        val abort = invalidateTransport || blockingIo.get()
         Diagnostics.event("follow.channel_close", diagnosticContext, source = reason,
-            fields = diagnosticFields() + mapOf("closeScope" to if (blockingIo.get()) "transport" else "channel"),
+            fields = diagnosticFields() + mapOf("closeScope" to if (abort) "transport" else "channel"),
             critical = true)
-        if (blockingIo.get()) abortTransport()
+        if (abort) abortTransport("follow_$reason", diagnosticContext)
         cleanup.execute {
             runCatching { channel.disconnect() }
             runCatching { input.close() }
@@ -137,7 +138,9 @@ class BoardFollowChannel private constructor(
             val failure = SocketTimeoutException("跟随回执超时；板端将请求停止，车辆状态未确认")
             Diagnostics.failure(diagnosticContext, "follow.ack_timeout", failure,
                 diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to ACK_TIMEOUT_MS))
-            close("ack_timeout")
+            // A completed write does not prove that the SSH transport is still alive. Do not
+            // let JSch's cached connection flag advertise a timed-out control lease as usable.
+            close("ack_timeout", invalidateTransport = true)
             throw failure
         } catch (failure: Exception) {
             val safeFailure = protocolDiagnosticFailure(failure)
@@ -200,8 +203,7 @@ class BoardFollowChannel private constructor(
                 Diagnostics.event("follow.blocking_io_cancelled", diagnosticContext,
                     fields = diagnosticFields() + mapOf("causeClass" to cause?.javaClass?.name,
                         "closeScope" to "transport"), critical = true)
-                abortTransport()
-                close("blocking_io_cancelled")
+                close("blocking_io_cancelled", invalidateTransport = true)
             }
             blockingIo.set(true)
             try {
@@ -254,7 +256,7 @@ class BoardFollowChannel private constructor(
             session: Session, camera: FollowCamera, execute: Boolean, dryRun: Boolean,
             options: FollowLaunchOptions,
             diagnostic: DiagnosticContext,
-            abortTransport: () -> Unit,
+            abortTransport: (reason: String, diagnostic: DiagnosticContext) -> Unit,
         ): BoardFollowChannel = withContext(Dispatchers.IO) {
             options.validate(camera)
             val started = System.nanoTime()
@@ -307,7 +309,7 @@ class BoardFollowChannel private constructor(
                 Diagnostics.failure(opened?.diagnosticContext ?: diagnostic, "follow.open_timeout", failure,
                     (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
                         mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to START_TIMEOUT_MS))
-                opened?.close("open_timeout")
+                opened?.close("ready_timeout", invalidateTransport = true)
                 throw failure
             } catch (failure: Exception) {
                 val safeFailure = protocolDiagnosticFailure(failure)

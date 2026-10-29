@@ -9,7 +9,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -87,10 +89,12 @@ data class BoardUiState(
 class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("board_connection", 0)
     private val credentialPreferences = application.getSharedPreferences("board_credentials", 0)
+    private val recoveryPreferences = application.getSharedPreferences("follow_recovery", 0)
+    private var followRecovery = FollowRecoverySnapshot.restore(recoveryPreferences.all)
     private val client = BoardSshClient()
     private val ownerDiagnostic = Diagnostics.newContext()
-    private var followDiagnostic = DiagnosticContext(preferences.getString("last_follow_operation", null)
-        ?: Diagnostics.newContext().operationId)
+    private var followDiagnostic = followRecovery?.context ?: DiagnosticContext(
+        preferences.getString("last_follow_operation", null) ?: Diagnostics.newContext().operationId)
     private var driveDiagnostic = DiagnosticContext(preferences.getString("last_drive_operation", null)
         ?: Diagnostics.newContext().operationId)
     private var firstFollowStopSource: ControlStopSource? = null
@@ -101,9 +105,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             port = preferences.getString("port", null) ?: "22",
             username = preferences.getString("username", null) ?: "topeet",
             password = credentialPreferences.getString("password", null).orEmpty(),
-            followUncertain = preferences.getBoolean("follow_unconfirmed", false),
-            followMessage = if (preferences.getBoolean("follow_unconfirmed", false))
-                "上次跟随进程退出未确认，请先在车端检查" else "尚未启动自动跟随"
+            followUncertain = followRecovery != null || preferences.getBoolean("follow_unconfirmed", false),
+            followFirstFailure = followRecovery?.firstFailure,
+            followMessage = if (followRecovery != null || preferences.getBoolean("follow_unconfirmed", false))
+                "上次跟随进程退出未确认，连接后将自动检查控制占用" else "尚未启动自动跟随"
         )
     )
     val state = mutableState.asStateFlow()
@@ -124,13 +129,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private var followJob: Job? = null
     private var followChannel: BoardFollowChannel? = null
     private var followStopRequested = false
+    private var followCleanupUnconfirmed = false
     private val followWakeup = Channel<Unit>(Channel.CONFLATED)
 
     init {
         Diagnostics.event("viewmodel.created", ownerDiagnostic)
         viewModelScope.launch {
             Diagnostics.failures.collect { failures ->
-                val followFailure = failures.firstOrNull { it.context.operationId == followDiagnostic.operationId }
+                val followFailure = selectFollowFirstFailure(followDiagnostic, followRecovery, state.value.followFirstFailure, failures)
                 val driveFailure = failures.firstOrNull { it.context.operationId == driveDiagnostic.operationId }
                 followFailure?.let {
                     followDiagnostic = followDiagnostic.copy(
@@ -145,11 +151,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 mutableState.update { it.copy(
-                    followFirstFailure = followFailure
-                        ?: it.followFirstFailure?.takeIf { f -> f.context.operationId == followDiagnostic.operationId },
+                    followFirstFailure = followFailure,
                     driveFirstFailure = driveFailure
                         ?: it.driveFirstFailure?.takeIf { f -> f.context.operationId == driveDiagnostic.operationId },
                 ) }
+                if (followRecovery != null || state.value.followUncertain) persistFollowRecovery()
             }
         }
         viewModelScope.launch {
@@ -160,9 +166,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     disableDrive("SSH 连接中断", source = ControlStopSource.TRANSPORT_LOST)
                     stopFollow("SSH 连接中断，正在请求结束跟随", ControlStopSource.TRANSPORT_LOST)
                     mutableState.update {
-                        it.copy(connected = false, status = "连接已断开", error = "连接中断，请检查 Wi-Fi 后重新连接。",
-                            videoServiceState = VideoServiceState.UNKNOWN,
-                            videoServiceMessage = "连接中断，视频服务状态未确认")
+                        it.withTransportState(false).copy(error = "连接中断，请检查 Wi-Fi 后重新连接。")
                     }
                 }
             }
@@ -173,6 +177,29 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         state.value.followActive -> followDiagnostic
         state.value.manualActive -> driveDiagnostic
         else -> ownerDiagnostic.copy(connectionId = client.diagnosticConnectionId)
+    }
+
+    private fun persistFollowRecovery(first: DiagnosticFailure? = state.value.followFirstFailure) {
+        val previous = followRecovery?.takeIf { it.context.operationId == followDiagnostic.operationId }
+        val snapshot = FollowRecoverySnapshot(followDiagnostic,
+            previous?.firstFailure ?: first?.takeIf { it.context.operationId == followDiagnostic.operationId })
+        if (snapshot == followRecovery) return
+        followRecovery = snapshot
+        recoveryPreferences.edit().clear().apply {
+            snapshot.storedValues().forEach { (key, value) -> putString(key, value) }
+        }.apply()
+    }
+
+    private fun clearFollowRecovery() {
+        followRecovery = null
+        recoveryPreferences.edit().clear().apply()
+        preferences.edit().putBoolean("follow_unconfirmed", false).apply()
+    }
+
+    private fun recordFollowFailure(event: String, failure: Throwable,
+        fields: Map<String, Any?> = emptyMap()): DiagnosticFailure {
+        val logged = Diagnostics.failure(followDiagnostic, event, failure, fields)
+        return selectFollowFirstFailure(followDiagnostic, followRecovery, state.value.followFirstFailure, listOf(logged)) ?: logged
     }
 
     fun recordUiEvent(event: String, detail: String? = null) {
@@ -238,6 +265,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 val result = client.execute(BOARD_STATUS_COMMAND, kind = "board_status", diagnostic = diagnostic)
                 mutableState.update { it.copy(result = result, status = "已连接") }
                 refreshVideoServiceState()
+                currentCoroutineContext().ensureActive()
+                if (!disconnecting && client.isConnected && state.value.followUncertain) inspectFollowAvailability("RECONNECT")
             } catch (cancelled: CancellationException) {
                 Diagnostics.event("connection.cancelled", diagnostic, critical = true)
                 throw cancelled
@@ -246,7 +275,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     mapOf("sshEstablished" to sshEstablished, "attempts" to connectionAttempts))
                 withContext(Dispatchers.IO) { client.disconnect("connection_failed", diagnostic) }
                 mutableState.update {
-                    it.copy(connected = false, status = "连接失败",
+                    it.withTransportState(false).copy(status = "连接失败",
                         error = describeFailure(failure, connecting = !sshEstablished, attempts = connectionAttempts))
                 }
             } finally {
@@ -275,7 +304,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 // The transport records a sanitized exception; terminal contents are never logged.
                 Diagnostics.event("terminal.failed", diagnostic, fields = mapOf("exceptionType" to failure.javaClass.name), critical = true)
                 mutableState.update {
-                    it.copy(connected = client.isConnected, status = if (client.isConnected) "已连接" else "连接已断开", error = describeFailure(failure))
+                    it.withTransportState(client.isConnected).copy(status = if (client.isConnected) "已连接" else "连接已断开", error = describeFailure(failure))
                 }
             } finally {
                 if (!disconnecting) mutableState.update { it.copy(busy = false) }
@@ -346,7 +375,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun recordVideoServiceFailure(failure: Exception) {
-        mutableState.update { it.copy(videoServiceState = VideoServiceState.UNKNOWN,
+        mutableState.update { it.withTransportState(client.isConnected).copy(videoServiceState = VideoServiceState.UNKNOWN,
             videoServiceMessage = "视频操作失败，状态未确认",
             videoServiceError = failure.message.orEmpty().ifBlank { "视频服务操作未完成，请重试。" }.take(800),
             connected = client.isConnected, status = if (client.isConnected) it.status else "连接已断开") }
@@ -361,34 +390,75 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         previous?.cancel()
         mutableState.update { it.copy(busy = true, status = "正在断开…") }
         operation = viewModelScope.launch {
-            disableDrive("连接已断开", source = ControlStopSource.DISCONNECT)
-            stopFollow("正在停止跟随后断开连接…", ControlStopSource.DISCONNECT)
-            // A follow startup may still be releasing the camera. Let that bounded service
-            // command finish; a pending stop prevents any late follow runtime start.
-            if (followChannel == null) followJob?.join()
-            val followFinished = withTimeoutOrNull(12_000L) { followJob?.join(); true } == true
-            if (!followFinished) {
-                val failure = SocketTimeoutException("断开等待超时，跟随进程退出未确认")
-                val first = Diagnostics.failure(followDiagnostic, "follow.disconnect_timeout", failure)
-                followChannel?.close("disconnect_timeout")
-                followJob?.cancel()
-                mutableState.update {
-                    it.copy(followUncertain = true, followFirstFailure = first, followMessage = "断开等待超时，跟随进程退出未确认",
-                        followError = "车端将按会话超时请求停止；请检查进程和车辆状态。")
+            var completed = false
+            try {
+                completed = withTimeoutOrNull(130_000L) {
+                    disableDrive("连接已断开", source = ControlStopSource.DISCONNECT)
+                    stopFollow("正在停止跟随后断开连接…", ControlStopSource.DISCONNECT)
+                    // Preserve video start/stop's existing 60/45-second allowance; the outer
+                    // deadline also bounds this startup join and every later cleanup join.
+                    if (followChannel == null) followJob?.join()
+                    val followFinished = withTimeoutOrNull(12_000L) { followJob?.join(); true } == true
+                    if (!followFinished) {
+                        markFollowCleanupUnconfirmed("follow.disconnect_timeout", "断开等待超时，跟随进程退出未确认")
+                        followChannel?.close("disconnect_timeout")
+                        followJob?.cancel()
+                    }
+                    driveJob?.join()
+                    videoServiceJob?.join()
+                    if (client.isConnected && state.value.videoServiceState != VideoServiceState.STOPPED) {
+                        try { changeVideoService(false) } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { /* Keep the failure visible. */ }
+                    }
+                    previous?.join()
+                    true
+                } == true
+                if (!completed) {
+                    Diagnostics.event("connection.disconnect_deadline", diagnostic,
+                        fields = mapOf("timeoutMs" to 130_000L), critical = true)
+                    if (followJob?.isActive == true || state.value.followUncertain)
+                        markFollowCleanupUnconfirmed("follow.disconnect_deadline", "断开清理超时，控制退出仍未确认")
+                }
+            } catch (cancelled: CancellationException) {
+                if (followJob?.isActive == true || state.value.followUncertain)
+                    markFollowCleanupUnconfirmed("follow.disconnect_cancelled", "断开清理被中断，控制退出仍未确认")
+                throw cancelled
+            } catch (failure: Exception) {
+                Diagnostics.failure(diagnostic, "connection.disconnect_failed", failure)
+                if (followJob?.isActive == true || state.value.followUncertain)
+                    markFollowCleanupUnconfirmed("follow.disconnect_failed", "断开清理失败，控制退出仍未确认")
+            } finally {
+                // Always detach the old transport, including failed/cancelled cleanup. No command
+                // is retried on a new connection, and no successful stop is inferred from this.
+                withContext(NonCancellable) {
+                    try {
+                        withContext(Dispatchers.IO) { client.disconnect("user_disconnect", diagnostic) }
+                        if (!completed) {
+                            followChannel?.close("disconnect_cleanup")
+                            driveChannel?.close("disconnect_cleanup")
+                            followJob?.cancel()
+                            driveJob?.cancel()
+                            videoServiceJob?.cancel()
+                        }
+                        withTimeoutOrNull(1_000L) { followJob?.join(); driveJob?.join(); videoServiceJob?.join() }
+                    } finally {
+                        disconnecting = false
+                        mutableState.update { it.withTransportState(false).copy(busy = false, status = "已断开", error = null) }
+                        Diagnostics.event("connection.disconnect_completed", diagnostic,
+                            fields = mapOf("cleanupCompleted" to completed), critical = true)
+                    }
                 }
             }
-            driveJob?.join()
-            videoServiceJob?.join()
-            if (client.isConnected && state.value.videoServiceState != VideoServiceState.STOPPED) {
-                try { changeVideoService(false) } catch (_: Exception) { /* Keep the failure visible. */ }
-            }
-            withContext(Dispatchers.IO) { client.disconnect("user_disconnect", diagnostic) }
-            withTimeoutOrNull(1_000L) { followJob?.join() }
-            previous?.join()
-            disconnecting = false
-            mutableState.update { it.copy(connected = false, busy = false, status = "已断开", error = null) }
-            Diagnostics.event("connection.disconnect_completed", diagnostic, critical = true)
         }
+    }
+
+    private fun markFollowCleanupUnconfirmed(event: String, message: String) {
+        followCleanupUnconfirmed = true
+        val first = recordFollowFailure(event, SocketTimeoutException(message))
+        mutableState.update { it.copy(followUncertain = true, followFirstFailure = first,
+            followMessage = message, followError = "车端将按会话超时请求停止；请重新连接后检查控制占用。") }
+        preferences.edit().putBoolean("follow_unconfirmed", true).apply()
+        persistFollowRecovery(first)
     }
 
     override fun onCleared() {
@@ -511,7 +581,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     try { changeVideoService(false, driveDiagnostic) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
                 }
                 mutableState.update {
-                    it.copy(driveStarting = false, driveEnabled = false, driveStopping = false,
+                    it.withTransportState(client.isConnected).copy(driveStarting = false, driveEnabled = false, driveStopping = false,
                         parkingSupported = false, parkingSettings = null, parkingUpdating = false,
                         parkingStatus = if (parkingCleared && channel?.ready?.dryRun == true) "模拟驻车已关闭，模拟电流已清零"
                             else if (parkingCleared) "驻车已关闭，电机驻车电流已清零"
@@ -656,7 +726,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             } catch (failure: Exception) {
                 Diagnostics.failure(diagnostic, "follow.configuration_failed", failure)
                 mutableState.update {
-                    it.copy(followConfigurationError = describeFailure(failure), connected = client.isConnected,
+                    it.withTransportState(client.isConnected).copy(followConfigurationError = describeFailure(failure), connected = client.isConnected,
                         status = if (client.isConnected) "已连接" else "连接已断开")
                 }
             } finally {
@@ -667,37 +737,50 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshFollowAvailability() {
         val current = state.value
-        if (!current.canInspectFollow || !current.followUncertain) return
-        val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
-        Diagnostics.event("follow.availability_requested", diagnostic,
-            fields = mapOf("controlOperationId" to followDiagnostic.operationId, "runId" to followDiagnostic.runId))
-        mutableState.update { it.copy(busy = true, followError = null, followMessage = "正在检查车端控制占用…") }
+        if (disconnecting || !current.canInspectFollow || !current.followUncertain) return
+        mutableState.update { it.copy(busy = true) }
         operation = viewModelScope.launch {
             try {
-                val availability = client.readFollowAvailability(diagnostic)
-                Diagnostics.event("follow.availability_result", diagnostic,
-                    fields = mapOf("controlAvailable" to availability.controlAvailable))
-                if (availability.controlAvailable) {
-                    preferences.edit().putBoolean("follow_unconfirmed", false).apply()
-                    mutableState.update {
-                        it.copy(followUncertain = false, followStatus = null,
-                            followMessage = "控制会话已结束；车轮停稳未确认")
-                    }
-                } else {
-                    mutableState.update {
-                        it.copy(followMessage = "控制仍被占用，保持锁定",
-                            followError = availability.reason ?: "车端尚未确认控制资源已释放")
-                    }
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (failure: Exception) {
-                Diagnostics.failure(diagnostic, "follow.availability_failed", failure)
-                mutableState.update {
-                    it.afterAvailabilityFailure(describeFailure(failure), client.isConnected)
-                }
+                inspectFollowAvailability("USER_INSPECT")
             } finally {
                 if (!disconnecting) mutableState.update { it.copy(busy = false) }
+            }
+        }
+    }
+
+    /** Reconnection and the manual button share one read-only recovery path while their caller owns busy. */
+    private suspend fun inspectFollowAvailability(source: String) {
+        if (disconnecting || !state.value.followUncertain || !client.isConnected) return
+        val connectionId = client.diagnosticConnectionId
+        val diagnostic = Diagnostics.newContext(connectionId)
+        Diagnostics.event("follow.availability_requested", diagnostic, source = source,
+            fields = mapOf("controlOperationId" to followDiagnostic.operationId, "runId" to followDiagnostic.runId))
+        mutableState.update { it.copy(followError = null, followMessage = "正在检查车端控制占用…") }
+        try {
+            val availability = client.readFollowAvailability(diagnostic)
+            currentCoroutineContext().ensureActive()
+            // A late result from a cancelled/replaced connection must not release the recovery lock.
+            if (disconnecting || connectionId != client.diagnosticConnectionId || !client.isConnected) return
+            Diagnostics.event("follow.availability_result", diagnostic,
+                fields = mapOf("controlAvailable" to availability.controlAvailable))
+            if (availability.controlAvailable) {
+                clearFollowRecovery()
+                mutableState.update {
+                    it.copy(followUncertain = false, followStatus = null,
+                        followMessage = "控制会话已结束；车轮停稳未确认，请重新查看配置后手动启动")
+                }
+            } else {
+                mutableState.update {
+                    it.copy(followMessage = "控制仍被占用，保持锁定",
+                        followError = availability.reason ?: "车端尚未确认控制资源已释放")
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Diagnostics.failure(diagnostic, "follow.availability_failed", failure)
+            if (!disconnecting) mutableState.update {
+                it.afterAvailabilityFailure(describeFailure(failure), client.isConnected)
             }
         }
     }
@@ -709,6 +792,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         followDiagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         preferences.edit().putString("last_follow_operation", followDiagnostic.operationId).apply()
         firstFollowStopSource = null
+        followCleanupUnconfirmed = false
         Diagnostics.event("follow.start_requested", followDiagnostic, source = "USER_START",
             fields = followOptionFields(current.followLaunchOptions) + mapOf("camera" to current.followCamera.argument,
                 "execute" to current.followExecute, "dryRun" to dryRun), critical = true)
@@ -750,6 +834,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 startAttempted = true
                 preferences.edit().putBoolean("follow_unconfirmed", true).apply()
+                persistFollowRecovery()
                 Diagnostics.event("follow.start_sending", followDiagnostic, critical = true)
                 var reply = control.start()
                 var stopSent = false
@@ -765,7 +850,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         lastRunState = reply.status.runState
                     }
                     reply.status.fault?.let { fault ->
-                        val first = Diagnostics.failure(followDiagnostic, "follow.board_fault", IllegalStateException(fault))
+                        val first = recordFollowFailure("follow.board_fault", IllegalStateException(fault))
                         mutableState.update { it.copy(followFirstFailure = first) }
                     }
                     mutableState.update {
@@ -796,7 +881,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 Diagnostics.event("follow.cancelled", followDiagnostic, fields = mapOf("startAttempted" to startAttempted), critical = true)
                 throw cancelled
             } catch (failure: Exception) {
-                val first = Diagnostics.failure(followDiagnostic, "follow.failed", failure,
+                val first = recordFollowFailure("follow.failed", failure,
                     mapOf("startAttempted" to startAttempted, "terminalReceived" to terminal))
                 mutableState.update {
                     it.copy(followStatus = null, followFirstFailure = first, followError = failure.message.orEmpty().take(350),
@@ -806,10 +891,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             } finally {
                 channel?.close("follow_cleanup")
                 followChannel = null
-                val uncertain = startAttempted && !terminal
-                preferences.edit().putBoolean("follow_unconfirmed", uncertain).apply()
+                val uncertain = !terminal && (startAttempted || followCleanupUnconfirmed)
+                if (terminal) clearFollowRecovery()
+                else if (uncertain) {
+                    preferences.edit().putBoolean("follow_unconfirmed", true).apply()
+                    persistFollowRecovery()
+                }
                 mutableState.update {
-                    it.copy(followActive = false, followStopping = false, followUncertain = uncertain,
+                    it.withTransportState(client.isConnected).copy(followActive = false, followStopping = false, followUncertain = uncertain,
                         followExecute = false, connected = client.isConnected,
                         status = if (client.isConnected) it.status else "连接已断开",
                         followMessage = if (uncertain && it.followError == null) "跟随进程退出未确认，请在车端检查"

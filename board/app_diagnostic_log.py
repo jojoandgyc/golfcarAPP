@@ -9,15 +9,15 @@ import math
 import os
 from pathlib import Path
 import re
-import sys
+import stat
 import threading
 import time
-import traceback
 
 
 MAX_BYTES = 20 * 1024 * 1024
 MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_ERROR_FRAMES = 24
 _SECRET_KEY = re.compile(r"password|passphrase|secret|credential|token|rawrequest|rawresponse", re.I)
 _HEX_SECRET = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])")
 _NAMED_SECRET = re.compile(r"(?i)\b(password|passphrase|token|secret|authorization)\b\s*[:=]\s*([^\s,;]+)")
@@ -37,6 +37,9 @@ def safe_value(value, key="", depth=0):
         return "[REDACTED]"
     if depth > 4:
         return "[TRUNCATED]"
+    if isinstance(value, _FailureSnapshot):
+        # This formatting runs only on the writer, never on the control caller.
+        value = value.render()
     if value is None or type(value) in (bool, int):
         return value
     if type(value) is float:
@@ -49,6 +52,79 @@ def safe_value(value, key="", depth=0):
     if isinstance(value, (list, tuple)):
         return [safe_value(v, depth=depth + 1) for v in value[:40]]
     return safe_text(type(value).__name__)
+
+
+class _FailureSnapshot(dict):
+    """Bounded primitive data only: no exception, traceback, frame or local references."""
+
+    def __init__(self, event, error, occurred_ns):
+        super().__init__(event=event, errorType=type(error).__name__,
+                         monotonicMs=occurred_ns // 1_000_000, monotonicNs=occurred_ns)
+        self.frames = []
+        if isinstance(error, BaseException):
+            # Use the built-in descriptors rather than user-defined __str__/__getattribute__.
+            args = BaseException.args.__get__(error)
+            tb = BaseException.__traceback__.__get__(error)
+            for _ in range(MAX_ERROR_FRAMES):
+                if tb is None:
+                    break
+                code = tb.tb_frame.f_code
+                self.frames.append((code.co_filename[:256], tb.tb_lineno, code.co_name[:80]))
+                tb = tb.tb_next
+        else:
+            args = (error,)
+        self.parts = tuple(value[:1024] if type(value) is str else "<large int>"
+                           if type(value) is int and value.bit_length() > 64 else value
+                           if type(value) in (int, float, bool, type(None))
+                           else "<" + type(value).__name__[:80] + ">" for value in args[:8])
+
+    def render(self):
+        # Do not use traceback/linecache: even the writer needs no source file reads.
+        message = safe_text("; ".join(str(value) for value in self.parts))
+        result = dict(self, message=message)
+        if self.frames:
+            lines = [f'  File "{filename}", line {line}, in {function}'
+                     for filename, line, function in self.frames]
+            lines.append(self["errorType"] + ": " + message)
+            result["stack"] = safe_text("\n".join(lines), 6000)
+        return result
+
+
+def _stderr_report(message):
+    """Best-effort Linux pipe/tty warning with no Python buffered-stream lock.
+
+    Opening /proc/self/fd creates a separate open-file description: O_NONBLOCK
+    cannot change the SSH protocol stdout/stderr flags, even if they were dup'ed.
+    Regular-file stderr is deliberately skipped because O_NONBLOCK cannot make
+    disk writes nonblocking. Unsupported platforms/sinks may drop the warning.
+    """
+    if os.name != "posix":
+        return
+    fd = None
+    try:
+        sink = os.fstat(2).st_mode
+        if not (stat.S_ISFIFO(sink) or stat.S_ISCHR(sink)):
+            return
+        fd = os.open("/proc/self/fd/2", os.O_WRONLY | os.O_NONBLOCK |
+                     getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0))
+        payload = (safe_text(message, 384) + "\n").encode("utf-8", "replace")[:512]
+        os.write(fd, payload)  # At most PIPE_BUF; a full pipe drops this warning.
+    except (OSError, ValueError):
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def report_unavailable_async():
+    """Constructor failure must not synchronously write stderr while holding motor ownership."""
+    try:
+        threading.Thread(target=_stderr_report,
+                         args=("FOLLOW_DIAGNOSTIC_UNAVAILABLE: initialization failed",),
+                         name="follow-diagnostic-warning", daemon=True).start()
+    except Exception:
+        # If a thread cannot be created there is no safe synchronous fallback.
+        pass
 
 
 class DiagnosticLog:
@@ -70,6 +146,10 @@ class DiagnosticLog:
         self.error = None
         self._queue = deque()
         self._lock = threading.Lock()
+        # Only an O(1) timestamp comparison/reference assignment occurs under this lock.
+        # No queue, formatter, writer, report callback or I/O may acquire it.
+        self._cause_lock = threading.Lock()
+        self._cause_sequence = 0
         self._wake = threading.Event()
         self._closing = False
         self._sequence = 0
@@ -77,7 +157,7 @@ class DiagnosticLog:
         self._current_path = None
         self._reported_dropped = 0
         self._writer = writer or self._write
-        self._report = report or (lambda message: print(message, file=sys.stderr, flush=True))
+        self._report = report or _stderr_report
         self._last_warning = 0.
         self._thread = threading.Thread(target=self._consume, name="follow-diagnostic-log", daemon=True)
         self._thread.start()
@@ -111,21 +191,34 @@ class DiagnosticLog:
         self._wake.set()
 
     def stop_requested(self, source: str, **fields):
-        # These calls belong to the supervisor's serial control loop. Preserve the earliest
-        # reason separately, even if a later cleanup/duplicate request has a different one.
-        if self.first_stop is None:
-            self.first_stop = dict(source=safe_text(source), monotonicMs=time.monotonic_ns() // 1_000_000)
+        occurred_ns, order = self._capture_cause_order()
+        detail = dict(source=source[:128], monotonicMs=occurred_ns // 1_000_000,
+                      monotonicNs=occurred_ns, causeOrder=order)
+        self._remember_first("first_stop", detail)
         self.event("stop_requested", critical=True, stopSource=source,
                    firstStop=self.first_stop, **fields)
 
     def failure(self, event: str, error: BaseException | str, **fields):
-        detail = dict(event=event, errorType=type(error).__name__, message=safe_text(error),
-                      monotonicMs=time.monotonic_ns() // 1_000_000)
-        if isinstance(error, BaseException):
-            detail["stack"] = safe_text("".join(traceback.format_exception(type(error), error, error.__traceback__)), 6000)
-        if self.first_failure is None:
-            self.first_failure = detail
+        occurred_ns, order = self._capture_cause_order()
+        detail = _FailureSnapshot(event, error, occurred_ns)
+        detail["causeOrder"] = order
+        self._remember_first("first_failure", detail)
         self.event(event, critical=True, error=detail, firstFailure=self.first_failure, **fields)
+
+    def _capture_cause_order(self):
+        with self._cause_lock:
+            self._cause_sequence += 1
+            return time.monotonic_ns(), self._cause_sequence
+
+    def _remember_first(self, attribute, detail):
+        # Capture time precedes snapshot construction. A preempted earlier caller must
+        # still win when a later caller queues its fault first.
+        with self._cause_lock:
+            current = getattr(self, attribute)
+            # The sequence resolves equal timestamps on coarse monotonic clocks.
+            if current is None or (detail["monotonicNs"], detail["causeOrder"]) < \
+                    (current["monotonicNs"], current["causeOrder"]):
+                setattr(self, attribute, detail)
 
     def close(self, timeout=.5):
         # Only called after worker cleanup. Never wait for this from heartbeat/STOP paths.

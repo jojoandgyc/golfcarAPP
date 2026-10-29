@@ -239,6 +239,10 @@ internal fun FollowControlCard(
                 if (state.followUncertain) {
                     Text("上次控制是否结束尚未确认。启动跟随、摇杆和终端控制保持锁定。",
                         color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    Text(if (!state.connected) "请到连接页重新连接，连接成功后会自动检查控制占用，不会自动恢复跟随。"
+                        else if (state.busy) "正在恢复连接或检查占用，控制保持锁定。"
+                        else "检查只确认控制资源是否释放；不会自动启动跟随，也不代表车轮已经停稳。",
+                        style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followRecoveryHint"))
                     OutlinedButton(onClick = onCheckAvailability, enabled = state.canInspectFollow,
                         modifier = Modifier.fillMaxWidth().testTag("inspectFollowAvailability")) {
                         Text("检查控制占用")

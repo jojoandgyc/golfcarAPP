@@ -135,6 +135,21 @@ class FollowControlsTest {
     }
 
     @Test
+    fun disconnectedRecoveryExplainsReconnectAndDoesNotStartOrInspectFromComposition() {
+        var inspections = 0
+        var starts = 0
+        val state = ready().copy(connected = false, followUncertain = true)
+        compose.setContent {
+            TestSurface { FollowControlCard(state, {}, { starts++ }, {}, { inspections++ }) }
+        }
+        compose.onNodeWithTag("startFollow").assertIsNotEnabled()
+        compose.onNodeWithTag("inspectFollowAvailability").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("followRecoveryHint").assertTextEquals(
+            "请到连接页重新连接，连接成功后会自动检查控制占用，不会自动恢复跟随。")
+        compose.runOnIdle { assertEquals(0, starts); assertEquals(0, inspections) }
+    }
+
+    @Test
     fun staleDistanceAndMissingFeedbackAreUnknownInsteadOfZero() {
         val state = ready().copy(followActive = true, followStatus = status().copy(rangeAgeMs = 900))
         compose.setContent { TestSurface { FollowControlCard(state, {}, {}, {}, {}) } }

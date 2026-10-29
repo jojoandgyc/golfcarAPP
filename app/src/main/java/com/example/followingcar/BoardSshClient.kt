@@ -12,6 +12,8 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -161,7 +163,7 @@ class BoardSshClient {
                 require(command.isNotBlank()) { "请输入要执行的命令" }
                 require(timeoutMillis in 1..300_000) { "命令超时必须在 1 毫秒到 5 分钟之间" }
                 val active = synchronized(stateLock) {
-                    connection?.takeIf { it.ready && it.session.isConnected }
+                    connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
                 } ?: throw IOException("尚未连接开发板，请先连接")
                 val stdout = BoundedOutputStream(OUTPUT_LIMIT_PER_STREAM)
                 val stderr = BoundedOutputStream(OUTPUT_LIMIT_PER_STREAM)
@@ -241,9 +243,12 @@ class BoardSshClient {
                     closeConnection(active, "exec_failed", context)
                     throw error
                 } finally {
-                    channel?.disconnect()
-                    Diagnostics.event("ssh.channel_closed", context,
-                        fields = mapOf("kind" to category, "phase" to phase), critical = true)
+                    val completedChannel = channel
+                    cleanup.execute {
+                        runCatching { completedChannel?.disconnect() }
+                        Diagnostics.event("ssh.channel_closed", context,
+                            fields = mapOf("kind" to category, "phase" to phase), critical = true)
+                    }
                 }
             }
         }
@@ -332,9 +337,8 @@ class BoardSshClient {
                 connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
             } ?: throw IOException("尚未连接开发板，请先连接")
             val context = diagnostic.copy(connectionId = active.diagnostic.connectionId)
-            BoardFollowChannel.open(active.session, camera, execute, dryRun, options, context) {
-                Diagnostics.event("ssh.transport_abort", context, source = "follow_blocking_io_cancelled", critical = true)
-                runCatching { active.socket.close() }
+            BoardFollowChannel.open(active.session, camera, execute, dryRun, options, context) { reason, failureContext ->
+                invalidateTransport(active, reason, failureContext)
             }
         }
     }
@@ -365,6 +369,7 @@ class BoardSshClient {
 
     private fun closeConnection(target: Connection, reason: String, diagnostic: DiagnosticContext) {
         synchronized(stateLock) {
+            target.ready = false
             if (connection === target) connection = null
         }
         Diagnostics.event("ssh.transport_close", diagnostic.copy(connectionId = target.diagnostic.connectionId),
@@ -372,17 +377,40 @@ class BoardSshClient {
         target.close()
     }
 
+    /** Socket close is immediate; never wait for JSch channel/write monitors on this path. */
+    private fun invalidateTransport(target: Connection, reason: String, diagnostic: DiagnosticContext) {
+        val detached = synchronized(stateLock) {
+            target.ready = false
+            if (connection === target) {
+                connection = null
+                true
+            } else false
+        }
+        Diagnostics.event("ssh.transport_abort", diagnostic.copy(connectionId = target.diagnostic.connectionId),
+            source = reason, fields = mapOf("closeScope" to "transport", "currentConnectionDetached" to detached),
+            critical = true)
+        // Always close only the captured transport. A newer connection may already exist.
+        target.close()
+    }
+
     private class Connection(val session: Session, val socket: Socket, val diagnostic: DiagnosticContext) {
         var ready = false // Accessed only under stateLock.
+        private val closed = AtomicBoolean(false)
 
         fun close() {
+            if (!closed.compareAndSet(false, true)) return
             // Closing our socket first also interrupts a connection not yet registered by JSch.
             runCatching { socket.close() }
-            runCatching { session.disconnect() }
+            // JSch disconnect may acquire channel/write monitors; do not wait on a UI,
+            // coroutine cancellation, or control deadline thread for that bookkeeping.
+            cleanup.execute { runCatching { session.disconnect() } }
         }
     }
 
     private companion object {
+        val cleanup = Executors.newCachedThreadPool { runnable ->
+            Thread(runnable, "ssh-connection-cleanup").apply { isDaemon = true }
+        }
         const val CONNECT_TIMEOUT_MS = 10_000
         const val CHANNEL_TIMEOUT_MS = 5_000L
         const val OUTPUT_LIMIT_PER_STREAM = 32 * 1024
