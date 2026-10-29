@@ -69,7 +69,7 @@ Android 验证包括模型输入与互锁、JSON 严格解析、五项配置的�
 | Android 构建／JVM／UI | `1.6-motor-config` / versionCode 7 构建成功；95 项 JVM 测试通过，Android 模拟器 20 项通过（19 项页面／协议测试 + 1 项真实 SSH 的内存模拟联调）；五分页、读取态、写入预览已检查截图 |
 | Python 完整测试 | Windows 27 项中 24 项通过、3 项 POSIX 专用测试跳过；板端 Linux 临时目录内 27/27 通过，锁与串口测试使用模拟对象和临时文件 |
 | 桥接部署版本／哈希／备份 | 2026-10-29 20:07:05（Asia/Taipei）控制空闲且持双锁时新增两文件；原位置均不存在旧文件，未替换现有 GUI／跟随／手动脚本；回执目录见下方 |
-| 手机安装版本 | 用户已拔掉手机，新版尚未安装；已安装到 Google Android 15 模拟器，APK 已生成 |
+| 手机安装版本 | 2026-10-29 已通过 `adb install -r` 更新 Samsung SM-S9280（Android 15）至 `1.6-motor-config` / versionCode 7；核对版本与 APK 哈希，保留 App 数据；五分页实机布局已目视检查，6 项独立模拟界面测试全部通过 |
 | 板端只读检查／配置读取 | 已部署的 `sudo --check` 通过：`controlAvailable=true, serialOpened=false`；未打开真实电机串口，未读取实车参数 |
 | 真实参数写入、重启保持、实车电机 | 均未执行。用户明确现有实车参数已调好，所有写入测试仅限 `--simulate` 内存设备，保留现有参数 |
 
@@ -81,4 +81,4 @@ Android 验证包括模型输入与互锁、JSON 严格解析、五项配置的�
 | `app_control_guard.py` | `7e537b8147e73246fcad974c2c84bec9b485692296fa6c7c6640e51d695abf6e` |
 | `app/build/outputs/apk/debug/app-debug.apk` | `96aeefc558ed66d8a595f8b4123dbcc00abaac31b49bf56d5119b82851dad1b4` |
 
-截图保存在本机构建目录 `app/build/reports/motor-configuration/`。内存模拟每次使用固定种子，写后回读通过且下一次新进程读回原模拟种子，不能将这些数值当成实车配置。手机接回后可安装新版和检查实际布局；本轮不自动执行任何实车参数写入、校准、恢复默认或启动电机测试。
+截图保存在本机构建目录 `app/build/reports/motor-configuration/`，包括 `phone-page.png` 与 `phone/motor-configuration/` 内的模拟页面。内存模拟每次使用固定种子，写后回读通过且下一次新进程读回原模拟种子，不能将这些数值当成实车配置。手机测试仅运行独立 `MotorConfigurationPageTest` 的假回调，没有真实 ViewModel、SSH、配对、热点或串口操作；测试后返回实际 App 电机页并恢复临时常亮设置。本轮未执行实车参数读取、写入、校准、恢复默认或启动电机测试。
