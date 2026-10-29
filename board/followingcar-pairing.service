@@ -1,0 +1,25 @@
+[Unit]
+Description=FollowingCar Bluetooth hotspot provisioning
+After=bluetooth.service NetworkManager.service
+Requires=bluetooth.service NetworkManager.service
+ConditionPathExists=/etc/followingcar-pairing.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -B /opt/followingcar-pairing/app_bluetooth_provision.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=180
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/topeet/lianzhan/.app_joystick.lock
+ReadWritePaths=/home/topeet/Desktop/rk_car_runtime_module/.follow_session.lock
+StateDirectory=followingcar-pairing
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

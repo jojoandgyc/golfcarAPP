@@ -3,6 +3,7 @@ package com.example.followingcar
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import java.io.IOException
 import java.net.SocketTimeoutException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -29,6 +30,9 @@ data class BoardUiState(
     val command: String = "whoami",
     val connected: Boolean = false,
     val busy: Boolean = false,
+    val pairingBusy: Boolean = false,
+    val pairingUnconfirmed: Boolean = false,
+    val pairingHotspotActive: Boolean = false,
     val status: String = "尚未连接",
     val error: String? = null,
     val result: CommandResult? = null,
@@ -71,14 +75,17 @@ data class BoardUiState(
     val followFirstFailure: DiagnosticFailure? = null,
 ) {
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
-    val followBlocksControl: Boolean get() = followActive || followUncertain
-    val canEnableDrive: Boolean get() = connected && !busy && !manualActive && !followBlocksControl && !videoServiceBusy
+    val followBlocksControl: Boolean get() = followActive || followStopping || followUncertain
+    val canEnableDrive: Boolean get() = connected && !busy && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
     val canToggleVideoService: Boolean
         get() = connected && !busy && !videoServiceBusy && !driveStarting && !driveStopping && !followBlocksControl
-    val canInspectFollow: Boolean get() = connected && !busy && !manualActive && !followActive && !videoServiceBusy
+    val canInspectFollow: Boolean get() = connected && !busy && !pairingBusy && !pairingUnconfirmed && !manualActive && !followActive && !followStopping && !videoServiceBusy
+    // Restoring a lost wireless group must remain possible while the old control lock awaits SSH inspection.
+    val canManagePairing: Boolean get() = !connected && !busy && !manualActive &&
+        !followActive && !followStopping && !videoServiceBusy
+    val canManageWifiDirect: Boolean get() = canManagePairing && !pairingBusy && !pairingHotspotActive && !pairingUnconfirmed
     val canStartFollow: Boolean
         get() = canInspectFollow && !followUncertain && !followConfigurationLoading &&
-            followConfiguration != null && followConfigurationError == null &&
             runCatching { followLaunchOptions.validate(followCamera) }.isSuccess
     val canConfigureParking: Boolean
         get() = connected && driveEnabled && driveConfirmedStopped && driveLeft == 0 && driveRight == 0 &&
@@ -112,6 +119,32 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         )
     )
     val state = mutableState.asStateFlow()
+    private val wifiDirectDelegate = lazy {
+        WifiDirectController(application) { state.value.canManageWifiDirect }
+    }
+    internal val wifiDirect: WifiDirectController get() = wifiDirectDelegate.value
+    private val pairingDelegate = lazy {
+        BluetoothHotspotController(application,
+            canMutate = { state.value.canManagePairing && !wifiDirect.mutationPending &&
+                !wifiDirect.state.value.groupExists && !wifiDirect.state.value.confirmationRequired },
+            onHotspotLost = ::onPairingHotspotLost,
+            onPaired = { address ->
+                // The controller has checked the Bluetooth result against the phone's real AP subnet.
+                if (state.value.canManagePairing && !wifiDirect.mutationPending && pairing.state.value.hotspotActive &&
+                    !pairing.state.value.confirmationRequired && pairing.state.value.boardIp == address) {
+                    mutableState.update { it.copy(host = address, pairingBusy = false,
+                        pairingUnconfirmed = false, pairingHotspotActive = true, error = null) }
+                    connect()
+                }
+            },
+            onHotspotLeaseChanged = { active -> PairingHotspotService.setActive(application, active) },
+        )
+    }
+    internal val pairing: BluetoothHotspotController get() = pairingDelegate.value
+    private var hotspotConnectionAddress: String? = null
+    private var connectingHotspot = false
+    private var directConnectionGroup: DirectNetworkLease? = null
+    private var connectingDirect = false
     private var operation: Job? = null
     // Service commands must finish before a competing start/stop. Cancelling an SSH command
     // closes the shared session, so motor stop uses its own channel and never cancels this job.
@@ -134,6 +167,33 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         Diagnostics.event("viewmodel.created", ownerDiagnostic)
+        viewModelScope.launch {
+            pairing.state.collect { pair ->
+                mutableState.update { it.copy(pairingBusy = pair.busy,
+                    pairingUnconfirmed = pair.confirmationRequired, pairingHotspotActive = pair.hotspotActive) }
+            }
+        }
+        viewModelScope.launch {
+            wifiDirect.state.collect { wireless ->
+                val expected = directConnectionGroup ?: return@collect
+                if (!expected.isLost(wireless)) return@collect
+                directConnectionGroup = null
+                val message = "Wi-Fi Direct 无线组已断开或失去确认，请恢复无线组后重新连接开发板。"
+                if (connectingDirect) operation?.cancel(CancellationException(message))
+                val failure = IOException(message)
+                if (state.value.followActive) {
+                    val first = recordFollowFailure("wifi_direct.transport_lost", failure)
+                    mutableState.update { it.copy(followFirstFailure = first) }
+                } else if (state.value.manualActive) {
+                    val first = Diagnostics.failure(driveDiagnostic, "wifi_direct.transport_lost", failure)
+                    mutableState.update { it.copy(driveFirstFailure = it.driveFirstFailure ?: first) }
+                } else Diagnostics.failure(activeDiagnostic(), "wifi_direct.transport_lost", failure)
+                disableDrive(message, source = ControlStopSource.TRANSPORT_LOST)
+                stopFollow(message, ControlStopSource.TRANSPORT_LOST)
+                client.disconnect("wifi_direct_group_lost", activeDiagnostic())
+                mutableState.update { it.withTransportState(false).copy(error = message) }
+            }
+        }
         viewModelScope.launch {
             Diagnostics.failures.collect { failures ->
                 val followFailure = selectFollowFirstFailure(followDiagnostic, followRecovery, state.value.followFirstFailure, failures)
@@ -214,6 +274,51 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun updatePassword(value: String) = editConnection { copy(password = value) }
     fun updateCommand(value: String) { mutableState.update { it.copy(command = value) } }
 
+    internal fun startPairing(address: String) {
+        if (!state.value.canManagePairing || pairing.state.value.busy) return
+        if (wifiDirect.state.value.groupExists || wifiDirect.mutationPending || wifiDirect.state.value.confirmationRequired) {
+            mutableState.update { it.copy(error = "请先在 Wi-Fi Direct 中确认并解散现有无线组，再一键配对。") }
+            return
+        }
+        mutableState.update { it.copy(error = null) }
+        pairing.start(address.trim().uppercase())
+    }
+
+    private fun onPairingHotspotLost() {
+        if (hotspotConnectionAddress == null) return
+        hotspotConnectionAddress = null
+        val message = "手机配对热点已断开，请恢复配对后重新连接开发板。"
+        if (connectingHotspot) operation?.cancel(CancellationException(message))
+        val failure = IOException(message)
+        if (state.value.followActive) {
+            val first = recordFollowFailure("pairing.hotspot_lost", failure)
+            mutableState.update { it.copy(followFirstFailure = first) }
+        } else if (state.value.manualActive) {
+            val first = Diagnostics.failure(driveDiagnostic, "pairing.hotspot_lost", failure)
+            mutableState.update { it.copy(driveFirstFailure = it.driveFirstFailure ?: first) }
+        } else Diagnostics.failure(activeDiagnostic(), "pairing.hotspot_lost", failure)
+        disableDrive(message, source = ControlStopSource.TRANSPORT_LOST)
+        stopFollow(message, ControlStopSource.TRANSPORT_LOST)
+        client.disconnect("pairing_hotspot_lost", activeDiagnostic())
+        mutableState.update { it.withTransportState(false).copy(error = message) }
+    }
+
+    private fun ensurePairingNetwork(address: String?) {
+        if (address != null && (hotspotConnectionAddress != address || !pairing.state.value.hotspotActive ||
+                pairing.state.value.confirmationRequired || pairing.state.value.boardIp != address))
+            throw CancellationException("手机配对热点已变化，取消本次 SSH 连接。")
+    }
+
+    internal fun selectWifiDirectAddress(address: String) {
+        val wireless = wifiDirect.state.value
+        if (!state.value.canManageWifiDirect || !wireless.groupInfoKnown || !wireless.isGroupOwner || wireless.busy) return
+        val actualAddress = wireless.clients.mapNotNull {
+            usableWifiDirectClientAddress(it.ipAddress, wireless.ownerAddress)
+        }.firstOrNull { it == address } ?: return
+        if (wireless.discovering) wifiDirect.stopDiscovery()
+        updateHost(actualAddress)
+    }
+
     private fun editConnection(edit: BoardUiState.() -> BoardUiState) {
         if (!state.value.busy && !state.value.connected && !state.value.manualActive &&
             !state.value.followActive && !state.value.videoServiceBusy) mutableState.update { it.edit().copy(error = null) }
@@ -224,10 +329,21 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update { it.copy(error = "请允许访问本地网络，App 才能连接开发板。") }
     }
 
-    fun connect() {
+    fun connect(viaWifiDirect: Boolean = false) {
         val input = state.value
-        if (disconnecting || input.busy || input.connected || input.manualActive ||
-            input.followActive || input.videoServiceBusy) return
+        if (disconnecting || input.busy || input.pairingBusy || input.pairingUnconfirmed || input.connected || input.manualActive ||
+            input.followActive || input.followStopping || input.videoServiceBusy) return
+        val wireless = wifiDirect.state.value
+        if (wifiDirect.mutationPending || wireless.confirmationRequired || (viaWifiDirect && (wireless.busy || wireless.discovering))) {
+            mutableState.update { it.copy(error = if (wireless.confirmationRequired) "上次无线操作结果未确认，请点击刷新无线状态后再连接 SSH。"
+                else "请等待无线组操作结束，并停止搜索设备后再连接 SSH。") }
+            return
+        }
+        val directGroup = if (viaWifiDirect) DirectNetworkLease.from(wireless) else null
+        if (viaWifiDirect && (directGroup == null || wifiDirectHostForConnection(wireless, input.host.trim()) == null)) {
+            mutableState.update { it.copy(error = "请先创建手机 GO 无线组，等待开发板加入，再使用当前组内的开发板 IP；不能使用手机地址或原局域网地址。") }
+            return
+        }
         val host = input.host.trim()
         val username = input.username.trim()
         val port = input.port.toIntOrNull()
@@ -238,6 +354,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val diagnostic = Diagnostics.newContext()
+        val pairedAddress = input.host.trim().takeIf { !viaWifiDirect && pairing.state.value.hotspotActive &&
+            pairing.state.value.boardIp == it && !pairing.state.value.confirmationRequired }
+        hotspotConnectionAddress = pairedAddress
+        connectingHotspot = pairedAddress != null
+        directConnectionGroup = directGroup
+        connectingDirect = directGroup != null
         Diagnostics.protectSecret(input.password)
         Diagnostics.event("connection.requested", diagnostic, source = "USER_CONNECT",
             fields = mapOf("host" to host, "port" to port))
@@ -255,7 +377,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     Diagnostics.event("connection.retry", diagnostic, fields = mapOf("attempt" to attempt))
                     mutableState.update { it.copy(status = "正在重新连接（$attempt/2）…") }
                 }) {
+                    ensureDirectConnectionGroup(directGroup)
+                    ensurePairingNetwork(pairedAddress)
                     client.connect(BoardConnection(host, port, username, input.password), diagnostic)
+                    ensureDirectConnectionGroup(directGroup)
+                    ensurePairingNetwork(pairedAddress)
                 }
                 sshEstablished = true
                 preferences.edit().putString("host", host).putString("port", port.toString())
@@ -268,9 +394,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 currentCoroutineContext().ensureActive()
                 if (!disconnecting && client.isConnected && state.value.followUncertain) inspectFollowAvailability("RECONNECT")
             } catch (cancelled: CancellationException) {
+                directConnectionGroup = null
+                hotspotConnectionAddress = null
+                client.disconnect("connection_cancelled", diagnostic)
+                mutableState.update { it.withTransportState(false) }
                 Diagnostics.event("connection.cancelled", diagnostic, critical = true)
                 throw cancelled
             } catch (failure: Exception) {
+                directConnectionGroup = null
+                hotspotConnectionAddress = null
                 Diagnostics.failure(diagnostic, "connection.failed", failure,
                     mapOf("sshEstablished" to sshEstablished, "attempts" to connectionAttempts))
                 withContext(Dispatchers.IO) { client.disconnect("connection_failed", diagnostic) }
@@ -279,8 +411,16 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         error = describeFailure(failure, connecting = !sshEstablished, attempts = connectionAttempts))
                 }
             } finally {
+                connectingDirect = false
+                connectingHotspot = false
                 if (!disconnecting) mutableState.update { it.copy(busy = false) }
             }
+        }
+    }
+
+    private fun ensureDirectConnectionGroup(expected: DirectNetworkLease?) {
+        if (expected != null && (directConnectionGroup !== expected || expected.isLost(wifiDirect.state.value))) {
+            throw CancellationException("手机无线组已变化，取消本次 SSH 连接；请恢复网络后手动重连。")
         }
     }
 
@@ -442,6 +582,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         withTimeoutOrNull(1_000L) { followJob?.join(); driveJob?.join(); videoServiceJob?.join() }
                     } finally {
+                        directConnectionGroup = null
+                        hotspotConnectionAddress = null
                         disconnecting = false
                         mutableState.update { it.withTransportState(false).copy(busy = false, status = "已断开", error = null) }
                         Diagnostics.event("connection.disconnect_completed", diagnostic,
@@ -468,6 +610,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         driveChannel?.close("viewmodel_cleared")
         followChannel?.close("viewmodel_cleared")
         client.disconnect("viewmodel_cleared", activeDiagnostic())
+        if (wifiDirectDelegate.isInitialized()) wifiDirect.close()
+        if (pairingDelegate.isInitialized()) pairing.close()
         super.onCleared()
     }
 
@@ -767,7 +911,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 clearFollowRecovery()
                 mutableState.update {
                     it.copy(followUncertain = false, followStatus = null,
-                        followMessage = "控制会话已结束；车轮停稳未确认，请重新查看配置后手动启动")
+                        followMessage = "控制会话已结束；车轮停稳未确认，可选择模式后手动启动跟随")
                 }
             } else {
                 mutableState.update {

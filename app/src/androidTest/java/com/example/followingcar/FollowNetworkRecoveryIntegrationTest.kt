@@ -132,7 +132,7 @@ class FollowNetworkRecoveryIntegrationTest {
             assertFalse(recovered.followError, recovered.followUncertain)
             assertFalse(recovered.followActive)
             assertFalse(recovered.followExecute)
-            assertFalse("New session still requires fresh configuration and a user start", recovered.canStartFollow)
+            assertTrue("Recovery allows an explicit user start without fetching configuration; it never starts automatically", recovered.canStartFollow)
             assertEquals(first, recovered.followFirstFailure)
             assertTrue(reader.readFollowAvailability().controlAvailable)
             assertTrue(Diagnostics.snapshot().events.map(::JSONObject).any {

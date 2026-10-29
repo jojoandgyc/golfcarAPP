@@ -28,6 +28,9 @@ class BoardPagesTest {
         compose.onNodeWithTag("host").assertExists()
         compose.onNodeWithTag("pageFollow").performClick()
         compose.onNodeWithTag("followTargetDistance").assertExists()
+        compose.onNodeWithTag("followConnect").assertIsDisplayed()
+        compose.onNodeWithTag("boardHeader").assertDoesNotExist()
+        compose.onNodeWithTag("connectionSummary").assertDoesNotExist()
         compose.onNodeWithTag("pageJoystick").performClick()
         compose.onNodeWithTag("driveStatus").assertExists()
         compose.onNodeWithTag("pageTerminal").performClick()
@@ -95,5 +98,18 @@ class BoardPagesTest {
         compose.onNodeWithTag("followCamera_astra-pro").performScrollTo().assertIsSelected()
         compose.onNodeWithTag("followCamera_gemini335").performScrollTo().performClick()
         compose.onNodeWithTag("followAvoidance").performScrollTo().assertIsOff()
+    }
+
+    @Test
+    fun followUsesInlineOptionalConfigurationAndPinnedConnectionAction() {
+        compose.onNodeWithTag("pageFollow").performClick()
+        compose.onNodeWithTag("followShadow").assertIsSelected()
+        compose.onNodeWithTag("followConnect").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("inspectFollowConfiguration").assertDoesNotExist()
+        compose.onNodeWithTag("followConfigurationToggle").performScrollTo().performClick()
+        compose.onNodeWithTag("inspectFollowConfiguration").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("followConnect").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("host").assertIsDisplayed()
+        compose.onNodeWithTag("boardHeader").assertIsDisplayed()
     }
 }
