@@ -148,8 +148,16 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 followConfiguration = null, followConfigurationError = null, status = "正在连接…")
         }
         operation = viewModelScope.launch {
+            var connectionAttempts = 1
+            var sshEstablished = false
             try {
-                client.connect(BoardConnection(host, port, username, input.password))
+                withInitialConnectionRetry(onRetry = { attempt ->
+                    connectionAttempts = attempt
+                    mutableState.update { it.copy(status = "正在重新连接（$attempt/2）…") }
+                }) {
+                    client.connect(BoardConnection(host, port, username, input.password))
+                }
+                sshEstablished = true
                 preferences.edit().putString("host", host).putString("port", port.toString())
                     .putString("username", username).apply()
                 credentialPreferences.edit().putString("password", input.password).apply()
@@ -160,7 +168,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 throw cancelled
             } catch (failure: Exception) {
                 withContext(Dispatchers.IO) { client.disconnect() }
-                mutableState.update { it.copy(connected = false, status = "连接失败", error = describeFailure(failure)) }
+                mutableState.update {
+                    it.copy(connected = false, status = "连接失败",
+                        error = describeFailure(failure, connecting = !sshEstablished, attempts = connectionAttempts))
+                }
             } finally {
                 if (!disconnecting) mutableState.update { it.copy(busy = false) }
             }
@@ -557,14 +568,16 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         stopFollow("$reason，正在请求结束跟随")
     }
 
-    private fun describeFailure(failure: Exception): String {
-        val message = failure.message.orEmpty()
+    private fun describeFailure(failure: Exception, connecting: Boolean = false, attempts: Int = 1): String {
+        val message = generateSequence(failure as Throwable?) { it.cause }.take(8)
+            .joinToString(" ") { it.message.orEmpty() }
         return when {
             message.contains("Auth fail", true) -> "登录失败，请检查用户名和密码。"
             message.contains("hostkey", true) || message.contains("host key", true) ->
                 "开发板身份校验失败。当前 App 只信任已配置的开发板；重装系统后需要更新主机公钥。"
             failure is SocketTimeoutException || message.contains("timeout", true) || message.contains("timed out", true) ->
-                "连接或命令超时，连接已断开。请检查 Wi-Fi；板上已启动的程序可能仍在运行。"
+                if (connecting) "连接开发板超时（已尝试 $attempts 次）。请确认手机与开发板网络互通，IP 地址和端口正确。"
+                else "连接或命令超时，连接已断开。请检查 Wi-Fi；板上已启动的程序可能仍在运行。"
             message.contains("refused", true) -> "开发板拒绝连接，请检查 SSH 服务和端口。"
             message.contains("unreachable", true) || message.contains("resolve", true) ->
                 "无法访问开发板，请检查 IP 地址与手机 Wi-Fi。"

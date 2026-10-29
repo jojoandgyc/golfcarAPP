@@ -15,7 +15,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
-/** Opt-in, read-only end-to-end test against the user's board. Password is a runner argument. */
+/** Opt-in, read-only check. Credentials are supplied explicitly or reused from this phone. */
 @RunWith(AndroidJUnit4::class)
 class BoardScreenIntegrationTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
@@ -24,10 +24,13 @@ class BoardScreenIntegrationTest {
     fun phoneCanConnectAndExecuteACommandFromTheScreen() {
         val arguments = InstrumentationRegistry.getArguments()
         val password = arguments.getString("boardPassword").orEmpty()
-        assumeTrue("Provide boardPassword to run against a real board", password.isNotEmpty())
+        val useSavedCredentials = arguments.getString("useSavedBoardCredentials") == "true"
+        assumeTrue("Opt in with boardPassword or useSavedBoardCredentials", password.isNotEmpty() || useSavedCredentials)
         compose.onNodeWithTag("host").performTextReplacement(arguments.getString("boardHost") ?: "172.16.16.82")
         compose.onNodeWithTag("username").performTextReplacement(arguments.getString("boardUsername") ?: "topeet")
-        compose.onNodeWithTag("password").performScrollTo().performTextReplacement(password)
+        if (password.isNotEmpty()) {
+            compose.onNodeWithTag("password").performScrollTo().performTextReplacement(password)
+        }
         compose.onNodeWithTag("connect").performScrollTo().performClick()
         compose.waitUntil(25_000) { textOf("connectionStatus") in listOf("已连接", "连接失败") }
         compose.onNodeWithTag("connectionStatus").assertTextEquals("已连接")
