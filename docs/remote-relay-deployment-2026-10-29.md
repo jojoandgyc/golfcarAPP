@@ -2,6 +2,8 @@
 
 本次在用户指定的海外服务器 `43.162.101.137` 上部署，入口为 `car.nujabes.top`。App 版本为 **1.7-remote-relay，versionCode 8**。此前提到的 `10.4.4.13` 没有被当作已验证的公网入口，也没有在其上另行部署。
 
+本记录保留最初模拟器部署的结果；同日后续已完成 [实体手机安装与无 VPN 验证](remote-relay-phone-validation-2026-10-29.md)，两轮测试分别记录。
+
 本次远程 SSH、独立模拟跟随、合成视频及专用隧道中断测试已完成；当前模拟器网络的手动控制未通过 600ms 看门狗验收，不能将“能够连接”解释为已满足低延迟驾驶要求。
 
 所有控制联调均为 `dryRun=true`、`execute=false`。没有运行实车电机测试，没有改动调好的电机参数，没有启动摄像头采集或原视频服务。
@@ -21,7 +23,7 @@
 | 板端视频网关部署回执 | `/etc/followingcar-relay/video-gateway-deployment.json` |
 | Android APK 构建时间 | `2026-10-29 22:24:17`（UTC+8），33,613,613 bytes，已安装到模拟器 |
 | Android 最终 APK SHA-256 | `5b46c14bad1ce8cb826e975cd7f314ff47094595a08d99de49e9b9f149b014d5` |
-| Git 版本定位 | 本报告与实现一同提交；使用 `git log -1 --format=%H -- docs/remote-relay-deployment-2026-10-29.md` 定位对应提交 |
+| Git 实现版本 | `e0553e1e071178a12cab543e1910c694f7f68337`；后续真机记录为文档更新，APK 未重编译 |
 
 板端独立视频网关使用的 MediaMTX 二进制 SHA-256：
 
