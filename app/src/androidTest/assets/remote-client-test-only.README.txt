@@ -1,0 +1,7 @@
+This is a public, synthetic test identity. It grants access to no server.
+The sibling remote-client-ec-test-only.p12 is the same fixture using EC P-256.
+The fixture password is fixture-password. Never deploy or trust this identity.
+Its certificate has CN=FollowingCar TEST ONLY, SAN=relay.example.test and
+clientAuth/serverAuth EKUs. The long validity avoids clock-dependent fixture failures.
+Instrumentation imports it only under a unique followingcar.remote.test.* key alias
+and a separate cache directory, never the user's production remote credentials.

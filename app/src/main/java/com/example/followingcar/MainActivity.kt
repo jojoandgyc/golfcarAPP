@@ -148,6 +148,9 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         if (allowed) viewModel.connect(viaWifiDirect = useWifiDirect) else viewModel.permissionDenied()
     }
+    val remoteImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(viewModel::importRemoteConfiguration)
+    }
     val nearbyPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         viewModel.wifiDirect.refreshStatus()
     }
@@ -174,6 +177,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     }
     val pair: (String) -> Unit = { address ->
         if (viewModel.state.value.canManagePairing && !viewModel.pairing.state.value.busy) {
+            viewModel.setRemoteMode(false)
             useWifiDirect = false
             pendingPairAddress = address
             keyboard?.hide()
@@ -187,7 +191,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
         if (current.canManagePairing && !current.pairingBusy && !current.pairingUnconfirmed && !currentWireless.busy && !currentWireless.confirmationRequired &&
             (!useWifiDirect || !currentWireless.discovering)) {
             keyboard?.hide()
-            if (Build.VERSION.SDK_INT >= 37 &&
+            if (!current.remoteMode && Build.VERSION.SDK_INT >= 37 &&
                 ContextCompat.checkSelfPermission(context, networkPermission) != PackageManager.PERMISSION_GRANTED
             ) permissionLauncher.launch(networkPermission) else viewModel.connect(viaWifiDirect = useWifiDirect)
         }
@@ -225,7 +229,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                             Column(Modifier.weight(1f)) {
                                 Text(state.status, fontWeight = FontWeight.Bold,
                                     modifier = Modifier.testTag("connectionStatus"))
-                                Text(state.username + "@" + state.host + ":" + state.port,
+                                Text((if (state.remoteMode) "远程 · " else "") + state.username + "@" + state.connectionHost + ":" + state.connectionPort,
                                     style = MaterialTheme.typography.bodySmall)
                             }
                             if (state.connected || state.busy) {
@@ -309,17 +313,27 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     }
                     when (page) {
                         BoardPage.CONNECTION -> {
-                            PairingCard(state = pairing, canManage = state.canManagePairing && !viewModel.wifiDirect.mutationPending,
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilterChip(selected = !state.remoteMode && !useWifiDirect, onClick = { viewModel.setRemoteMode(false); useWifiDirect = false },
+                                    enabled = state.canManageConnectionMode && !wireless.busy && (!useWifiDirect || !wireless.discovering),
+                                    label = { Text("局域网") }, modifier = Modifier.weight(1f).testTag("connectionLanMode"))
+                                FilterChip(selected = !state.remoteMode && useWifiDirect,
+                                    onClick = { viewModel.setRemoteMode(false); useWifiDirect = true; viewModel.wifiDirect.refreshStatus() },
+                                    enabled = state.canManageConnectionMode && state.canManageWifiDirect && !wireless.busy,
+                                    label = { Text("Wi-Fi 直连") }, modifier = Modifier.weight(1f).testTag("connectionDirectMode"))
+                                FilterChip(selected = state.remoteMode,
+                                    onClick = { viewModel.setRemoteMode(true); useWifiDirect = false },
+                                    enabled = state.canManageConnectionMode && !wireless.busy && !wireless.discovering,
+                                    label = { Text("远程") }, modifier = Modifier.weight(1f).testTag("connectionRemoteMode"))
+                            }
+                            if (state.remoteMode) RemoteConnectionCard(state,
+                                onImport = { if (viewModel.state.value.canManageConnectionMode) {
+                                    keyboard?.hide()
+                                    remoteImportLauncher.launch(arrayOf("application/json", "application/octet-stream", "text/plain"))
+                                } })
+                            else PairingCard(state = pairing, canManage = state.canManagePairing && !viewModel.wifiDirect.mutationPending,
                                 sshConnected = state.connected, onPair = pair, onCancel = viewModel.pairing::cancel,
                                 onCheck = viewModel.pairing::retryStatus, onStopHotspot = viewModel.pairing::stopHotspot)
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                FilterChip(selected = !useWifiDirect, onClick = { useWifiDirect = false },
-                                    enabled = state.canManageWifiDirect && !wireless.busy && (!useWifiDirect || !wireless.discovering),
-                                    label = { Text("局域网") }, modifier = Modifier.weight(1f).testTag("connectionLanMode"))
-                                FilterChip(selected = useWifiDirect, onClick = { useWifiDirect = true; viewModel.wifiDirect.refreshStatus() },
-                                    enabled = state.canManageWifiDirect && !wireless.busy,
-                                    label = { Text("Wi-Fi Direct") }, modifier = Modifier.weight(1f).testTag("connectionDirectMode"))
-                            }
                             if (!useWifiDirect && wireless.confirmationRequired) {
                                 Text("上次直连操作结果尚未确认，请先刷新无线状态再连接 SSH。", style = MaterialTheme.typography.bodySmall)
                                 OutlinedButton(onClick = viewModel.wifiDirect::refresh, enabled = !wireless.busy,
@@ -434,6 +448,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
 
 @Composable
 private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifier: Modifier = Modifier) {
+    val remoteVideo by viewModel.remoteVideo.collectAsStateWithLifecycle()
     var useDirectionPad by rememberSaveable { mutableStateOf(false) }
     var manualSection by rememberSaveable { mutableStateOf(ManualSection.DRIVE) }
     var waitingForModeStop by remember { mutableStateOf(false) }
@@ -500,6 +515,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                         val panelHeight = maxWidth * 3 / 8 + 48.dp
                         BoardCameraPreview(state = state,
                             onVideoServiceEnabledChange = viewModel::setVideoServiceEnabled,
+                            remoteVideo = if (state.remoteMode) remoteVideo else null,
                             modifier = Modifier.fillMaxWidth().height(panelHeight))
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
@@ -630,10 +646,11 @@ private fun ConnectionCard(state: BoardUiState, viewModel: BoardViewModel, conne
     var showPassword by remember { mutableStateOf(false) }
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("连接开发板", style = MaterialTheme.typography.titleMedium)
-            Text(if (useWifiDirect) "先让开发板加入手机无线组，再使用开发板分配到的 IP 连接 SSH。"
+            Text(if (state.remoteMode) "连接远程小车" else "连接开发板", style = MaterialTheme.typography.titleMedium)
+            Text(if (state.remoteMode) "手机和小车均需联网。使用开发板的用户名和密码，通过服务器建立加密连接。"
+                else if (useWifiDirect) "先让开发板加入手机无线组，再使用开发板分配到的 IP 连接 SSH。"
                 else "手机和开发板需接入同一局域网。", style = MaterialTheme.typography.bodySmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (!state.remoteMode) Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
                     value = state.host, onValueChange = viewModel::updateHost, label = { Text("IP 地址") },
                     singleLine = true, enabled = !state.busy, modifier = Modifier.weight(1f).testTag("host"),
@@ -659,7 +676,9 @@ private fun ConnectionCard(state: BoardUiState, viewModel: BoardViewModel, conne
             )
             Text("连接成功后会在本机保存密码，下次自动填入。", style = MaterialTheme.typography.bodySmall)
             if (!networkReady) Text(networkHint, style = MaterialTheme.typography.bodySmall)
-            Button(onClick = connect, enabled = state.canManageWifiDirect && networkReady, modifier = Modifier.fillMaxWidth().testTag("connect")) { Text("连接开发板") }
+            Button(onClick = connect, enabled = state.canManageConnectionMode && networkReady &&
+                (if (state.remoteMode) state.remoteProfile != null && state.remoteProfileError == null else state.canManageWifiDirect),
+                modifier = Modifier.fillMaxWidth().testTag("connect")) { Text(if (state.remoteMode) "远程连接" else "连接开发板") }
         }
     }
 }

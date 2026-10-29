@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.carremote
+*.boardremote
+*.p12
+*.key
+*secret*.json

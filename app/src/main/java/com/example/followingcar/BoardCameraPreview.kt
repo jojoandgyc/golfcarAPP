@@ -2,9 +2,12 @@ package com.example.followingcar
 
 import android.annotation.SuppressLint
 import android.graphics.Color
+import android.net.http.SslError
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.PermissionRequest
+import android.webkit.ClientCertRequest
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -44,6 +47,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import java.io.ByteArrayInputStream
 
 /** Service controls plus the board's full-frame RGB/depth player, sized for the driving page. */
 @Composable
@@ -51,9 +55,10 @@ internal fun BoardCameraPreview(
     state: BoardUiState,
     onVideoServiceEnabledChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    remoteVideo: RemoteVideoEndpoint? = null,
 ) {
     var retryKey by remember { mutableIntStateOf(0) }
-    var playerStatus by remember(state.host, state.videoPreviewRevision, retryKey) {
+    var playerStatus by remember(state.host, remoteVideo?.identity, state.videoPreviewRevision, retryKey) {
         mutableStateOf("正在连接画面…")
     }
     val running = state.videoServiceState == VideoServiceState.RUNNING
@@ -97,9 +102,9 @@ internal fun BoardCameraPreview(
         Box(Modifier.fillMaxWidth().weight(1f).background(MaterialTheme.colorScheme.surfaceVariant)) {
             if (canPreview) {
                 // A successful service start reloads the player even if the IP is unchanged.
-                key(state.host, state.videoPreviewRevision, retryKey) {
+                key(state.host, remoteVideo?.identity, state.videoPreviewRevision, retryKey) {
                     BoardVideoPlayer(state.host, onStatusChange = { playerStatus = it },
-                        modifier = Modifier.fillMaxSize())
+                        modifier = Modifier.fillMaxSize(), remoteVideo = remoteVideo)
                 }
             } else {
                 val message = when {
@@ -125,10 +130,11 @@ internal fun BoardCameraPreview(
 /** Receive-only player: unloading it releases WebRTC without requesting phone camera access. */
 @Composable
 @Suppress("DEPRECATION")
-private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit, modifier: Modifier) {
-    val host = boardHost.trim()
-    val diagnostic = remember(host) { Diagnostics.newContext() }
-    if (!isBoardIpv4(host)) {
+private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit, modifier: Modifier,
+    remoteVideo: RemoteVideoEndpoint? = null) {
+    val host = remoteVideo?.host ?: boardHost.trim()
+    val diagnostic = remember(host, remoteVideo?.identity) { Diagnostics.newContext() }
+    if (remoteVideo == null && !isBoardIpv4(host)) {
         Text("请先在连接页填写开发板的 IPv4 地址。", modifier,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         return
@@ -136,8 +142,10 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
 
     // The MediaMTX player fills the WebView, without the /preview page's heading and telemetry.
     // A trailing slash avoids redirecting the main frame before reader.js resolves its WHEP URL.
-    val previewUrl = "http://$host:8889/rgbd/?controls=false&muted=true&autoplay=true&playsinline=true"
+    val previewUrl = remoteVideo?.previewUrl
+        ?: "http://$host:8889/rgbd/?controls=false&muted=true&autoplay=true&playsinline=true"
     val currentHost = rememberUpdatedState(host)
+    val currentRemote = rememberUpdatedState(remoteVideo)
     val currentUrl = rememberUpdatedState(previewUrl)
     val currentOnStatusChange = rememberUpdatedState(onStatusChange)
     val context = LocalContext.current
@@ -174,13 +182,75 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
                 override fun onPermissionRequest(request: PermissionRequest) {
                     request.deny()
                 }
+
+                override fun onReceivedTitle(view: WebView, title: String?) {
+                    if (currentRemote.value == null || view.url != currentUrl.value) return
+                    // Only fixed status codes from our player reach diagnostics; no URL, ICE or SDP data.
+                    if (title?.startsWith("FollowingCarVideo:") != true) return
+                    val code = title?.removePrefix("FollowingCarVideo:") ?: return
+                    val message = when (code) {
+                        "connecting" -> "正在连接远程画面…"
+                        "playing" -> "远程画面已连接"
+                        "retrying" -> "画面连接中断，正在重连…"
+                        "media_stalled" -> "画面停止更新，正在重连…"
+                        "authentication_failed" -> "远程视频认证失败，请检查凭据"
+                        "unavailable" -> "暂无远程画面，可重连"
+                        "closed" -> "预览已暂停"
+                        else -> return
+                    }
+                    Diagnostics.event("video.player.remote_state", diagnostic,
+                        fields = mapOf("playerState" to code), critical = code in setOf("authentication_failed", "media_stalled"))
+                    currentOnStatusChange.value(message)
+                }
             }
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     if (!request.isForMainFrame) return false
                     val target = request.url
                     if (target.toString() == "about:blank") return false
+                    currentRemote.value?.let { return !it.allowsNavigation(target.toString()) }
                     return target.scheme != "http" || target.host != currentHost.value || target.port != 8889
+                }
+
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val endpoint = currentRemote.value ?: return null
+                    if (request.url.toString() == "about:blank" || endpoint.allowsResource(request.url.toString())) return null
+                    return WebResourceResponse("text/plain", "UTF-8", 403, "Forbidden", emptyMap(),
+                        ByteArrayInputStream(ByteArray(0)))
+                }
+
+                override fun onReceivedClientCertRequest(view: WebView, request: ClientCertRequest) {
+                    val endpoint = currentRemote.value
+                    if (endpoint == null || !endpoint.acceptsClientCertificate(request.host, request.port)) {
+                        request.cancel()
+                        return
+                    }
+                    try {
+                        val key = endpoint.privateKey()
+                        val chain = endpoint.certificateChain()
+                        if (key == null || chain.isNullOrEmpty()) {
+                            request.cancel()
+                            pageFailed = true
+                            currentOnStatusChange.value("远程视频凭据不可用，请重新导入")
+                        } else {
+                            chain.forEach { it.checkValidity() }
+                            request.proceed(key, chain)
+                        }
+                    } catch (_: Exception) {
+                        request.cancel()
+                        pageFailed = true
+                        Diagnostics.event("video.player.client_identity_failed", diagnostic, critical = true)
+                        currentOnStatusChange.value("远程视频凭据无效，请重新导入")
+                    }
+                }
+
+                override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+                    // Never turn a failed HTTPS certificate check into a trusted video session.
+                    handler.cancel()
+                    pageFailed = true
+                    Diagnostics.event("video.player.tls_failed", diagnostic,
+                        fields = mapOf("errorCode" to error.primaryError), critical = true)
+                    currentOnStatusChange.value("视频证书校验失败，连接已拒绝")
                 }
 
                 override fun onReceivedError(view: WebView, request: WebResourceRequest,
@@ -207,7 +277,7 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
                     if (url == currentUrl.value && !pageFailed) {
                         Diagnostics.event("video.player.page_loaded", diagnostic,
                             fields = mapOf("width" to view.width, "height" to view.height))
-                        currentOnStatusChange.value("播放器已加载")
+                        if (currentRemote.value == null) currentOnStatusChange.value("播放器已加载")
                     }
                 }
             }
@@ -227,7 +297,8 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
     }
     LaunchedEffect(webView, foreground, previewUrl) {
         if (foreground) {
-            Diagnostics.event("video.player.load_started", diagnostic, fields = mapOf("host" to host))
+            Diagnostics.event("video.player.load_started", diagnostic,
+                fields = mapOf("host" to host, "mode" to if (remoteVideo == null) "local" else "remote"))
             pageFailed = false
             currentOnStatusChange.value("正在连接画面…")
             webView.onResume()
@@ -244,6 +315,7 @@ private fun BoardVideoPlayer(boardHost: String, onStatusChange: (String) -> Unit
         onDispose {
             Diagnostics.event("video.player.disposed", diagnostic)
             webView.stopLoading()
+            if (remoteVideo != null) WebView.clearClientCertPreferences(null)
             webView.loadUrl("about:blank")
             webView.onPause()
             (webView.parent as? ViewGroup)?.removeView(webView)

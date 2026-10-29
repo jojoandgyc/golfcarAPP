@@ -8,7 +8,6 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.UUID
@@ -31,6 +30,7 @@ data class BoardConnection(
     val port: Int,
     val username: String,
     val password: String,
+    val tls: RemoteTlsConfig? = null,
 ) {
     // Avoid accidentally including credentials in logs or exception messages.
     override fun toString(): String = "BoardConnection(host=$host, port=$port, username=$username)"
@@ -86,7 +86,8 @@ class BoardSshClient {
             val started = System.nanoTime()
             Diagnostics.event("ssh.connect_started", context,
                 fields = mapOf("host" to config.host, "port" to config.port,
-                    "generation" to attempt, "timeoutMs" to CONNECT_TIMEOUT_MS), critical = true)
+                    "generation" to attempt, "timeoutMs" to CONNECT_TIMEOUT_MS,
+                    "transport" to if (config.tls == null) "local" else "remote_mtls"), critical = true)
 
             val socket = Socket()
             val jsch = JSch().apply {
@@ -105,8 +106,7 @@ class BoardSshClient {
                 setDaemonThread(true)
                 setSocketFactory(object : SocketFactory {
                     override fun createSocket(host: String, port: Int): Socket {
-                        socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
-                        return socket
+                        return openBoardSocket(socket, host, port, CONNECT_TIMEOUT_MS, config.tls)
                     }
 
                     override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
@@ -268,11 +268,10 @@ class BoardSshClient {
                     connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
                 } ?: throw IOException("尚未连接开发板，请先连接")
                 val context = diagnostic.copy(connectionId = active.diagnostic.connectionId)
-                BoardDriveChannel.open(active.session, dryRun, context) {
+                BoardDriveChannel.open(active.session, dryRun, context) { reason, failureContext ->
                     // A timed-out write cannot be safely retried. Closing the socket also
                     // unblocks JSch without waiting for its channel/write monitor.
-                    Diagnostics.event("ssh.transport_abort", context, source = "drive_blocking_io_cancelled", critical = true)
-                    runCatching { active.socket.close() }
+                    invalidateTransport(active, reason, failureContext)
                 }
             }
         }

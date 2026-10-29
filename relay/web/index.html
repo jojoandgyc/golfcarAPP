@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self' blob:; img-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>FollowingCarVideo:connecting</title>
+  <link rel="stylesheet" href="./player.css">
+  <script defer src="./whep.js"></script>
+  <script defer src="./player.js"></script>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline disablepictureinpicture></video>
+  <div id="message" role="status">正在连接远程画面…</div>
+  <div id="quality" aria-live="off"></div>
+</body>
+</html>

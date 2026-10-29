@@ -1,6 +1,7 @@
 package com.example.followingcar
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.io.IOException
@@ -27,6 +28,10 @@ data class BoardUiState(
     val port: String = "22",
     val username: String = "topeet",
     val password: String = "",
+    val remoteMode: Boolean = false,
+    val remoteProfile: RemoteProfile? = null,
+    val remoteProfileLoading: Boolean = false,
+    val remoteProfileError: String? = null,
     val command: String = "whoami",
     val connected: Boolean = false,
     val busy: Boolean = false,
@@ -74,6 +79,10 @@ data class BoardUiState(
     val followError: String? = null,
     val followFirstFailure: DiagnosticFailure? = null,
 ) {
+    val connectionHost: String get() = if (remoteMode) remoteProfile?.host ?: DEFAULT_REMOTE_HOST else host
+    val connectionPort: String get() = if (remoteMode) (remoteProfile?.controlPort ?: DEFAULT_REMOTE_CONTROL_PORT).toString() else port
+    val canManageConnectionMode: Boolean get() = canManagePairing && !pairingBusy &&
+        !pairingUnconfirmed && !remoteProfileLoading
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followStopping || followUncertain
     val canEnableDrive: Boolean get() = connected && !busy && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
@@ -99,6 +108,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("board_connection", 0)
     private val credentialPreferences = application.getSharedPreferences("board_credentials", 0)
     private val recoveryPreferences = application.getSharedPreferences("follow_recovery", 0)
+    private val remoteCredentials = RemoteCredentials(application)
+    private val mutableRemoteVideo = MutableStateFlow<RemoteVideoEndpoint?>(null)
+    internal val remoteVideo = mutableRemoteVideo.asStateFlow()
     private var followRecovery = FollowRecoverySnapshot.restore(recoveryPreferences.all)
     private val client = BoardSshClient()
     private val ownerDiagnostic = Diagnostics.newContext()
@@ -114,6 +126,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             port = preferences.getString("port", null) ?: "22",
             username = preferences.getString("username", null) ?: "topeet",
             password = credentialPreferences.getString("password", null).orEmpty(),
+            remoteMode = preferences.getBoolean("remote_mode", false),
+            remoteProfileLoading = true,
             followUncertain = followRecovery != null || preferences.getBoolean("follow_unconfirmed", false),
             followFirstFailure = followRecovery?.firstFailure,
             followMessage = if (followRecovery != null || preferences.getBoolean("follow_unconfirmed", false))
@@ -171,6 +185,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         Diagnostics.event("viewmodel.created", ownerDiagnostic)
+        viewModelScope.launch {
+            try { reloadRemoteIdentity() }
+            catch (_: Exception) {
+                mutableState.update { it.copy(remoteProfileError = "远程凭据不可用，请重新导入连接配置") }
+            } finally { mutableState.update { it.copy(remoteProfileLoading = false) } }
+        }
         viewModelScope.launch {
             state.collect { current ->
                 if (!current.connected || current.manualActive || current.followBlocksControl) {
@@ -240,7 +260,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     disableDrive("SSH 连接中断", source = ControlStopSource.TRANSPORT_LOST)
                     stopFollow("SSH 连接中断，正在请求结束跟随", ControlStopSource.TRANSPORT_LOST)
                     mutableState.update {
-                        it.withTransportState(false).copy(error = "连接中断，请检查 Wi-Fi 后重新连接。")
+                        it.withTransportState(false).copy(error = if (it.remoteMode)
+                            "远程连接中断，请检查手机网络、小车网络及中转服务后重新连接。"
+                            else "连接中断，请检查 Wi-Fi 后重新连接。")
                     }
                 }
             }
@@ -287,6 +309,49 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun updateUsername(value: String) = editConnection { copy(username = value) }
     fun updatePassword(value: String) = editConnection { copy(password = value) }
     fun updateCommand(value: String) { mutableState.update { it.copy(command = value) } }
+
+    fun setRemoteMode(remote: Boolean) {
+        if (!state.value.canManageConnectionMode || wifiDirect.mutationPending ||
+            wifiDirect.state.value.busy || wifiDirect.state.value.confirmationRequired) return
+        preferences.edit().putBoolean("remote_mode", remote).apply()
+        mutableState.update { it.copy(remoteMode = remote, error = null, result = null) }
+        Diagnostics.event("connection.mode_changed", ownerDiagnostic,
+            fields = mapOf("mode" to if (remote) "REMOTE" else "LOCAL"), critical = true)
+    }
+
+    private suspend fun reloadRemoteIdentity() {
+        val identity = withContext(Dispatchers.IO) { remoteCredentials.getClientIdentity() }
+        mutableRemoteVideo.value = identity?.let {
+            RemoteVideoEndpoint(it.profile.host, it.profile.videoPort, it.profile.clientCertificateSha256,
+                privateKey = { it.privateKey }, certificateChain = { it.certificateChain })
+        }
+        mutableState.update { it.copy(remoteProfile = identity?.profile, remoteProfileError = null) }
+    }
+
+    fun importRemoteConfiguration(uri: Uri) {
+        if (!state.value.canManageConnectionMode || wifiDirect.mutationPending || wifiDirect.state.value.busy) return
+        mutableState.update { it.copy(busy = true, remoteProfileLoading = true, remoteProfileError = null) }
+        operation = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    val input = getApplication<Application>().contentResolver.openInputStream(uri)
+                        ?: throw IOException("无法打开连接配置")
+                    input.use { remoteCredentials.importProfile(it) }
+                }
+                reloadRemoteIdentity()
+                preferences.edit().putBoolean("remote_mode", true).apply()
+                mutableState.update { it.copy(remoteMode = true, status = "远程配置已导入，请连接开发板", error = null) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                Diagnostics.event("remote.import_failed", ownerDiagnostic,
+                    fields = mapOf("exceptionType" to failure.javaClass.simpleName), critical = true)
+                mutableState.update { it.copy(remoteProfileError = "远程配置导入失败，请使用有效的 .carremote 文件") }
+            } finally {
+                mutableState.update { it.copy(remoteProfileLoading = false, busy = false) }
+            }
+        }
+    }
 
     internal fun startPairing(address: String) {
         if (!state.value.canManagePairing || pairing.state.value.busy) return
@@ -345,8 +410,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connect(viaWifiDirect: Boolean = false) {
         val input = state.value
-        if (disconnecting || input.busy || input.pairingBusy || input.pairingUnconfirmed || input.connected || input.manualActive ||
+        if (disconnecting || input.busy || input.remoteProfileLoading || input.pairingBusy || input.pairingUnconfirmed || input.connected || input.manualActive ||
             input.followActive || input.followStopping || input.videoServiceBusy) return
+        if (input.remoteMode && (viaWifiDirect || input.remoteProfile == null || input.remoteProfileError != null)) {
+            mutableState.update { it.copy(error = "请先导入有效的远程连接配置，并选择远程连接模式") }
+            return
+        }
         val wireless = wifiDirect.state.value
         if (wifiDirect.mutationPending || wireless.confirmationRequired || (viaWifiDirect && (wireless.busy || wireless.discovering))) {
             mutableState.update { it.copy(error = if (wireless.confirmationRequired) "上次无线操作结果未确认，请点击刷新无线状态后再连接 SSH。"
@@ -358,9 +427,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             mutableState.update { it.copy(error = "请先创建手机 GO 无线组，等待开发板加入，再使用当前组内的开发板 IP；不能使用手机地址或原局域网地址。") }
             return
         }
-        val host = input.host.trim()
+        val host = input.connectionHost.trim()
         val username = input.username.trim()
-        val port = input.port.toIntOrNull()
+        val port = input.connectionPort.toIntOrNull()
         if (host.isBlank() || host.any(Char::isWhitespace) || username.isBlank() ||
             port == null || port !in 1..65535 || input.password.isEmpty()
         ) {
@@ -368,7 +437,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val diagnostic = Diagnostics.newContext()
-        val pairedAddress = input.host.trim().takeIf { !viaWifiDirect && pairing.state.value.hotspotActive &&
+        val pairedAddress = input.host.trim().takeIf { !input.remoteMode && !viaWifiDirect && pairing.state.value.hotspotActive &&
             pairing.state.value.boardIp == it && !pairing.state.value.confirmationRequired }
         hotspotConnectionAddress = pairedAddress
         connectingHotspot = pairedAddress != null
@@ -376,9 +445,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         connectingDirect = directGroup != null
         Diagnostics.protectSecret(input.password)
         Diagnostics.event("connection.requested", diagnostic, source = "USER_CONNECT",
-            fields = mapOf("host" to host, "port" to port))
+            fields = mapOf("host" to host, "port" to port, "mode" to if (input.remoteMode) "REMOTE" else "LOCAL"))
         mutableState.update {
-            it.copy(host = host, username = username, busy = true, error = null, result = null,
+            it.copy(host = if (input.remoteMode) it.host else host, username = username, busy = true, error = null, result = null,
                 followConfiguration = null, followConfigurationError = null, status = "正在连接…",
                 videoServiceState = VideoServiceState.UNKNOWN, videoServiceError = null)
         }
@@ -386,6 +455,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             var connectionAttempts = 1
             var sshEstablished = false
             try {
+                val remoteTls = if (input.remoteMode) withContext(Dispatchers.IO) {
+                    remoteCredentials.createTlsConfig()
+                } else null
                 withInitialConnectionRetry(onRetry = { attempt ->
                     connectionAttempts = attempt
                     Diagnostics.event("connection.retry", diagnostic, fields = mapOf("attempt" to attempt))
@@ -393,13 +465,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }) {
                     ensureDirectConnectionGroup(directGroup)
                     ensurePairingNetwork(pairedAddress)
-                    client.connect(BoardConnection(host, port, username, input.password), diagnostic)
+                    client.connect(BoardConnection(host, port, username, input.password, tls = remoteTls), diagnostic)
                     ensureDirectConnectionGroup(directGroup)
                     ensurePairingNetwork(pairedAddress)
                 }
                 sshEstablished = true
-                preferences.edit().putString("host", host).putString("port", port.toString())
-                    .putString("username", username).apply()
+                preferences.edit().apply {
+                    if (!input.remoteMode) putString("host", host).putString("port", port.toString())
+                    putString("username", username)
+                }.apply()
                 credentialPreferences.edit().putString("password", input.password).apply()
                 mutableState.update { it.copy(connected = true, status = "正在读取开发板信息…") }
                 val result = client.execute(BOARD_STATUS_COMMAND, kind = "board_status", diagnostic = diagnostic)
@@ -750,6 +824,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 driveDiagnostic = activeChannel.diagnosticContext
                 Diagnostics.event("drive.ready", driveDiagnostic, fields = mapOf("dryRun" to activeChannel.ready.dryRun))
                 if (stopRequest == null) {
+                    // READY may have spent time in the network. Confirm a current stopped
+                    // request before enabling input; the existing ACK/watchdog deadlines apply.
+                    mutableState.update { it.copy(driveStatus = "正在确认停车回执…") }
+                    val initialAck = activeChannel.exchange(0, 0)
+                    check(initialAck.stopped) { "初始停车回执未确认" }
+                    Diagnostics.event("drive.initial_stop_acknowledged", driveDiagnostic, critical = true)
+                }
+                // A stop arriving during the first ACK must keep input locked.
+                if (stopRequest == null) {
                     mutableState.update {
                         it.copy(driveStarting = false, driveEnabled = true, driveConfirmedStopped = true,
                             drivePort = activeChannel.ready.port,
@@ -806,9 +889,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             } catch (failure: Exception) {
                 val first = Diagnostics.failure(driveDiagnostic, "drive.failed", failure)
                 mutableState.update {
-                    it.copy(driveStatus = "手动控制已停用", driveConfirmedStopped = false, driveFirstFailure = first,
+                    it.withTransportState(client.isConnected).copy(driveStatus = "手动控制已停用", driveConfirmedStopped = false, driveFirstFailure = first,
                         parkingStatus = "驻车状态未确认，请重新启用手动控制",
-                        driveError = "控制连接已中止：${failure.message.orEmpty().take(220)}。请检查小车后重新启用。")
+                        driveError = if (it.remoteMode && failure.message.orEmpty().contains("watchdog", ignoreCase = true))
+                            "远程指令未能在停车保护期限内到达，手动控制已退出。请检查网络延迟后重新启用。"
+                        else "控制连接已中止：${failure.message.orEmpty().take(220)}。请检查小车后重新启用。")
                 }
             } finally {
                 channel?.close("drive_cleanup")
@@ -820,7 +905,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 mutableState.update { it.copy(driveStarting = false, driveEnabled = false,
                     driveStopping = true, driveLeft = 0, driveRight = 0) }
                 withContext(NonCancellable) {
-                    try { changeVideoService(false, driveDiagnostic) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
+                    if (client.isConnected) {
+                        try { changeVideoService(false, driveDiagnostic) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
+                    }
                 }
                 mutableState.update {
                     it.withTransportState(client.isConnected).copy(driveStarting = false, driveEnabled = false, driveStopping = false,
@@ -1183,15 +1270,20 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         val message = generateSequence(failure as Throwable?) { it.cause }.take(8)
             .joinToString(" ") { it.message.orEmpty() }
         return when {
+            generateSequence(failure as Throwable?) { it.cause }.take(8).any { it is javax.net.ssl.SSLException } ->
+                "远程加密连接失败，请检查设备凭据、服务器证书和设备时间；连接未放行。"
             message.contains("Auth fail", true) -> "登录失败，请检查用户名和密码。"
             message.contains("hostkey", true) || message.contains("host key", true) ->
                 "开发板身份校验失败。当前 App 只信任已配置的开发板；重装系统后需要更新主机公钥。"
             failure is SocketTimeoutException || message.contains("timeout", true) || message.contains("timed out", true) ->
-                if (connecting) "连接开发板超时（已尝试 $attempts 次）。请确认手机与开发板网络互通，IP 地址和端口正确。"
-                else "连接或命令超时，连接已断开。请检查 Wi-Fi；板上已启动的程序可能仍在运行。"
-            message.contains("refused", true) -> "开发板拒绝连接，请检查 SSH 服务和端口。"
+                if (connecting && state.value.remoteMode) "远程连接超时（已尝试 $attempts 次）。请检查两端网络和服务器中转服务。"
+                else if (connecting) "连接开发板超时（已尝试 $attempts 次）。请确认手机与开发板网络互通，IP 地址和端口正确。"
+                else "连接或命令超时，连接已断开。请检查网络；板上已启动的程序可能仍在运行。"
+            message.contains("refused", true) -> if (state.value.remoteMode)
+                "远程入口拒绝连接，请检查中转服务和小车 SSH 服务。" else "开发板拒绝连接，请检查 SSH 服务和端口。"
             message.contains("unreachable", true) || message.contains("resolve", true) ->
-                "无法访问开发板，请检查 IP 地址与手机 Wi-Fi。"
+                if (state.value.remoteMode) "无法访问远程服务器，请检查域名和手机网络。"
+                else "无法访问开发板，请检查 IP 地址与手机 Wi-Fi。"
             else -> "操作失败：${message.ifBlank { failure.javaClass.simpleName }.take(350)}"
         }
     }

@@ -41,7 +41,7 @@ class BoardDriveChannel private constructor(
     private val input: InputStream,
     private val output: OutputStream,
     private val stderr: BoundedOutputStream,
-    private val abortTransport: () -> Unit,
+    private val abortTransport: (reason: String, diagnostic: DiagnosticContext) -> Unit,
     val diagnosticContext: DiagnosticContext,
 ) {
     private val transaction = Mutex()
@@ -94,14 +94,15 @@ class BoardDriveChannel private constructor(
     }
 
     /** Nonblocking for UI/lifecycle callers. EOF or the board watchdog stops the motors. */
-    fun close(reason: String = "requested") {
+    fun close(reason: String = "requested", invalidateTransport: Boolean = false) {
         if (!closed.compareAndSet(false, true)) return
+        val abort = invalidateTransport || blockingIo.get()
         Diagnostics.event("drive.channel_close", diagnosticContext, source = reason,
-            fields = diagnosticFields() + mapOf("closeScope" to if (blockingIo.get()) "transport" else "channel"),
+            fields = diagnosticFields() + mapOf("closeScope" to if (abort) "transport" else "channel"),
             critical = true)
         // Explicitly interrupt a network write if one is in flight. A partially sent control
         // command must not be retried on this transport.
-        if (blockingIo.get()) abortTransport()
+        if (abort) abortTransport("drive_$reason", diagnosticContext)
         cleanup.execute {
             runCatching { channel.disconnect() }
             runCatching { input.close() }
@@ -189,7 +190,8 @@ class BoardDriveChannel private constructor(
                 Diagnostics.failure(diagnosticContext, "drive.ack_timeout", failure,
                     diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started),
                         "leftRpm" to left, "rightRpm" to right))
-                close("ack_timeout")
+                // A completed write does not prove that a blackholed SSH connection is alive.
+                close("ack_timeout", invalidateTransport = true)
                 throw failure
             } catch (failure: Exception) {
                 val safeFailure = protocolDiagnosticFailure(failure)
@@ -255,8 +257,7 @@ class BoardDriveChannel private constructor(
                 Diagnostics.event("drive.blocking_io_cancelled", diagnosticContext,
                     fields = diagnosticFields() + mapOf("causeClass" to cause?.javaClass?.name,
                         "closeScope" to "transport"), critical = true)
-                abortTransport()
-                close("blocking_io_cancelled")
+                close("blocking_io_cancelled", invalidateTransport = true)
             }
             blockingIo.set(true)
             try {
@@ -319,7 +320,8 @@ class BoardDriveChannel private constructor(
         }
 
         suspend fun open(
-            session: Session, dryRun: Boolean, diagnostic: DiagnosticContext, abortTransport: () -> Unit,
+            session: Session, dryRun: Boolean, diagnostic: DiagnosticContext,
+            abortTransport: (reason: String, diagnostic: DiagnosticContext) -> Unit,
         ): BoardDriveChannel =
             withContext(Dispatchers.IO) {
                 val started = System.nanoTime()
@@ -370,7 +372,7 @@ class BoardDriveChannel private constructor(
                     Diagnostics.failure(diagnostic, "drive.open_timeout", failure,
                         (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
                             mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to START_TIMEOUT_MS))
-                    opened?.close("open_timeout")
+                    opened?.close("ready_timeout", invalidateTransport = true)
                     throw failure
                 } catch (failure: Exception) {
                     val safeFailure = protocolDiagnosticFailure(failure)

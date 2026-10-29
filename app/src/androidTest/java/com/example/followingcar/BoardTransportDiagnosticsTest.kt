@@ -264,7 +264,7 @@ class BoardTransportDiagnosticsTest {
             val constructor = BoardDriveChannel::class.java.declaredConstructors.single { it.parameterCount == 6 }
                 .apply { isAccessible = true }
             val aborts = AtomicInteger()
-            val abort: () -> Unit = { aborts.incrementAndGet() }
+            val abort: (String, DiagnosticContext) -> Unit = { _, _ -> aborts.incrementAndGet() }
             val channel = constructor.newInstance(FakeChannel(), ByteArrayInputStream(response.toByteArray()),
                 output, BoundedOutputStream(4096), abort, context) as BoardDriveChannel
             BoardDriveChannel::class.java.getDeclaredField("token").apply { isAccessible = true }
@@ -341,6 +341,80 @@ class BoardTransportDiagnosticsTest {
             client.disconnect("test_cleanup", context)
             socket.close()
         }
+    }
+
+    @Test fun missingDriveAckInvalidatesTransportImmediatelyWithoutChangingDeadline() = runBlocking {
+        val context = testContext()
+        val client = BoardSshClient()
+        val socket = Socket()
+        attachConnection(client, DiagnosticTestSession(ReadyChannel(driveReady())), socket, context)
+        try {
+            val control = client.openDriveChannel(dryRun = true, diagnostic = context)
+            assertEquals(600, control.ready.watchdogMs)
+            val started = System.nanoTime()
+            assertTrue(runCatching { control.exchange(0, 0) }.exceptionOrNull() is SocketTimeoutException)
+            assertTrue("Original 900 ms deadline must remain bounded", elapsedMillis(started) < 1800)
+            assertFalse(client.isConnected)
+            assertTrue(socket.isClosed)
+            val records = events(context)
+            assertEquals("drive_ack_timeout", record(records, "ssh.transport_abort").getString("source"))
+            assertEquals("transport", record(records, "drive.channel_close").getJSONObject("fields").getString("closeScope"))
+            assertEquals("drive.ack_timeout", testEngine.snapshot().failures.single().event)
+        } finally { client.disconnect("test_cleanup", context); socket.close() }
+    }
+
+    @Test fun missingDriveReadyInvalidatesTransportWithoutSendingControl() = runBlocking {
+        val context = testContext()
+        val client = BoardSshClient()
+        val socket = Socket()
+        val silent = ReadyChannel("")
+        attachConnection(client, DiagnosticTestSession(silent), socket, context)
+        try {
+            assertTrue(runCatching { client.openDriveChannel(dryRun = true, diagnostic = context) }
+                .exceptionOrNull() is SocketTimeoutException)
+            assertFalse(client.isConnected)
+            assertTrue(socket.isClosed)
+            assertEquals(0, silent.sent.size())
+            assertEquals("drive_ready_timeout", record(events(context), "ssh.transport_abort").getString("source"))
+        } finally { client.disconnect("test_cleanup", context); socket.close() }
+    }
+
+    @Test fun timeoutFromOldDriveChannelCannotCloseReplacementConnection() = runBlocking {
+        val oldContext = testContext()
+        val newContext = testContext()
+        val client = BoardSshClient()
+        val oldSocket = Socket()
+        val newSocket = Socket()
+        attachConnection(client, DiagnosticTestSession(ReadyChannel(driveReady())), oldSocket, oldContext)
+        try {
+            val oldControl = client.openDriveChannel(dryRun = true, diagnostic = oldContext)
+            attachConnection(client, DiagnosticTestSession(ReadyChannel("")), newSocket, newContext)
+            assertTrue(runCatching { oldControl.exchange(0, 0) }.exceptionOrNull() is SocketTimeoutException)
+            assertTrue(oldSocket.isClosed)
+            assertFalse(newSocket.isClosed)
+            assertTrue(client.isConnected)
+            assertEquals(newContext.connectionId, client.diagnosticConnectionId)
+            assertFalse(record(events(oldContext), "ssh.transport_abort").getJSONObject("fields")
+                .getBoolean("currentConnectionDetached"))
+        } finally { client.disconnect("test_cleanup", newContext); oldSocket.close(); newSocket.close() }
+    }
+
+    @Test fun driveChannelEofKeepsOtherSshChannelsUsable() = runBlocking {
+        val context = testContext()
+        val client = BoardSshClient()
+        val socket = Socket()
+        val fake = ReadyChannel(driveReady())
+        attachConnection(client, DiagnosticTestSession(fake), socket, context)
+        try {
+            val control = client.openDriveChannel(dryRun = true, diagnostic = context)
+            fake.eof = true
+            assertTrue(runCatching { control.exchange(0, 0) }.exceptionOrNull() is IOException)
+            assertTrue(client.isConnected)
+            assertFalse(socket.isClosed)
+            val records = events(context)
+            assertEquals("channel", record(records, "drive.channel_close").getJSONObject("fields").getString("closeScope"))
+            assertFalse(records.any { it.optString("event") == "ssh.transport_abort" })
+        } finally { client.disconnect("test_cleanup", context); socket.close() }
     }
 
     @Test fun missingReadyInvalidatesTransportWithoutSendingStart() = runBlocking {
@@ -476,6 +550,10 @@ class BoardTransportDiagnosticsTest {
             .put("avoidance", "off").put("reverseEnabled", false)
             .put("reverseDistanceM", JSONObject.NULL)).toString() + "\n"
 
+    private fun driveReady(): String = JSONObject().put("type", "ready").put("token", "1".repeat(32))
+        .put("dryRun", true).put("port", "synthetic-test").put("watchdogMs", 600).put("maxRpm", 60)
+        .toString() + "\n"
+
     private fun events(context: DiagnosticContext): List<JSONObject> = testEngine.snapshot().events
         .map(::JSONObject).filter { it.optString("operationId") == context.operationId }
 
@@ -506,12 +584,13 @@ class BoardTransportDiagnosticsTest {
         val sent = ByteArrayOutputStream()
         @Volatile private var connected = false
         @Volatile private var disconnected = false
+        @Volatile var eof = false
         override fun connect(timeout: Int) { connected = true }
         override fun getInputStream(): InputStream = replies
         override fun getOutputStream(): OutputStream = sent
         override fun isConnected(): Boolean = connected && !disconnected
         override fun isClosed(): Boolean = disconnected
-        override fun isEOF(): Boolean = false
+        override fun isEOF(): Boolean = eof
         override fun disconnect() { disconnected = true }
     }
 }

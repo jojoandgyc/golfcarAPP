@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 7
-        versionName = "1.6-motor-config"
+        versionCode = 8
+        versionName = "1.7-remote-relay"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
