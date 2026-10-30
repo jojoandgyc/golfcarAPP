@@ -9,7 +9,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 
 enum class PairingStage {
     IDLE, DISCOVERING, PAIRING_BLUETOOTH, CONNECTING_BLUETOOTH, CHECKING_BOARD,
-    STARTING_HOTSPOT, SENDING_CREDENTIALS, WAITING_NETWORK, VERIFYING_NETWORK, PAIRED, UNKNOWN, ERROR,
+    STARTING_HOTSPOT, SENDING_CREDENTIALS, WAITING_NETWORK, VERIFYING_NETWORK, RECOVERING, PAIRED, UNKNOWN, ERROR,
 }
 
 data class PairingDevice(val name: String, val address: String, val bonded: Boolean) {
@@ -22,6 +22,7 @@ data class PairingState(
     val permissionGranted: Boolean = false,
     val bluetoothEnabled: Boolean = false,
     val busy: Boolean = false,
+    val recoveryLoading: Boolean = false,
     val stage: PairingStage = PairingStage.IDLE,
     val devices: List<PairingDevice> = emptyList(),
     val selectedAddress: String = DEFAULT_PAIRING_BOARD_ADDRESS,
@@ -30,6 +31,7 @@ data class PairingState(
     val confirmationRequired: Boolean = false,
     val status: String = "一键连接蓝牙并为开发板配置手机热点",
     val error: String? = null,
+    val firstError: String? = null,
 ) {
     override fun toString() = "PairingState(stage=$stage, busy=$busy, hotspotActive=$hotspotActive, " +
         "confirmationRequired=$confirmationRequired, deviceCount=${devices.size})"
@@ -85,6 +87,7 @@ internal fun pairingFailureMessage(code: String, stage: PairingStage, ioPhase: P
 }
 
 internal fun pairingRequestAllowed(state: PairingState, canMutate: Boolean): String? = when {
+    state.recoveryLoading -> "正在读取上次配网记录…"
     !canMutate -> "请先结束控制并断开 SSH，再配对网络。"
     state.busy -> "配对正在处理中。"
     !state.supported -> "此设备不支持蓝牙配对。"
@@ -143,7 +146,9 @@ internal fun pairingBoardErrorCode(value: Any?): String = when (value) {
     "join_requires_root", "wifi_not_ready_for_switch", "activation_not_confirmed",
     "network_address_unconfirmed", "unsafe_pairing_state", "pairing_state_unreadable",
     "invalid_hotspot_ssid", "invalid_wpa2_psk", "hotspot_not_visible_2g", "hotspot_unavailable",
-    "outcome_unknown_after_restart", "network_restored", "internal_error", "join_failed" -> value as String
+    "outcome_unknown_after_restart", "network_restored", "network_superseded", "hotspot_disconnected",
+    "recovery_pending", "request_expired",
+    "current_network_unconfirmed", "internal_error", "join_failed" -> value as String
     else -> "board_failed"
 }
 
@@ -180,13 +185,30 @@ internal fun pairingErrorMessage(code: String): String = when (code) {
         "开发板未能使用该热点；本开发板仅支持 2.4 GHz，请检查热点频段。"
     "hotspot_incompatible" -> "系统当前的热点或 Wi-Fi Direct 与配对热点冲突，请先关闭后重试。"
     "hotspot_denied" -> "手机系统不允许创建配对热点。"
+    "hotspot_timeout" -> "手机热点启动超时，尚未发送配网配置；请检查系统热点或 Wi-Fi Direct 是否冲突。"
     "hotspot_stopped" -> "手机配对热点已停止，连接已失效。"
     "address_unverified" -> "开发板已返回地址，但无法确认属于手机热点；尚未连接 SSH。"
     "request_not_found" -> "开发板没有该次配网的确认记录，请检查现场网络。"
     "provisioning_pending" -> "开发板仍在连接热点，请稍后再次查询结果。"
     "network_address_unconfirmed" -> "开发板网络变更尚未确认，请查询结果或检查板端。"
-    "network_restored" -> "开发板已恢复原网络，可以关闭配对热点后重新配对。"
+    "current_network_unconfirmed" -> "旧热点连接暂时无法确认，需要核对开发板当前网络。"
+    "network_restored" -> "开发板已恢复原网络，旧事务已解除，可以重新一键配对。"
+    "network_superseded" -> "旧配对连接已失效，小车已接入其他网络；旧事务已解除，可以重新一键配对。"
+    "recovery_pending" -> "小车还有待确认的配网事务，请恢复并核对上次连接。"
+    "request_expired" -> "上次配网请求已失效，已核实小车没有未结束的配网操作，可以重新一键配对。"
+    "hotspot_disconnected" -> "旧热点已断开，已核实小车没有正在进行的无线连接；可以重新一键配对。"
+    "recovery_unavailable" -> "暂时无法核实旧配网记录。请确认小车已开机、控制空闲且有正常网络，然后恢复连接。"
+    "recovery_timeout" -> "自动核对已超时，已保留恢复记录。确认小车开机后点击恢复连接，不会重复切网。"
+    "recovery_storage_failed" -> "无法可靠保存配网恢复记录，已停止发送配置。请检查手机存储，然后点击恢复并核对连接。"
     "cancelled" -> "配对已取消。"
     "state_changed" -> "控制或连接状态已变化，配对已停止。"
     else -> "配对未完成（$code）。"
 }
+
+internal fun isPairingRequestId(value: String): Boolean = runCatching {
+    java.util.UUID.fromString(value).toString() == value
+}.getOrDefault(false)
+
+/** Used only after a definitive negative result, never on an unverified error string alone. */
+internal fun pairingLeaseExpired(code: String) = code in setOf(
+    "network_restored", "network_superseded", "hotspot_disconnected", "request_expired")

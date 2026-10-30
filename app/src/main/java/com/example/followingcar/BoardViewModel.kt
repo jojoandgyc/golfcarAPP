@@ -116,6 +116,12 @@ data class BoardUiState(
             !followBlocksControl && !motorActionUnconfirmed
 }
 
+/** Applies a controller-verified local lease without enabling or restarting any control mode. */
+internal fun BoardUiState.withVerifiedPairingNetwork(address: String): BoardUiState = copy(
+    host = address, remoteMode = false, pairingBusy = false, pairingUnconfirmed = false,
+    pairingHotspotActive = true, error = null,
+)
+
 class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("board_connection", 0)
     private val credentialPreferences = application.getSharedPreferences("board_credentials", 0)
@@ -168,8 +174,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 // The controller has checked the Bluetooth result against the phone's real AP subnet.
                 if (state.value.canManagePairing && !wifiDirect.mutationPending && pairing.state.value.hotspotActive &&
                     !pairing.state.value.confirmationRequired && pairing.state.value.boardIp == address) {
-                    mutableState.update { it.copy(host = address, pairingBusy = false,
-                        pairingUnconfirmed = false, pairingHotspotActive = true, error = null) }
+                    // Pairing creates a local link. A previously selected remote profile must not
+                    // redirect this automatic SSH connection through the overseas server.
+                    mutableState.update { it.withVerifiedPairingNetwork(address) }
+                    preferences.edit().putBoolean("remote_mode", false).apply()
                     connect()
                 }
             },
@@ -473,7 +481,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         directConnectionGroup = directGroup
         connectingDirect = directGroup != null
         Diagnostics.protectSecret(input.password)
-        Diagnostics.event("connection.requested", diagnostic, source = "USER_CONNECT",
+        Diagnostics.event("connection.requested", diagnostic,
+            source = if (pairedAddress != null) "PAIRING_CONNECT" else "USER_CONNECT",
             fields = mapOf("host" to host, "port" to port, "mode" to if (input.remoteMode) "REMOTE" else "LOCAL"))
         mutableState.update {
             it.copy(host = if (input.remoteMode) it.host else host, username = username, busy = true, error = null, result = null,
@@ -487,10 +496,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 val remoteTls = if (input.remoteMode) withContext(Dispatchers.IO) {
                     remoteCredentials.createTlsConfig()
                 } else null
-                withInitialConnectionRetry(onRetry = { attempt ->
+                // DHCP confirmation can precede reachability/SSH readiness. Retry connection
+                // establishment only; never repeat a remote command or resume driving.
+                val retryDelays = if (pairedAddress != null) listOf(750L, 1_500L) else listOf(300L)
+                withInitialConnectionRetry(retryDelaysMillis = retryDelays, onRetry = { attempt ->
                     connectionAttempts = attempt
-                    Diagnostics.event("connection.retry", diagnostic, fields = mapOf("attempt" to attempt))
-                    mutableState.update { it.copy(status = "正在重新连接（$attempt/2）…") }
+                    Diagnostics.event("connection.retry", diagnostic, fields = mapOf("attempt" to attempt,
+                        "maxAttempts" to retryDelays.size + 1, "pairedHotspot" to (pairedAddress != null)))
+                    mutableState.update { it.copy(status = "正在重新连接（$attempt/${retryDelays.size + 1}）…") }
                 }) {
                     ensureDirectConnectionGroup(directGroup)
                     ensurePairingNetwork(pairedAddress)
@@ -526,7 +539,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) { client.disconnect("connection_failed", diagnostic) }
                 mutableState.update {
                     it.withTransportState(false).copy(status = "连接失败",
-                        error = describeFailure(failure, connecting = !sshEstablished, attempts = connectionAttempts))
+                        error = describeFailure(failure, connecting = !sshEstablished, attempts = connectionAttempts) +
+                            if (pairedAddress != null && pairing.state.value.hotspotActive)
+                                " 热点已保留，可在配对卡片中核对并重新连接。" else "")
                 }
             } finally {
                 connectingDirect = false

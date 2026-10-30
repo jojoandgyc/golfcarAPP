@@ -2,12 +2,15 @@
 Description=FollowingCar Bluetooth hotspot provisioning
 After=bluetooth.service NetworkManager.service
 Requires=bluetooth.service NetworkManager.service
+PartOf=bluetooth.service
 ConditionPathExists=/etc/followingcar-pairing.json
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -B /opt/followingcar-pairing/app_bluetooth_provision.py
-Restart=on-failure
+# BlueZ can release a registered profile with a clean daemon exit. Restart that
+# case as well; an explicit systemctl stop still keeps this service stopped.
+Restart=always
 RestartSec=5
 TimeoutStopSec=180
 KillMode=mixed

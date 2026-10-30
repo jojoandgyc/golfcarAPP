@@ -6,6 +6,7 @@ import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.runtime.mutableStateOf
 import com.example.followingcar.ui.theme.FollowingCarTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -85,5 +86,102 @@ class PairingCardTest {
         compose.onNodeWithTag("pairingNetwork").assertTextEquals("上次确认的小车地址 192.168.45.20")
         compose.onNodeWithTag("reconnectPairedBoard").performClick()
         assertEquals(1, checks)
+    }
+
+    @Test fun recoveryLoadingShowsProgressWithoutAnyNewNetworkAction() {
+        compose.setContent { FollowingCarTheme {
+            PairingCard(PairingState(recoveryLoading = true), true, false, {}, {}, {}, {},
+                onCheckBluetooth = {})
+        } }
+        compose.onNodeWithTag("pairingProgress").assertExists()
+        listOf("startPairing", "checkBluetooth", "pairingAdvanced", "checkPairing",
+            "stopPairingHotspot", "cancelPairing").forEach {
+            compose.onNodeWithTag(it).assertDoesNotExist()
+        }
+    }
+
+    @Test fun loadingRecoveryAlsoHidesActionsForAnExistingInMemoryHotspot() {
+        compose.setContent { FollowingCarTheme {
+            PairingCard(PairingState(recoveryLoading = true, hotspotActive = true,
+                boardIp = "192.168.45.20"), true, false, {}, {}, {}, {})
+        } }
+        compose.onNodeWithTag("stopPairingHotspot").assertDoesNotExist()
+        compose.onNodeWithTag("reconnectPairedBoard").assertDoesNotExist()
+        compose.onNodeWithTag("startPairing").assertDoesNotExist()
+    }
+
+    @Test fun latestRecoveryErrorDoesNotReplaceTheFirstFailure() {
+        val state = mutableStateOf(PairingState(confirmationRequired = true,
+            error = "读取小车响应超时", firstError = "读取小车响应超时"))
+        compose.setContent { FollowingCarTheme {
+            PairingCard(state.value, true, false, {}, {}, {}, {})
+        } }
+        compose.onNodeWithTag("pairingError").assertTextEquals("读取小车响应超时")
+        compose.onNodeWithTag("pairingFirstError").assertDoesNotExist()
+
+        compose.runOnIdle { state.value = state.value.copy(error = "正在等待小车重新上线") }
+        compose.onNodeWithTag("pairingError").assertTextEquals("正在等待小车重新上线")
+        compose.onNodeWithTag("pairingFirstError").assertTextEquals("首次异常：读取小车响应超时")
+    }
+
+    @Test fun automaticRecoveryOffersCancelWithoutConcurrentQueryOrProvision() {
+        var cancellations = 0
+        compose.setContent { FollowingCarTheme {
+            PairingCard(PairingState(stage = PairingStage.RECOVERING, busy = true,
+                confirmationRequired = true, hotspotActive = true), false, false,
+                {}, { cancellations += 1 }, {}, {}, onCheckBluetooth = {})
+        } }
+        compose.onNodeWithTag("pairingProgress").assertExists()
+        compose.onNodeWithTag("cancelPairing").assertIsEnabled().performClick()
+        assertEquals(1, cancellations)
+        listOf("checkPairing", "startPairing", "stopPairingHotspot", "checkBluetooth", "pairingAdvanced").forEach {
+            compose.onNodeWithTag(it).assertDoesNotExist()
+        }
+    }
+
+    @Test fun unknownResultAfterHotspotLossCannotChangeThePendingBoard() {
+        val state = mutableStateOf(PairingState(supported = true))
+        var checks = 0
+        var provisions = 0
+        compose.setContent { FollowingCarTheme {
+            PairingCard(state.value, true, false, { provisions += 1 }, {}, { checks += 1 }, {},
+                onCheckBluetooth = {})
+        } }
+        compose.onNodeWithTag("pairingAdvanced").performClick()
+        compose.onNodeWithTag("pairingBoardAddress").assertExists()
+
+        compose.runOnIdle {
+            state.value = state.value.copy(stage = PairingStage.UNKNOWN, confirmationRequired = true,
+                hotspotActive = false)
+        }
+        compose.onNodeWithTag("pairingAdvanced").assertDoesNotExist()
+        compose.onNodeWithTag("pairingBoardAddress").assertDoesNotExist()
+        compose.onNodeWithTag("startPairing").assertDoesNotExist()
+        compose.onNodeWithTag("checkBluetooth").assertDoesNotExist()
+        compose.onNodeWithTag("checkPairing").assertIsEnabled().performClick()
+        assertEquals(1, checks)
+        assertEquals(0, provisions)
+    }
+
+    @Test fun anUnknownRequestCannotBeCheckedDuringCompetingControl() {
+        compose.setContent { FollowingCarTheme {
+            PairingCard(PairingState(confirmationRequired = true), false, false, {}, {}, {}, {})
+        } }
+        compose.onNodeWithTag("checkPairing").assertIsNotEnabled()
+        compose.onNodeWithTag("pairingAdvanced").assertDoesNotExist()
+        compose.onNodeWithTag("startPairing").assertDoesNotExist()
+    }
+
+    @Test fun restoredSelectedBoardIsUsedAfterTheOldRequestIsConfirmed() {
+        val state = mutableStateOf(PairingState(recoveryLoading = true))
+        var selected: String? = null
+        compose.setContent { FollowingCarTheme {
+            PairingCard(state.value, true, false, { selected = it }, {}, {}, {})
+        } }
+        compose.runOnIdle {
+            state.value = state.value.copy(recoveryLoading = false, selectedAddress = "12:34:56:78:90:AB")
+        }
+        compose.onNodeWithTag("startPairing").performClick()
+        assertEquals("12:34:56:78:90:AB", selected)
     }
 }

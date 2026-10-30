@@ -44,6 +44,8 @@ sudo /usr/bin/python3 -B /opt/followingcar-pairing/app_bluetooth_provision.py --
 
 回复 `type=status`，包含 `boardId`、`controlAvailable`、`band="2.4GHz"`、`operationInProgress` 和 `lastResult`。`lastResult` 仅返回所查询操作；没有对应记录时为 `null`，不会拿其他配对结果替代。
 
+2026-10-30 恢复增强保持 `v=1`，增加可选的 `recoveryRequestId` 及 `recoveryState=clear|pending|unavailable`。`clear` 只在控制空闲、没有活动/未知事务、当前 WLAN 确认为稳定的外部网络或严格稳定断开、旧自有热点不会自行回切且两次观察一致时给出。它仅允许解除旧恢复记录，不代表任何地址已通过 SSH 地址核验。查询不存在的 UUID 时，仅在上述证明成立后先保存 `request_expired` 确定失败记录，再返回；同 UUID 迟来的配网提交只返回既有结果。
+
 配网请求使用同样的 `v` 和 `requestId`，`cmd=provision`，额外字段只有 `ssid`、`psk`。服务按顺序回复 `type=progress,stage=accepted`、`stage=connecting`，最后回复 `type=result`。不回显热点名称或密码。
 
 成功结果包含 `ok=true`、`definitive=true`、`ip`、`gateway`、`prefixLength`。`gateway` 是 DHCP 报告的手机热点地址；本地热点未提供默认路由时，使用实际 DHCP server identifier。App 必须独立确认它与新建热点接口的本机地址和前缀一致，才把板端地址交给 SSH，不能仅相信远端提供的地址。
@@ -60,7 +62,15 @@ sudo /usr/bin/python3 -B /opt/followingcar-pairing/app_bluetooth_provision.py --
 
 服务不自动恢复原 Wi-Fi。恢复必须在控制空闲时明确执行，并核对先前 profile UUID。用户关闭热点或 App 进程退出可能使板端失去网络，现有控制心跳失效和停车处理继续生效；无线连接恢复不自动重新启动行驶。
 
-未知结果可以只读核实。App 再查询同一 `requestId` 时，服务仅使用请求编号完全匹配的私有网络事务记录；控制空闲且当前确为原 profile、已有 IPv4、本次新 profile 不再活动时，返回确定的 `network_restored` 失败。若当前确为本次新 profile、归属及热点地址均核实，则返回确定成功。其他请求的记录、控制忙、陌生 profile、缺地址或清理仍不明确，都不能解除未知状态。核实不重新执行配网，并保留原始固定错误码 `firstError`。
+未知结果可以只读核实。App 再查询同一 `requestId` 时，服务仅使用请求编号完全匹配的私有网络事务记录；控制空闲且当前确为原 profile、已有 IPv4、本次新 profile 不再活动时，返回确定的 `network_restored` 失败。若当前确为本次新 profile、归属及热点地址均核实，则返回确定成功。其他请求的记录、控制忙、网络身份或活动状态未核实、清理不明确，都不能解除未知状态。核实不重新执行配网，并保留原始固定错误码 `firstError`。
+
+当前已经接入另一个稳定网络时，不再强制要求其 UUID 与当初的原 profile 相同：服务核实控制空闲、当前 UUID 活动且有有效 IPv4、本次热点 UUID 不活动，旧 profile 已删除或仍归本服务且 `autoconnect=no`，再二次确认观察一致，返回 `network_superseded` 确定失败。该结果不把新网络当作手机热点，不切换、删除或改写当前网络。App 自动释放自己的失效热点并恢复入口；若用户本次明确点击“一键配对”，在核实旧事务结束后可以继续正常的新配网。
+
+手机进程退出后，若小车附近没有原 Wi-Fi，服务也可核实旧热点结束：必须是受管 `wlan0`、稳定 `state=30`、无当前 profile/IPv4、旧热点不活动且不会自动回切、控制及 worker 均空闲，并二次确认网络及活动集合一致，才返回 `hotspot_disconnected`。正在连接、正在断开、失败状态、残留地址或观察变化都不能代替这个证明。App 在没有实际热点 reservation 时不会拿历史成功地址连接 SSH，会等待板端核实旧热点断开。
+
+App 的最小恢复记录位于 `noBackupFilesDir/pairing-recovery/`，仅含目标蓝牙地址、规范 UUID、阶段、时间和固定首错码，不含 SSID、密码、IP 或命令内容。发送凭据前在独立 IO 线程原子提交；提交失败不发送。恢复加载期间不能新配网，已知未发送记录按 UUID 清理，损坏记录必须通过板端恢复证明核实。系统停止热点后仍保留待确认状态。蓝牙建链/只读查询最多三次（750/1500 ms 退避），凭据只发送一次，断线后最多 90 秒自动查询原事务。用户取消会立即关闭本次 socket，不清掉可能已执行的记录。
+
+同一已认证手机的新 RFCOMM 连接可以替换其旧连接；旧连接已排队但未接受的帧失效，已接受的 worker 不受 socket 断开影响。服务正常释放 BlueZ Profile 后由 systemd 自动重启；只关联蓝牙服务，不因 NetworkManager 变化重启正在进行的网络事务。SSH 自动连接强制使用刚核实的本地热点，保留原远程配置和 LAN 默认地址，不自动启动车辆。
 
 ## 验证
 

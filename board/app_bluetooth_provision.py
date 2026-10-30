@@ -184,8 +184,47 @@ def response(request_id, kind, **fields):
     return dict(v=1, requestId=request_id, type=kind, **fields)
 
 
+def unresolved_record(record):
+    return (record.get("type") != "result" or record.get("definitive") is not True
+            or type(record.get("ok")) is not bool)
+
+
+def disconnected_network(network):
+    # Only NetworkManager's settled DISCONNECTED state is evidence of a lost
+    # hotspot. PREPARE/CONFIG/IP_CONFIG/DEACTIVATING/FAILED are not equivalent.
+    return (network.get("interface") == "wlan0" and network.get("managed") is True
+            and network.get("state") == 30 and network.get("profileUuid") is None
+            and network.get("addresses") == [])
+
+
 class HotspotSystem(BoardSystem):
     """The same guarded NM transaction, with verified DHCP addresses for the App."""
+    def external_profile_confirmed(self, network):
+        profile_uuid = canonical_uuid(network.get("profileUuid"))
+        output = self.checked(["/usr/bin/nmcli", "-t", "--escape", "no", "-f",
+                               "connection.id,connection.uuid,connection.interface-name",
+                               "connection", "show", "uuid", profile_uuid])
+        fields = dict(line.split(":", 1) for line in output.splitlines() if ":" in line)
+        name = fields.get("connection.id")
+        return (set(fields) == {"connection.id", "connection.uuid", "connection.interface-name"}
+                and type(name) is str and bool(name) and name != "--"
+                and name == network.get("profileName") and not name.startswith("followingcar-direct-")
+                and fields.get("connection.uuid") == profile_uuid
+                # A NetworkManager profile may have no interface pin; the two
+                # actual wlan0 observations still bind its active UUID.
+                and fields.get("connection.interface-name") in ("wlan0", "", "--"))
+
+    def inactive_profile_safe(self, profile_uuid, ssid):
+        # An inactive profile that can automatically reconnect is not a settled
+        # expired lease. Read only; never disable or delete somebody's profile.
+        if profile_uuid not in self.profile_uuids():
+            return True
+        if not self.owns_profile(profile_uuid, ssid):
+            return False
+        enabled = self.checked(["/usr/bin/nmcli", "-g", "connection.autoconnect",
+                                "connection", "show", "uuid", profile_uuid]).strip()
+        return enabled == "no"
+
     def address_result(self, profile_uuid):
         network = self.network()
         if network["state"] != 100 or network["profileUuid"] != profile_uuid:
@@ -295,23 +334,99 @@ class Provisioner:
         with self.lock:
             self.state.put(record)
 
+    def remember_final(self, final):
+        """Disk failure must not strand an accepted request in progress in memory."""
+        try:
+            self.state.put(final)
+        except Exception:
+            # The durable accepted/connecting record remains crash-unknown on
+            # restart. Never let a failed final write hide what this worker knows.
+            final = dict(final, resultRecording="unavailable")
+            self.state.records = [row for row in self.state.records
+                                  if row["requestId"] != final["requestId"]]
+            self.state.records = (self.state.records + [final])[-MAX_HISTORY:]
+        return final
+
     def status(self, request):
         with self.lock:
-            active = self.active_id is not None
-            previous = self.state.get(request.get("queryRequestId", ""))
+            active = self.active_id is not None or self.worker is not None and self.worker.is_alive()
+            query_id = request.get("queryRequestId")
+            previous = self.state.get(query_id or "")
             if (not active and previous is not None
-                    and (previous.get("definitive") is False or previous.get("ok") is True)):
+                    and (unresolved_record(previous) or previous.get("ok") is True)):
                 previous = self.reconcile(previous)
-        available, error = False, None
-        if not active:
-            try:
-                with self.system.idle_guard():
-                    available = True
-            except Exception as failure:
-                error = code(failure)
-        return response(request["requestId"], "status", boardId=self.board_id,
-                        controlAvailable=available, band="2.4GHz", operationInProgress=active,
-                        lastResult=previous, error=error)
+            recovery_id = self.active_id or next((row["requestId"] for row in reversed(self.state.records)
+                if unresolved_record(row)), None)
+            available, error = False, None
+            recovery_state = "pending" if active or recovery_id else "unavailable"
+            if not active:
+                try:
+                    with self.system.idle_guard():
+                        available = True
+                        if recovery_id is None:
+                            recovery_state, recovery_id = self.recovery_observation()
+                        if query_id and previous is None and recovery_state == "clear":
+                            # A missing record is never enough to unlock. The
+                            # network proof and durable tombstone are one locked
+                            # decision; a late same-UUID provision cannot replay.
+                            expired = response(query_id, "result", ok=False, definitive=True,
+                                               error="request_expired", networkChanged=False)
+                            self.state.put(expired)
+                            previous = expired
+                except Exception as failure:
+                    recovery_state = "unavailable"
+                    error = code(failure)
+            result = response(request["requestId"], "status", boardId=self.board_id,
+                              controlAvailable=available, band="2.4GHz", operationInProgress=active,
+                              lastResult=previous, error=error, recoveryState=recovery_state)
+            if recovery_id is not None:
+                result["recoveryRequestId"] = recovery_id
+            return result
+
+    def recovery_observation(self):
+        """Called under both transaction and control locks; observations only."""
+        network = self.system.network()
+        disconnected = disconnected_network(network)
+        if not disconnected and (network.get("state") != 100 or not network.get("addresses")):
+            return "unavailable", None
+        current_uuid = None if disconnected else canonical_uuid(network.get("profileUuid"))
+        addresses = [ipaddress.IPv4Address(value) for value in network["addresses"]]
+        if any(int(address) < 0x01000000 or address.is_loopback or address.is_link_local
+               or address.is_multicast or int(address) >= 0xf0000000 for address in addresses):
+            return "unavailable", None
+        active = self.system.active_uuids()
+        if not disconnected and current_uuid not in active:
+            return "unavailable", None
+        try:
+            record = self.read_join_record()
+        except FileNotFoundError:
+            record = None  # Fresh installation with no transaction history.
+        recovery_id = None
+        if record is not None:
+            if (type(record) is not dict or record.get("schemaVersion") != 1
+                    or record.get("action") != "join" or record.get("method") != "bluetooth_hotspot"
+                    or record.get("interface") != "wlan0"):
+                return "unavailable", None
+            own_uuid = canonical_uuid(record.get("profileUuid"))
+            record_id = canonical_uuid(record.get("requestId"))
+            if own_uuid == current_uuid:
+                known = self.state.get(record_id)
+                if known is not None and (known.get("ok") is True or unresolved_record(known)):
+                    recovery_id = record_id
+                return "pending" if recovery_id else "unavailable", recovery_id
+            if (own_uuid in active or not self.system.inactive_profile_safe(own_uuid, record.get("requestedSsid"))):
+                return "unavailable", None
+        if not disconnected and not self.system.external_profile_confirmed(network):
+            return "unavailable", None
+        if not self.network_observation_unchanged(network, active):
+            return "unavailable", None
+        return "clear", None
+
+    def network_observation_unchanged(self, network, active):
+        again = self.system.network()
+        return (all(again.get(key) == network.get(key) for key in
+                    ("interface", "managed", "state", "profileUuid", "profileName", "addresses"))
+                and self.system.active_uuids() == active)
 
     def read_join_record(self):
         if hasattr(self.join_store, "read"):
@@ -346,6 +461,8 @@ class Provisioner:
                                 previouslySucceeded=True)
             if "firstError" in previous:
                 fallback["firstError"] = previous["firstError"]
+        if self.active_id is not None or self.worker is not None and self.worker.is_alive():
+            return fallback
         try:
             record = self.read_join_record()
             request_id = previous["requestId"]
@@ -354,18 +471,41 @@ class Provisioner:
                     or record.get("method") != "bluetooth_hotspot" or record.get("interface") != "wlan0"):
                 return fallback
             profile_uuid = canonical_uuid(record.get("profileUuid"))
-            prior_uuid = canonical_uuid(record.get("previousConnectionUuid"))
+            prior_value = record.get("previousConnectionUuid")
+            prior_uuid = canonical_uuid(prior_value) if prior_value is not None else None
             if profile_uuid == prior_uuid or type(record.get("requestedSsid")) is not str:
                 return fallback
             with self.system.idle_guard():
                 network = self.system.network()
-                if network["state"] != 100 or not network.get("addresses"):
+                disconnected = disconnected_network(network)
+                if not disconnected and (network["state"] != 100 or not network.get("addresses")):
+                    return fallback
+                current_uuid = None if disconnected else canonical_uuid(network.get("profileUuid"))
+                addresses = [ipaddress.IPv4Address(value) for value in network["addresses"]]
+                if any(int(address) < 0x01000000 or address.is_unspecified or address.is_loopback or address.is_link_local
+                       or address.is_multicast or int(address) >= 0xf0000000 for address in addresses):
                     return fallback
                 active_uuids = self.system.active_uuids()
-                if (network["profileUuid"] == prior_uuid and prior_uuid in active_uuids
-                        and profile_uuid not in active_uuids):
+                if disconnected:
+                    if (profile_uuid in active_uuids
+                            or not self.system.inactive_profile_safe(profile_uuid, record["requestedSsid"])
+                            or not self.network_observation_unchanged(network, active_uuids)):
+                        return fallback
                     final = response(request_id, "result", ok=False, definitive=True,
-                                     networkChanged=False, error="network_restored", reconciled=True)
+                                     networkChanged=False, error="hotspot_disconnected", reconciled=True)
+                # A reboot or a user's later network selection need not return
+                # to the exact former profile. A settled different connection
+                # proves this hotspot lease is no longer current, not that the
+                # new network belongs to the phone or is suitable for SSH.
+                elif (current_uuid != profile_uuid and current_uuid in active_uuids
+                        and profile_uuid not in active_uuids
+                        and self.system.inactive_profile_safe(profile_uuid, record["requestedSsid"])):
+                    if not self.network_observation_unchanged(network, active_uuids):
+                        return fallback
+                    final = response(request_id, "result", ok=False, definitive=True,
+                                     networkChanged=False,
+                                     error="network_restored" if current_uuid == prior_uuid else "network_superseded",
+                                     reconciled=True)
                 elif (network["profileUuid"] == profile_uuid and profile_uuid in active_uuids
                       and self.system.owns_profile(profile_uuid, record["requestedSsid"])):
                     final = response(request_id, "result", ok=True, definitive=True,
@@ -382,7 +522,7 @@ class Provisioner:
             # Busy/unknown, mismatched or unavailable observations cannot unlock.
             return fallback
 
-    def handle(self, request, emit):
+    def handle(self, request, emit, request_is_current=lambda: True):
         # The caller only passes parse_request output. Emission failure is never a
         # cancellation of an already accepted network operation.
         def safe_emit(value):
@@ -391,14 +531,18 @@ class Provisioner:
             except (OSError, RuntimeError):
                 pass
         if request["cmd"] == "status":
-            safe_emit(self.status(request))
+            with self.lock:
+                if request_is_current():
+                    safe_emit(self.status(request))
             return
         request_id = request["requestId"]
         credentials = validate_credentials(request["ssid"], request["psk"])
         with self.lock:
+            if not request_is_current():
+                return  # A replaced socket cannot submit its queued old frame.
             previous = self.state.get(request_id)
             if previous is not None:
-                if self.active_id is None and (previous.get("ok") is True or previous.get("definitive") is False):
+                if self.active_id is None and (previous.get("ok") is True or unresolved_record(previous)):
                     previous = self.reconcile(previous)
                 safe_emit(previous)
                 return
@@ -406,6 +550,17 @@ class Provisioner:
                 safe_emit(response(request_id, "result", ok=False, definitive=True,
                                    error="provisioning_busy", networkChanged=False))
                 return
+            # A restarted daemon has no worker, but that alone does not make an
+            # incomplete network operation safe to overwrite with a new UUID.
+            # Resolve the retained transaction read-only before accepting new
+            # credentials, preserving the only evidence needed for recovery.
+            for retained in list(self.state.records):
+                if unresolved_record(retained):
+                    if self.reconcile(retained).get("definitive") is not True:
+                        safe_emit(response(request_id, "result", ok=False, definitive=True,
+                                           error="recovery_pending", networkChanged=False,
+                                           recoveryRequestId=retained["requestId"]))
+                        return
             # Fast preflight rejects busy control before accepting credentials.
             try:
                 with self.system.idle_guard():
@@ -424,8 +579,7 @@ class Provisioner:
                 self.active_id = None
                 failed = response(request_id, "result", ok=False, definitive=True,
                                   error="worker_unavailable", networkChanged=False)
-                self.state.put(failed)
-                safe_emit(failed)
+                safe_emit(self.remember_final(failed))
 
     def _provision(self, request_id, credentials, emit):
         result = None
@@ -449,18 +603,12 @@ class Provisioner:
         finally:
             credentials = None
         with self.lock:
-            try:
-                self.state.put(final)
-            except Exception:
-                # The earlier accepted/connecting record survives a restart.
-                # Keep the definitive result in memory but disclose persistence loss.
-                final["resultRecording"] = "unavailable"
-                self.state.records = (self.state.records + [final])[-MAX_HISTORY:]
+            final = self.remember_final(final)
             self.active_id = None
         emit(final)
 
 
-def serve_socket(connection, provisioner, stop_event):
+def serve_socket(connection, provisioner, stop_event, is_current=lambda: True):
     """Bounded frames; disconnect does not cancel the independent accepted worker."""
     write_lock = threading.Lock()
     def emit(value):
@@ -474,7 +622,7 @@ def serve_socket(connection, provisioner, stop_event):
     frame_start = None
     idle_deadline = time.monotonic() + 180
     try:
-        while not stop_event.is_set():
+        while not stop_event.is_set() and is_current():
             now = time.monotonic()
             if now > idle_deadline or frame_start is not None and now - frame_start > 10:
                 break
@@ -500,7 +648,8 @@ def serve_socket(connection, provisioner, stop_event):
                     request = parse_request(raw)
                 except JoinError:
                     return  # No reflection of malformed/untrusted request text.
-                provisioner.handle(request, emit)
+                provisioner.handle(request, emit,
+                                   request_is_current=lambda: not stop_event.is_set() and is_current())
                 request = None
                 idle_deadline = time.monotonic() + 180
                 frame_start = time.monotonic() if pending else None
@@ -511,6 +660,47 @@ def serve_socket(connection, provisioner, stop_event):
     finally:
         pending.clear()
         connection.close()
+
+
+class ProvisioningConnections:
+    """One authenticated owner, with same-phone stale-socket replacement."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.connections = {}
+
+    @staticmethod
+    def shutdown(connection):
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def accept(self, device, connection):
+        with self.lock:
+            if any(owner != device for owner in self.connections.values()):
+                raise JoinError("provisioning_connection_busy")
+            previous = list(self.connections)
+            self.connections.clear()
+            self.connections[connection] = device
+        # An already accepted operation belongs to the Provisioner, not the
+        # socket. Superseding an idle/stale link cannot cancel or repeat it.
+        for old_connection in previous:
+            self.shutdown(old_connection)
+
+    def discard(self, connection):
+        with self.lock:
+            self.connections.pop(connection, None)
+
+    def is_current(self, connection):
+        with self.lock:
+            return connection in self.connections
+
+    def close(self, device=None):
+        with self.lock:
+            connections = [connection for connection, owner in self.connections.items()
+                           if device is None or owner == device]
+        for connection in connections:
+            self.shutdown(connection)
 
 
 def load_config(path):
@@ -541,8 +731,7 @@ def run_daemon(config, enrollment_seconds=0):
     loop, stopped = GLib.MainLoop(), threading.Event()
     provisioner = Provisioner(config["boardId"])
     allowed = set(config["allowedDevices"])
-    connections = set()
-    connection_lock = threading.Lock()
+    connections = ProvisioningConnections()
     enrollment_until = time.monotonic() + enrollment_seconds
     page_scan = PageScanLease()
     # Also covers startup failures before entering GLib's main loop. Existing
@@ -572,22 +761,28 @@ def run_daemon(config, enrollment_seconds=0):
             # being generally trusted by a desktop session is not sufficient.
             if stopped.is_set() or not permitted(device):
                 raise Rejected("Device not enrolled")
-            with connection_lock:
-                if connections:
-                    raise Rejected("Provisioning connection busy")
-                connection = socket.socket(fileno=descriptor.take())
-                connections.add(connection)
+            connection = socket.socket(fileno=descriptor.take())
+            try:
+                connections.accept(str(device), connection)
+            except JoinError:
+                connection.close()
+                raise Rejected("Provisioning connection busy") from None
             def run():
                 try:
-                    serve_socket(connection, provisioner, stopped)
+                    serve_socket(connection, provisioner, stopped,
+                                 is_current=lambda: connections.is_current(connection))
                 finally:
-                    with connection_lock:
-                        connections.discard(connection)
-            threading.Thread(target=run, name="bluetooth-provision", daemon=True).start()
+                    connections.discard(connection)
+            try:
+                threading.Thread(target=run, name="bluetooth-provision", daemon=True).start()
+            except Exception:
+                connections.discard(connection)
+                connection.close()
+                raise Rejected("Provisioning worker unavailable") from None
 
         @dbus.service.method("org.bluez.Profile1", in_signature="o", out_signature="")
-        def RequestDisconnection(self, _device):
-            close_connections()
+        def RequestDisconnection(self, device):
+            connections.close(str(device))
 
     class Agent(dbus.service.Object):
         def authorize(self, device):
@@ -663,12 +858,7 @@ def run_daemon(config, enrollment_seconds=0):
         GLib.timeout_add_seconds(enrollment_seconds, remove_agent)
 
     def close_connections():
-        with connection_lock:
-            for connection in list(connections):
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+        connections.close()
 
     def stop(*_args):
         stopped.set()

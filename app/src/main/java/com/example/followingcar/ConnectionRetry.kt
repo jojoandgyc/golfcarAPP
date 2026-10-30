@@ -11,13 +11,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 
 /**
- * Retries only the initial connection, once, after a transient network failure.
+ * Retries only the initial connection, with a bounded delay schedule, after a transient network failure.
  * The block must not send remote commands: a command may already have executed when its reply is lost.
  */
 internal suspend fun <T> withInitialConnectionRetry(
+    retryDelaysMillis: List<Long> = listOf(300L),
     onRetry: suspend (nextAttempt: Int) -> Unit = {},
     connect: suspend () -> T,
 ): T {
+    require(retryDelaysMillis.size <= 3 && retryDelaysMillis.all { it in 0L..10_000L })
     var attempt = 1
     while (true) {
         currentCoroutineContext().ensureActive()
@@ -27,10 +29,11 @@ internal suspend fun <T> withInitialConnectionRetry(
             throw cancelled
         } catch (failure: Exception) {
             currentCoroutineContext().ensureActive()
-            if (attempt >= 2 || !isTransientConnectionFailure(failure)) throw failure
+            if (attempt > retryDelaysMillis.size || !isTransientConnectionFailure(failure)) throw failure
+            val backoff = retryDelaysMillis[attempt - 1]
             attempt += 1
             onRetry(attempt)
-            delay(300L)
+            delay(backoff)
         }
     }
 }

@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
@@ -52,14 +53,20 @@ class FakeSystem(pair.HotspotSystem):
             self.locked = False
 
     def network(self):
-        return dict(state=100, supports2GHz=True, profileUuid=self.current,
-                    addresses=["192.168.57.12"], ssid=SSID)
+        return dict(interface="wlan0", managed=True, state=100 if self.current else 30,
+                    supports2GHz=True, profileUuid=self.current,
+                    addresses=["192.168.57.12"] if self.current else [], ssid=SSID,
+                    profileName="followingcar-direct-" + self.current if self.current == self.created and self.current
+                    else "Original Wi-Fi")
+
+    def external_profile_confirmed(self, network):
+        return network.get("profileName") == "Original Wi-Fi"
 
     def profile_uuids(self):
-        return {self.current}
+        return {self.current} if self.current else set()
 
     def active_uuids(self):
-        return {self.current} | self.extra_active
+        return ({self.current} if self.current else set()) | self.extra_active
 
     def add_profile(self, profile_uuid, ssid):
         assert self.locked
@@ -169,6 +176,56 @@ class ProvisionTests(unittest.TestCase):
         self.assertTrue(self.replies[-1]["lastResult"]["ok"])
         self.assertEqual(request["requestId"], self.replies[-1]["lastResult"]["requestId"])
 
+    def test_socket_replacement_recovers_accepted_operation_without_repeating_switch(self):
+        registry, stopped = pair.ProvisioningConnections(), threading.Event()
+        old_client, old_server = socket.socketpair()
+        new_client, new_server = socket.socketpair()
+        old_client.settimeout(2)
+        new_client.settimeout(2)
+        threads = []
+        streams = []
+        def start(server):
+            registry.accept("phone", server)
+            def run():
+                try:
+                    pair.serve_socket(server, self.provisioner, stopped,
+                                      is_current=lambda: registry.is_current(server))
+                finally:
+                    registry.discard(server)
+            thread = threading.Thread(target=run)
+            thread.start()
+            threads.append(thread)
+        def send(client, request):
+            client.sendall((json.dumps(request) + "\n").encode())
+        try:
+            old_stream = old_client.makefile("rb")
+            new_stream = new_client.makefile("rb")
+            streams.extend([old_stream, new_stream])
+            start(old_server)
+            request = self.request()
+            send(old_client, request)
+            self.assertEqual("accepted", json.loads(old_stream.readline())["stage"])
+            start(new_server)
+            threads[0].join(2)
+            self.assertFalse(threads[0].is_alive())
+            send(new_client, self.request("status", queryRequestId=request["requestId"]))
+            self.assertTrue(json.loads(new_stream.readline())["operationInProgress"])
+            self.jobs.pop()()
+            send(new_client, self.request("status", queryRequestId=request["requestId"]))
+            result = json.loads(new_stream.readline())
+            self.assertTrue(result["lastResult"]["ok"])
+            self.assertFalse(result["operationInProgress"])
+            self.assertEqual(["create", "activate"], self.system.calls)
+        finally:
+            stopped.set()
+            registry.close()
+            for stream in streams:
+                stream.close()
+            for connection in (old_client, new_client, old_server, new_server):
+                connection.close()
+            for thread in threads:
+                thread.join(2)
+
     def test_unknown_request_status_does_not_return_other_result(self):
         self.handle(self.request())
         self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
@@ -209,7 +266,148 @@ class ProvisionTests(unittest.TestCase):
     def test_status_has_no_network_mutations_or_credentials(self):
         self.handle(self.request("status"))
         self.assertTrue(self.replies[-1]["controlAvailable"])
+        self.assertEqual("clear", self.replies[-1]["recoveryState"])
         self.assertEqual("2.4GHz", self.replies[-1]["band"])
+        self.assertEqual([], self.system.calls)
+        self.assertEqual([], self.store.rows)
+
+    def test_absent_request_requires_clear_proof_and_gets_durable_replay_tombstone(self):
+        missing_id = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=missing_id))
+        status = self.replies[-1]
+        self.assertEqual("clear", status["recoveryState"])
+        expired = status["lastResult"]
+        self.assertEqual(missing_id, expired["requestId"])
+        self.assertEqual("request_expired", expired["error"])
+        self.assertTrue(expired["definitive"])
+        self.assertFalse(expired["ok"] or expired["networkChanged"])
+        self.assertEqual(expired, self.store.rows[-1][-1])
+        self.handle(self.request(request_id=missing_id))
+        self.assertEqual(expired, self.replies[-1])
+        self.assertEqual([], self.jobs)
+        self.assertEqual([], self.system.calls)
+        self.handle(self.request("status", queryRequestId=missing_id))
+        self.assertEqual(1, len(self.store.rows))
+
+    def test_tombstone_persistence_failure_cannot_claim_absent_request_is_resolved(self):
+        self.store.fail = True
+        self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+        self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+        self.assertEqual([], self.state.records)
+        self.assertEqual([], self.system.calls)
+
+    def test_missing_request_while_worker_or_unknown_transaction_exists_cannot_expire(self):
+        request = self.request()
+        self.handle(request)
+        missing_id = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=missing_id))
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+        self.assertEqual(request["requestId"], self.replies[-1]["recoveryRequestId"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+        self.system.fail_address = True
+        self.jobs.pop()()
+        self.handle(self.request("status", queryRequestId=missing_id))
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+        self.assertIsNone(self.state.get(missing_id))
+
+    def test_connected_owned_hotspot_returns_recoverable_id_instead_of_clear(self):
+        request = self.request()
+        self.handle(request)
+        self.jobs.pop()()
+        self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+        self.assertEqual(request["requestId"], self.replies[-1]["recoveryRequestId"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+        self.assertEqual(1, len(self.state.records))
+
+    def test_untracked_owned_hotspot_or_uncertain_profile_identity_cannot_clear(self):
+        network = self.system.network()
+        with patch.object(self.system, "network", return_value=dict(network,
+                profileName="followingcar-direct-" + self.system.current)):
+            self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+        self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+        with patch.object(self.system, "external_profile_confirmed", return_value=False):
+            self.handle(self.request("status"))
+        self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+        self.assertEqual([], self.state.records)
+
+    def test_busy_control_and_live_finishing_worker_do_not_report_clear(self):
+        self.system.idle = False
+        self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+        self.assertFalse(self.replies[-1]["controlAvailable"])
+        self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+        self.system.idle = True
+        class FinishingWorker:
+            def is_alive(self):
+                return True
+        self.provisioner.worker = FinishingWorker()
+        self.handle(self.request("status"))
+        self.assertTrue(self.replies[-1]["operationInProgress"])
+        self.assertNotEqual("clear", self.replies[-1]["recoveryState"])
+
+    def test_network_flap_or_missing_active_uuid_prevents_clear_and_tombstone(self):
+        network = self.system.network()
+        for key, value in (("state", 40), ("profileUuid", str(uuid.uuid4())),
+                           ("profileName", "Another network"), ("addresses", [])):
+            with self.subTest(key=key), patch.object(self.system, "network",
+                    side_effect=[network, dict(network, **{key: value})]):
+                self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+            self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+            self.assertIsNone(self.replies[-1]["lastResult"])
+        for observed in ([set()], [{self.system.current}, set()]):
+            with patch.object(self.system, "active_uuids", side_effect=observed):
+                self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+            self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+        self.assertEqual([], self.store.rows)
+
+    def test_disconnected_or_invalid_address_cannot_clear_recovery(self):
+        network = self.system.network()
+        for values in (dict(state=30), dict(addresses=[]), dict(addresses=["169.254.2.1"]),
+                       dict(addresses=["127.0.0.1"]), dict(addresses=["invalid"]), dict(profileUuid=None)):
+            with self.subTest(values=values), patch.object(self.system, "network",
+                    return_value=dict(network, **values)):
+                self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+            self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+            self.assertIsNone(self.replies[-1]["lastResult"])
+        self.assertEqual([], self.store.rows)
+
+    def test_corrupted_network_journal_prevents_clear(self):
+        self.join_store.rows.append({"unexpected": True})
+        self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+        self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+
+    def test_incomplete_history_record_is_pending_not_clear(self):
+        previous_id = str(uuid.uuid4())
+        self.state.put(pair.response(previous_id, "result", error="incomplete_record"))
+        self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+        self.assertEqual(previous_id, self.replies[-1]["recoveryRequestId"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+
+    def test_replaced_socket_cannot_submit_previously_queued_credentials(self):
+        request = self.request()
+        self.provisioner.handle(request, self.replies.append, request_is_current=lambda: False)
+        self.assertEqual([], self.replies)
+        self.assertEqual([], self.jobs)
+        self.assertEqual([], self.state.records)
+        self.assertEqual([], self.system.calls)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX private-state file permissions")
+    def test_expiration_tombstone_survives_daemon_restart(self):
+        path = self.root / "durable-state.json"
+        self.provisioner.state = pair.PairingState(path)
+        request_id = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=request_id))
+        reopened = pair.PairingState(path)
+        replacement = pair.Provisioner("followingcar-test", self.system, reopened,
+                                       self.jobs.append, self.join_store)
+        replacement.handle(self.request(request_id=request_id), self.replies.append)
+        self.assertEqual("request_expired", self.replies[-1]["error"])
+        self.assertEqual([], self.jobs)
         self.assertEqual([], self.system.calls)
 
     def failed_unknown_operation(self):
@@ -243,6 +441,128 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual("192.168.57.12", recovered["ip"])
         self.assertEqual(["create", "activate"], self.system.calls)
 
+    def test_lost_successful_hotspot_without_another_wifi_is_definitively_expired(self):
+        request = self.request()
+        self.handle(request)
+        self.jobs.pop()()
+        self.system.current = None
+        calls = list(self.system.calls)
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        status = self.replies[-1]
+        self.assertEqual("hotspot_disconnected", status["lastResult"]["error"])
+        self.assertTrue(status["lastResult"]["definitive"])
+        self.assertFalse(status["lastResult"]["ok"] or status["lastResult"]["networkChanged"])
+        self.assertEqual("clear", status["recoveryState"])
+        self.assertEqual(calls, self.system.calls)
+        self.handle(self.request())
+        self.assertEqual("accepted", self.replies[-1]["stage"])
+        self.assertEqual(calls, self.system.calls)  # New credentials queued, not silently replayed.
+
+    def test_disconnected_unknown_history_requires_matching_query_before_clear(self):
+        request = self.failed_unknown_operation()
+        self.system.current = None
+        self.handle(self.request("status"))
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+        self.assertEqual(request["requestId"], self.replies[-1]["recoveryRequestId"])
+        missing_id = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=missing_id))
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+        self.assertIsNone(self.state.get(missing_id))
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertEqual("clear", self.replies[-1]["recoveryState"])
+        self.assertEqual("hotspot_disconnected", self.replies[-1]["lastResult"]["error"])
+        self.assertEqual("network_address_unconfirmed", self.replies[-1]["lastResult"]["firstError"])
+        self.assertEqual(["create", "activate"], self.system.calls)
+
+    def test_stably_disconnected_fresh_board_can_expire_a_missing_request(self):
+        self.system.current = None
+        missing_id = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=missing_id))
+        self.assertEqual("clear", self.replies[-1]["recoveryState"])
+        self.assertEqual("request_expired", self.replies[-1]["lastResult"]["error"])
+        self.handle(self.request(request_id=missing_id))
+        self.assertEqual("request_expired", self.replies[-1]["error"])
+        self.assertEqual([], self.jobs)
+        self.assertEqual([], self.system.calls)
+
+    def test_transitioning_unmanaged_or_inconsistent_disconnect_is_not_final(self):
+        request = self.failed_unknown_operation()
+        self.system.current = None
+        disconnected = self.system.network()
+        invalid = [dict(state=value) for value in (20, 40, 50, 60, 70, 80, 90, 110, 120)]
+        invalid.extend([dict(managed=False), dict(managed=None), dict(interface="wlan1"),
+                        dict(profileUuid=self.system.created), dict(addresses=["192.168.57.12"])])
+        for changed in invalid:
+            with self.subTest(changed=changed), patch.object(self.system, "network",
+                    return_value=dict(disconnected, **changed)):
+                self.handle(self.request("status", queryRequestId=request["requestId"]))
+                self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+                self.assertNotEqual("clear", self.replies[-1]["recoveryState"])
+        self.assertEqual(["create", "activate"], self.system.calls)
+
+    def test_disconnected_observation_must_stay_identical_and_active_set_must_not_change(self):
+        request = self.failed_unknown_operation()
+        self.system.current = None
+        disconnected = self.system.network()
+        for changed in (dict(state=40), dict(managed=False), dict(profileUuid=self.system.created),
+                        dict(addresses=["192.168.57.12"])):
+            with self.subTest(changed=changed), patch.object(self.system, "network",
+                    side_effect=[disconnected, dict(disconnected, **changed)]):
+                self.handle(self.request("status", queryRequestId=request["requestId"]))
+                self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        with patch.object(self.system, "active_uuids", side_effect=[set(), {self.system.created}]):
+            self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        self.assertEqual(["create", "activate"], self.system.calls)
+
+    def test_disconnected_recovery_requires_old_profile_inactive_and_non_autoconnecting(self):
+        request = self.failed_unknown_operation()
+        self.system.current = None
+        self.system.extra_active.add(self.system.created)
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        self.system.extra_active.clear()
+        with patch.object(self.system, "inactive_profile_safe", return_value=False):
+            self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+
+    def test_control_busy_or_worker_alive_cannot_resolve_a_disconnected_hotspot(self):
+        request = self.failed_unknown_operation()
+        self.system.current = None
+        self.system.idle = False
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        self.assertFalse(self.replies[-1]["controlAvailable"])
+        self.system.idle = True
+        class ActiveWorker:
+            def is_alive(self):
+                return True
+        self.provisioner.worker = ActiveWorker()
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        self.assertTrue(self.replies[-1]["operationInProgress"])
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+
+    def test_disconnected_resolution_disk_failure_does_not_unlock_unknown_request(self):
+        request = self.failed_unknown_operation()
+        self.system.current = None
+        self.store.fail = True
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        self.assertEqual("pending", self.replies[-1]["recoveryState"])
+
+    def test_missing_record_cannot_be_expired_during_disconnected_network_flap(self):
+        self.system.current = None
+        disconnected = self.system.network()
+        for changed in (dict(state=40), dict(managed=False), dict(addresses=["192.168.57.12"])):
+            with self.subTest(changed=changed), patch.object(self.system, "network",
+                    side_effect=[disconnected, dict(disconnected, **changed)]):
+                self.handle(self.request("status", queryRequestId=str(uuid.uuid4())))
+            self.assertEqual("unavailable", self.replies[-1]["recoveryState"])
+            self.assertIsNone(self.replies[-1]["lastResult"])
+        self.assertEqual([], self.state.records)
+
     def test_recovery_never_uses_another_request_latest_record(self):
         request = self.failed_unknown_operation()
         self.system.current = self.join_store.rows[-1]["previousConnectionUuid"]
@@ -257,11 +577,151 @@ class ProvisionTests(unittest.TestCase):
         self.handle(self.request("status", queryRequestId=request["requestId"]))
         self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
 
-    def test_foreign_profile_keeps_recovery_unknown(self):
+    def test_settled_alternate_network_ends_old_lease_without_claiming_success(self):
         request = self.failed_unknown_operation()
+        self.system.current = str(uuid.uuid4())
+        calls = list(self.system.calls)
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        result = self.replies[-1]["lastResult"]
+        self.assertTrue(result["definitive"])
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["networkChanged"])
+        self.assertEqual("network_superseded", result["error"])
+        self.assertNotIn("ip", result)
+        self.assertEqual("network_address_unconfirmed", result["firstError"])
+        self.assertEqual(calls, self.system.calls)
+
+    def test_successful_historical_lease_on_alternate_network_is_expired(self):
+        request = self.request()
+        self.handle(request)
+        self.jobs.pop()()
+        self.system.current = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        result = self.replies[-1]["lastResult"]
+        self.assertEqual("network_superseded", result["error"])
+        self.assertTrue(result["definitive"])
+        self.assertFalse(result["ok"])
+
+    def test_alternate_network_does_not_resolve_while_old_profile_can_autoconnect(self):
+        request = self.failed_unknown_operation()
+        self.system.current = str(uuid.uuid4())
+        with patch.object(self.system, "inactive_profile_safe", return_value=False):
+            self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+
+    def test_alternate_network_with_old_profile_still_active_remains_unknown(self):
+        request = self.failed_unknown_operation()
+        self.system.extra_active.add(self.system.current)
         self.system.current = str(uuid.uuid4())
         self.handle(self.request("status", queryRequestId=request["requestId"]))
         self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+
+    def test_changing_network_or_active_set_cannot_resolve_old_lease(self):
+        request = self.failed_unknown_operation()
+        self.system.current = str(uuid.uuid4())
+        network = self.system.network()
+        for observations in ([network, dict(network, profileUuid=str(uuid.uuid4()))],
+                             [network, dict(network, addresses=[])]):
+            with self.subTest(observations=observations), patch.object(self.system, "network", side_effect=observations):
+                self.handle(self.request("status", queryRequestId=request["requestId"]))
+            self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        with patch.object(self.system, "active_uuids", side_effect=[{self.system.current},
+                {self.system.current, self.system.created}]):
+            self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+
+    def test_invalid_current_address_cannot_resolve_old_lease(self):
+        request = self.failed_unknown_operation()
+        self.system.current = str(uuid.uuid4())
+        network = self.system.network()
+        for address in ("127.0.0.1", "0.0.0.1", "169.254.1.2", "224.0.0.1", "bad"):
+            with self.subTest(address=address), patch.object(self.system, "network",
+                    return_value=dict(network, addresses=[address])):
+                self.handle(self.request("status", queryRequestId=request["requestId"]))
+            self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+
+    def test_recovery_can_start_from_previously_disconnected_wifi(self):
+        self.system.current = None
+        request = self.failed_unknown_operation()
+        self.assertIsNone(self.join_store.rows[-1]["previousConnectionUuid"])
+        self.system.fail_address = False
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        result = self.replies[-1]["lastResult"]
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["definitive"])
+        self.assertEqual(["create", "activate"], self.system.calls)
+
+    def test_unknown_operation_blocks_new_credentials_and_preserves_network_record(self):
+        request = self.failed_unknown_operation()
+        record = dict(self.join_store.rows[-1])
+        self.handle(self.request())
+        self.assertEqual("recovery_pending", self.replies[-1]["error"])
+        self.assertEqual(request["requestId"], self.replies[-1]["recoveryRequestId"])
+        self.assertEqual(record, self.join_store.rows[-1])
+        self.assertEqual([], self.jobs)
+        self.assertEqual(["create", "activate"], self.system.calls)
+
+    def test_status_can_recover_lost_phone_request_id_without_reflecting_secrets(self):
+        request = self.failed_unknown_operation()
+        self.handle(self.request("status"))
+        self.assertEqual(request["requestId"], self.replies[-1]["recoveryRequestId"])
+        self.assertIsNone(self.replies[-1]["lastResult"])
+        self.assertNotIn(SSID, json.dumps(self.replies[-1]))
+        self.assertNotIn(PASSWORD, json.dumps(self.replies[-1]))
+        self.system.current = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertNotIn("recoveryRequestId", self.replies[-1])
+
+    def test_new_request_can_continue_after_readonly_resolution_of_expired_lease(self):
+        self.failed_unknown_operation()
+        self.system.current = str(uuid.uuid4())
+        self.handle(self.request())
+        self.assertEqual("accepted", self.replies[-1]["stage"])
+        self.assertEqual(1, len(self.jobs))
+        self.assertEqual(["create", "activate"], self.system.calls)
+
+    def test_worker_launch_and_final_disk_failure_still_returns_queryable_terminal_result(self):
+        request = self.request()
+        def fail_launch(_):
+            self.store.fail = True
+            raise RuntimeError("thread unavailable")
+        self.provisioner.start_thread = fail_launch
+        self.handle(request)
+        self.assertEqual("worker_unavailable", self.replies[-1]["error"])
+        self.assertTrue(self.replies[-1]["definitive"])
+        self.assertFalse(self.replies[-1]["networkChanged"])
+        self.assertEqual("unavailable", self.replies[-1]["resultRecording"])
+        self.assertEqual(1, len(self.state.records))
+        self.assertIsNone(self.provisioner.active_id)
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        self.assertEqual("worker_unavailable", self.replies[-1]["lastResult"]["error"])
+        self.assertNotIn("recoveryRequestId", self.replies[-1])
+        self.assertEqual([], self.system.calls)
+
+    def test_terminal_disk_failure_does_not_leave_duplicate_progress_or_hide_first_error(self):
+        request = self.failed_unknown_operation()
+        self.store.fail = True
+        self.system.current = str(uuid.uuid4())
+        self.handle(self.request("status", queryRequestId=request["requestId"]))
+        # Reconciliation cannot claim durable recovery when that write fails.
+        self.assertFalse(self.replies[-1]["lastResult"]["definitive"])
+        self.assertEqual("network_address_unconfirmed", self.replies[-1]["lastResult"]["error"])
+
+    def test_final_write_failure_keeps_one_queryable_result_without_repeating_activation(self):
+        request = self.request()
+        original = self.system.address_result
+        def addresses(profile_uuid):
+            result = original(profile_uuid)
+            self.store.fail = True
+            return result
+        self.system.address_result = addresses
+        self.handle(request)
+        self.jobs.pop()()
+        self.assertTrue(self.replies[-1]["ok"])
+        self.assertEqual("unavailable", self.replies[-1]["resultRecording"])
+        self.assertEqual(1, len(self.state.records))
+        self.assertEqual("result", self.state.records[0]["type"])
+        self.assertEqual(["create", "activate"], self.system.calls)
 
     def test_prior_network_with_own_profile_still_active_keeps_unknown(self):
         request = self.failed_unknown_operation()
@@ -412,6 +872,87 @@ class AddressTests(unittest.TestCase):
         for options in ("routers = 192.168.58.1", "routers = 192.168.57.1 192.168.57.2", "domain_name = test"):
             with self.subTest(options=options), self.assertRaises(pair.JoinError):
                 self.system("IP4.ADDRESS[1]:192.168.57.12/24\nDHCP4.OPTION[1]:" + options + "\n").address_result("owned")
+
+
+class InactiveLeaseTests(unittest.TestCase):
+    def test_external_profile_identity_is_checked_against_actual_wlan0_observation(self):
+        system = pair.HotspotSystem()
+        profile_uuid = str(uuid.uuid4())
+        network = dict(profileUuid=profile_uuid, profileName="Original network")
+        fields = {"connection.id": "Original network", "connection.uuid": profile_uuid,
+                  "connection.interface-name": "wlan0"}
+        for pin in ("wlan0", "", "--"):
+            output = "\n".join(key + ":" + value for key, value in
+                               dict(fields, **{"connection.interface-name": pin}).items())
+            with self.subTest(pin=pin), patch.object(system, "checked", return_value=output):
+                self.assertTrue(system.external_profile_confirmed(network))
+        for updates in ({"connection.id": "followingcar-direct-" + profile_uuid},
+                        {"connection.id": "Other network"}, {"connection.interface-name": "wlan1"},
+                        {"connection.uuid": str(uuid.uuid4())}):
+            output = "\n".join(key + ":" + value for key, value in dict(fields, **updates).items())
+            with self.subTest(updates=updates), patch.object(system, "checked", return_value=output):
+                self.assertFalse(system.external_profile_confirmed(network))
+
+    def test_absent_profile_needs_no_configuration_read_or_mutation(self):
+        system = pair.HotspotSystem()
+        with patch.object(system, "profile_uuids", return_value=set()), \
+                patch.object(system, "checked") as command:
+            self.assertTrue(system.inactive_profile_safe("owned", SSID))
+        command.assert_not_called()
+
+    def test_retained_profile_must_be_owned_and_explicitly_non_autoconnecting(self):
+        system = pair.HotspotSystem()
+        with patch.object(system, "profile_uuids", return_value={"owned"}), \
+                patch.object(system, "owns_profile", return_value=True), \
+                patch.object(system, "checked", return_value="no\n") as command:
+            self.assertTrue(system.inactive_profile_safe("owned", SSID))
+            self.assertNotIn(SSID, command.call_args.args[0])
+            self.assertEqual("connection.autoconnect", command.call_args.args[0][2])
+            for value in ("yes", "unknown", "", "no\nyes"):
+                command.return_value = value
+                self.assertFalse(system.inactive_profile_safe("owned", SSID))
+        with patch.object(system, "profile_uuids", return_value={"owned"}), \
+                patch.object(system, "owns_profile", return_value=False), \
+                patch.object(system, "checked") as command:
+            self.assertFalse(system.inactive_profile_safe("owned", SSID))
+        command.assert_not_called()
+
+
+class ConnectionRecoveryTests(unittest.TestCase):
+    class Connection:
+        shutdowns = 0
+        def shutdown(self, _):
+            self.shutdowns += 1
+
+    def test_same_authenticated_owner_can_replace_stale_connection_immediately(self):
+        registry = pair.ProvisioningConnections()
+        old, new = self.Connection(), self.Connection()
+        registry.accept("phone", old)
+        registry.accept("phone", new)
+        self.assertEqual(1, old.shutdowns)
+        self.assertEqual(0, new.shutdowns)
+        registry.discard(old)  # Old worker exit must not remove the new owner.
+        self.assertEqual({new: "phone"}, registry.connections)
+        registry.close("phone")
+        self.assertEqual(1, new.shutdowns)
+
+    def test_different_owner_cannot_interrupt_existing_authenticated_session(self):
+        registry = pair.ProvisioningConnections()
+        old, new = self.Connection(), self.Connection()
+        registry.accept("phone", old)
+        with self.assertRaisesRegex(pair.JoinError, "provisioning_connection_busy"):
+            registry.accept("other-phone", new)
+        registry.close("other-phone")
+        self.assertEqual(0, old.shutdowns)
+        self.assertEqual({old: "phone"}, registry.connections)
+
+    def test_already_lost_old_socket_does_not_prevent_new_status_connection(self):
+        registry = pair.ProvisioningConnections()
+        old, new = self.Connection(), self.Connection()
+        old.shutdown = lambda _: (_ for _ in ()).throw(OSError("already disconnected"))
+        registry.accept("phone", old)
+        registry.accept("phone", new)
+        self.assertEqual({new: "phone"}, registry.connections)
 
 
 class PageScanTests(unittest.TestCase):

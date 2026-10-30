@@ -5,6 +5,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PairingModelsTest {
+    @Test fun onlyProvenLeaseEndCodesRestoreThePairingEntry() {
+        for (code in listOf("network_restored", "network_superseded", "hotspot_disconnected", "request_expired")) {
+            assertEquals(code, pairingBoardErrorCode(code))
+            assertTrue(pairingLeaseExpired(code))
+        }
+        for (code in listOf("current_network_unconfirmed", "network_address_unconfirmed", "recovery_pending",
+            "bluetooth_eof", "protocol_error", "arbitrary_remote_error")) assertFalse(pairingLeaseExpired(code))
+    }
+
+    @Test fun recoveryLoadingCannotStartNetworkMutation() {
+        val state = PairingState(supported = true, permissionGranted = true, bluetoothEnabled = true,
+            recoveryLoading = true)
+        assertNotNull(pairingRequestAllowed(state, true))
+        assertNull(pairingRequestAllowed(state.copy(recoveryLoading = false), true))
+    }
+
     @Test fun responseLossAfterAnyPossibleCredentialWriteRequiresConfirmation() {
         assertTrue(pairingFailureRequiresConfirmation(true, false))
         assertFalse(pairingFailureRequiresConfirmation(false, false))
