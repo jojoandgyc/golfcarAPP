@@ -30,6 +30,7 @@ class RelaySettings:
     control_port: int = 2443
     video_port: int = 8443
     transport_port: int = 7443
+    ssh_backend_port: int = 22022
     turn_port: int = 3478
     turns_port: int = 5349
     relay_min: int = 62000
@@ -41,7 +42,7 @@ class RelaySettings:
         for value in (self.public_ip, self.local_ip):
             ipaddress.IPv4Address(value)
         ports = [self.control_port, self.video_port, self.transport_port,
-                 self.turn_port, self.turns_port, 22022, 18889]
+                 self.turn_port, self.turns_port, self.ssh_backend_port, 18889]
         if any(type(p) is not int or not 1024 <= p <= 65535 for p in ports):
             raise ValueError("Invalid relay port")
         if len(set(ports)) != len(ports):
@@ -65,7 +66,7 @@ bindAddr = "0.0.0.0"
 bindPort = {settings.transport_port}
 quicBindPort = {settings.transport_port}
 proxyBindAddr = "127.0.0.1"
-allowPorts = [{{ single = 22022 }}, {{ single = 18889 }}]
+allowPorts = [{{ single = {settings.ssh_backend_port} }}, {{ single = 18889 }}]
 maxPortsPerClient = 2
 detailedErrorsToClient = false
 auth.method = "token"
@@ -132,7 +133,7 @@ name = "board-ssh"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 22
-remotePort = 22022
+remotePort = {settings.ssh_backend_port}
 transport.useCompression = false
 
 [[proxies]]
@@ -166,7 +167,7 @@ stream {{
         proxy_connect_timeout 5s;
         proxy_timeout 1h;
         tcp_nodelay on;
-        proxy_pass 127.0.0.1:22022;
+        proxy_pass 127.0.0.1:{settings.ssh_backend_port};
     }}
 }}
 http {{

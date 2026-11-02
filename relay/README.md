@@ -8,11 +8,11 @@
 
 | 流量 | 路径 |
 |---|---|
-| 控制、配置、日志、终端 | App 内 JSch → TLS 客户端证书认证 `2443/TCP` → nginx → frps 回环 `22022` → QUIC → frpc → 板端 SSH `22` |
+| 控制、配置、日志、终端 | App 内 JSch → TLS 客户端证书认证 `2443/TCP` → nginx → frps 回环 `22024` → QUIC 或 TLS/TCP → frpc → 板端 SSH `22` |
 | 播放器和 WHEP 信令 | App WebView → HTTPS 双向认证 `8443/TCP` → `/player/` 或 `/rgbd/whep` → frps 回环 `18889` → frpc → 独立视频网关 `19889` |
 | RGB/深度合成视频 | WebRTC → 同一服务器 Coturn → 板端 MediaMTX；优先 UDP，不转码，不经过 SSH/frp 字节流 |
 
-服务器新增 `7443/TCP+UDP` 供板端 frpc，Coturn 使用 `3478/TCP+UDP`、`5349/TCP` 和 `62000–62099/UDP`。TURN 端口段位于服务器当前临时端口范围之外。现有 VPN 的 `443/UDP`、SSH、防火墙、默认路由保持原样。`22022`、`18889` 只绑定 `127.0.0.1`，不能直接从公网登录板端默认密码。
+服务器新增 `7443/TCP+UDP` 供板端 frpc，Coturn 使用 `3478/TCP+UDP`、`5349/TCP` 和 `62000–62099/UDP`。TURN 端口段位于服务器当前临时端口范围之外。现有 VPN 的 `443/UDP`、SSH、防火墙、默认路由保持原样。当前海外部署在 `settings.json` 中设置 `ssh_backend_port=22024`，避开另一套 SSH 中继使用的 `22022`；`22024`、`18889` 只绑定 `127.0.0.1`，不能直接从公网登录板端默认密码。其他独立部署可按实际端口规划设置 `ssh_backend_port`，其值必须与板端 frpc 配置一致。
 
 frp 固定 **0.71.1**，两个架构的官方发布文件 SHA-256 写在 `configuration.py`。下载后先校验摘要，再提取唯一目标可执行文件。板端内核没有 TUN/WireGuard，本方案不创建 VPN 网卡，也不修改 Wi-Fi。
 

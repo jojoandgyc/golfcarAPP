@@ -30,6 +30,15 @@ class RelayConfigurationTest(unittest.TestCase):
                          config["transport"]["tls"]["trustedCaFile"])
         self.assertEqual(self.settings.host, config["transport"]["tls"]["serverName"])
 
+    def test_dedicated_ssh_backend_avoids_other_local_tunnels(self):
+        settings = RelaySettings(ssh_backend_port=22024)
+        self.assertEqual([{"single": 22024}, {"single": 18889}],
+                         tomllib.loads(frps_config(settings))["allowPorts"])
+        self.assertEqual(22024, tomllib.loads(frpc_config(settings))["proxies"][0]["remotePort"])
+        self.assertIn("proxy_pass 127.0.0.1:22024;", nginx_config(settings))
+        with self.assertRaises(ValueError):
+            RelaySettings(ssh_backend_port=settings.video_port).validate()
+
     def test_explicit_tcp_fallback_keeps_tls(self):
         config = tomllib.loads(frpc_config(self.settings, "tcp"))
         self.assertTrue(config["transport"]["tls"]["enable"])
