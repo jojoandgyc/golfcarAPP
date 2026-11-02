@@ -1,0 +1,12 @@
+config/
+secrets/
+private/
+web/
+bin/
+*.carremote
+*.boardremote
+*.pem
+*.key
+*.p12
+*.tar.gz
+__pycache__/

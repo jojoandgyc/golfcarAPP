@@ -1,0 +1,5 @@
+FROM alpine:3.20
+RUN apk add --no-cache coturn ca-certificates
+USER 11000:11000
+ENTRYPOINT ["/usr/bin/turnserver"]
+CMD ["-c", "/etc/followingcar-relay/coturn.conf"]

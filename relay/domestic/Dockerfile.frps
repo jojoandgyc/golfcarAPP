@@ -1,0 +1,10 @@
+FROM alpine:3.20
+
+# The running overseas frps 0.71.1 binary is staged in bin/ and verified.
+# No download occurs while building on the production host.
+COPY bin/frps /usr/local/bin/frps
+RUN echo "2322762939e66e66850bbc9103b6d73fec39e83bd8ad6c71ebeeb120d56d6ab3  /usr/local/bin/frps" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/frps
+USER 11000:11000
+ENTRYPOINT ["/usr/local/bin/frps"]
+CMD ["-c", "/etc/followingcar-relay/frps.toml"]

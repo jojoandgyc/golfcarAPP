@@ -1,0 +1,91 @@
+name: followingcar-domestic
+
+services:
+  frps:
+    build:
+      context: .
+      dockerfile: Dockerfile.frps
+    user: "11000:11000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+    restart: unless-stopped
+    stop_grace_period: 10s
+    ports:
+      - "7443:7443/tcp"
+      - "7443:7443/udp"
+    volumes:
+      - ./config/frps.toml:/etc/followingcar-relay/frps.toml:ro
+      - ./secrets/frp-token:/etc/followingcar-relay/frp-token:ro
+      - ./secrets/tls:/etc/followingcar-relay/tls:ro
+    networks:
+      car:
+        ipv4_address: 172.28.240.11
+    logging: &bounded_logs
+      driver: json-file
+      options: {max-size: "5m", max-file: "3"}
+
+  nginx:
+    image: nginx:1.27-alpine
+    entrypoint: ["/usr/sbin/nginx"]
+    command: ["-c", "/etc/followingcar-relay/nginx.conf", "-g", "daemon off;"]
+    user: "11000:11000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+    restart: unless-stopped
+    stop_grace_period: 10s
+    ports:
+      - "2443:2443/tcp"
+      - "9443:9443/tcp"
+    tmpfs:
+      - /run/followingcar-nginx:uid=11000,gid=11000,mode=0750
+    volumes:
+      - ./config/nginx.conf:/etc/followingcar-relay/nginx.conf:ro
+      - ./secrets/tls:/etc/followingcar-relay/tls:ro
+      - ./web:/opt/followingcar-relay/web:ro
+    networks:
+      car:
+        ipv4_address: 172.28.240.12
+    logging: *bounded_logs
+
+  turn:
+    build:
+      context: .
+      dockerfile: Dockerfile.turn
+    user: "11000:11000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 96
+    mem_limit: 256m
+    cpus: 1.0
+    restart: unless-stopped
+    stop_grace_period: 10s
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "5349:5349/tcp"
+      - "62000-62099:62000-62099/udp"
+    tmpfs:
+      - /run/followingcar-turn:uid=11000,gid=11000,mode=0750
+    volumes:
+      - ./config/coturn.conf:/etc/followingcar-relay/coturn.conf:ro
+      - ./secrets/tls:/etc/followingcar-relay/tls:ro
+    networks:
+      car:
+        ipv4_address: 172.28.240.10
+    logging: *bounded_logs
+
+networks:
+  car:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.240.0/24
