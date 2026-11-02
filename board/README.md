@@ -14,6 +14,8 @@ The follow bridge/worker copies in this directory predate that update and must
 not overwrite the current board installation. See the [App adaptation record](../docs/follow-handoff-adaptation-2026-10-30.md).
 
 - `app_joystick_bridge.py` belongs in `/home/topeet/lianzhan/scripts/`.
+- Manual diagnostics also require `app_diagnostic_log.py` beside that joystick script.
+  Manual logs are stored under `/home/topeet/lianzhan/app_drive_diagnostic_logs/`.
 - `app_follow_bridge.py`, `app_follow_worker.py`, and `app_diagnostic_log.py` belong together in
   `/home/topeet/Desktop/rk_car_runtime_module/`.
 - Follow uses the existing runtime and its installed dependencies. The existing

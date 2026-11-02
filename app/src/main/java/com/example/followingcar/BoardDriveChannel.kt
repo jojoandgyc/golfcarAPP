@@ -20,16 +20,19 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
+import org.json.JSONArray
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 data class DriveReady(
     val port: String, val dryRun: Boolean, val watchdogMs: Int, val maxRpm: Int,
     val parkingSupported: Boolean = false, val parking: ParkingSettings? = null,
+    val infraredSupported: Boolean = false,
 )
 data class DriveAck(
     val left: Int, val right: Int, val stopped: Boolean,
     val parking: ParkingSettings? = null,
+    val interlock: DriveInterlock? = null,
 )
 
 /**
@@ -42,8 +45,10 @@ class BoardDriveChannel private constructor(
     private val output: OutputStream,
     private val stderr: BoundedOutputStream,
     private val abortTransport: (reason: String, diagnostic: DiagnosticContext) -> Unit,
-    val diagnosticContext: DiagnosticContext,
+    diagnosticContext: DiagnosticContext,
 ) {
+    @Volatile var diagnosticContext: DiagnosticContext = diagnosticContext
+        private set
     private val transaction = Mutex()
     private val closed = AtomicBoolean(false)
     private val blockingIo = AtomicBoolean(false)
@@ -54,6 +59,9 @@ class BoardDriveChannel private constructor(
     @Volatile private var currentCommand = "open"
     @Volatile private var lastAckSequence = 0L
     @Volatile private var lastAckNanos = 0L
+    @Volatile private var lastAckRttMs: Long? = null
+    @Volatile private var sendGapMs: Long? = null
+    private var lastSendNanos = 0L
     private var summaryAt = System.nanoTime()
     private var summaryCount = 0
     private var summaryRttTotal = 0L
@@ -135,8 +143,13 @@ class BoardDriveChannel private constructor(
                             .put("parkingCurrent", parking.currentAmps)
                     }
                     phase = "write"
+                    val sendingNanos = System.nanoTime()
+                    sendGapMs = if (lastSendNanos == 0L) null else
+                        ((sendingNanos - lastSendNanos) / 1_000_000L).coerceAtLeast(0L)
+                    lastSendNanos = sendingNanos
                     if (report) Diagnostics.event("drive.request_send", diagnosticContext,
                         fields = mapOf("commandType" to command, "seq" to sentSequence,
+                            "sendGapMs" to sendGapMs, "lastAckRttMs" to lastAckRttMs,
                             "leftRpm" to left, "rightRpm" to right,
                             "parkingEnabled" to parking?.enabled, "parkingAmps" to parking?.currentAmps),
                         critical = important)
@@ -151,11 +164,16 @@ class BoardDriveChannel private constructor(
                     requireMessage(reply.getLong("seq") == sentSequence, "开发板回执序号不匹配")
                     val nextToken = readToken(reply)
                     requireMessage(nextToken != previousToken, "开发板控制令牌未更新")
-                    val actualLeft = reply.getInt("left")
-                    val actualRight = reply.getInt("right")
-                    val stopped = reply.getBoolean("stopped")
-                    requireMessage(actualLeft == left && actualRight == right, "开发板回执速度与指令不一致")
-                    requireMessage(stopped == (actualLeft == 0 && actualRight == 0), "开发板停车回执不一致")
+                    val rawLeft = reply.opt("left")
+                    val rawRight = reply.opt("right")
+                    val rawStopped = reply.opt("stopped")
+                    requireMessage(rawLeft is Number && rawRight is Number && rawStopped is Boolean &&
+                        rawLeft.toDouble() == rawLeft.toInt().toDouble() &&
+                        rawRight.toDouble() == rawRight.toInt().toDouble(), "开发板速度或停车回执格式无效")
+                    val actualLeft = (rawLeft as Number).toInt()
+                    val actualRight = (rawRight as Number).toInt()
+                    val stopped = rawStopped as Boolean
+                    val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight, stopped)
                     val actualParking = if (ready.parkingSupported) readParking(reply) else null
                     if (ready.parkingSupported) {
                         val expectedParking = if (closing) confirmedParking?.copy(enabled = false)
@@ -167,12 +185,14 @@ class BoardDriveChannel private constructor(
                     lastAckSequence = sentSequence
                     lastAckNanos = System.nanoTime()
                     val rtt = elapsedMillis(started)
+                    lastAckRttMs = rtt
                     summaryCount += 1
                     summaryRttTotal += rtt
                     summaryRttMax = maxOf(summaryRttMax, rtt)
                     if (report) {
                         Diagnostics.event("drive.ack_summary", diagnosticContext, fields = mapOf(
                             "commandType" to command, "seq" to sentSequence, "elapsedMs" to rtt,
+                            "sendGapMs" to sendGapMs, "lastAckRttMs" to lastAckRttMs,
                             "sampleCount" to summaryCount, "maxRttMs" to summaryRttMax,
                             "meanRttMs" to summaryRttTotal / summaryCount,
                             "leftRpm" to actualLeft, "rightRpm" to actualRight, "stopped" to stopped),
@@ -183,7 +203,7 @@ class BoardDriveChannel private constructor(
                         summaryRttMax = 0
                     }
                     phase = "idle"
-                    DriveAck(actualLeft, actualRight, stopped, actualParking)
+                    DriveAck(actualLeft, actualRight, stopped, actualParking, interlock)
                 }
             } catch (timeout: TimeoutCancellationException) {
                 val failure = SocketTimeoutException("摇杆控制回执超时，已关闭控制通道；请重新启用摇杆")
@@ -284,6 +304,7 @@ class BoardDriveChannel private constructor(
     private fun diagnosticFields(): Map<String, Any?> = mapOf(
         "phase" to phase, "commandType" to currentCommand, "seq" to sequence,
         "lastAckSeq" to lastAckSequence,
+        "lastAckRttMs" to lastAckRttMs, "sendGapMs" to sendGapMs,
         "lastAckAgeMs" to if (lastAckNanos == 0L) null else elapsedMillis(lastAckNanos),
         "channelConnected" to channel.isConnected, "channelClosed" to channel.isClosed,
         "channelEof" to channel.isEOF, "blockingIo" to blockingIo.get(),
@@ -307,6 +328,32 @@ class BoardDriveChannel private constructor(
         val amps = (current as Number).toInt()
         requireMessage(enabled == false || amps > 0, "开发板驻车开关与电流不一致")
         return ParkingSettings(enabled as Boolean, amps)
+    }
+
+    private fun readInterlock(reply: JSONObject, command: String, requestedLeft: Int, requestedRight: Int,
+        actualLeft: Int, actualRight: Int, stopped: Boolean): DriveInterlock? {
+        var blocked: Boolean? = null
+        var directions: List<String>? = null
+        if (ready.infraredSupported || reply.has("infraredBlocked") || reply.has("infraredDirections")) {
+            val rawBlocked = reply.opt("infraredBlocked")
+            val rawDirections = reply.opt("infraredDirections")
+            requireMessage(rawBlocked is Boolean && rawDirections is JSONArray, "开发板红外保护回执格式无效")
+            blocked = rawBlocked as Boolean
+            val array = rawDirections as JSONArray
+            requireMessage(array.length() <= 3, "开发板红外保护方向过多")
+            directions = (0 until array.length()).map { index ->
+                val direction = array.opt(index)
+                requireMessage(direction is String, "开发板红外保护方向格式无效")
+                direction as String
+            }
+        }
+        return try {
+            validatedDriveInterlock(ready.infraredSupported, command, requestedLeft, requestedRight,
+                actualLeft, actualRight, stopped, blocked, directions)
+        } catch (failure: IllegalArgumentException) {
+            requireMessage(false, failure.message ?: "开发板红外保护回执无效")
+            null // requireMessage always throws above.
+        }
     }
 
     internal companion object {
@@ -351,25 +398,35 @@ class BoardDriveChannel private constructor(
                         control.token = control.readToken(reply)
                         val parkingSupported = reply.optBoolean("parkingSupported", false)
                         val parking = if (parkingSupported) control.readParking(reply) else null
+                        val rawInfraredSupported = reply.opt("infraredSupported")
+                        control.requireMessage(!reply.has("infraredSupported") || rawInfraredSupported is Boolean,
+                            "开发板红外保护能力字段无效")
+                        val rawRunId = reply.opt("runId")
+                        control.requireMessage(!reply.has("runId") ||
+                            rawRunId is String && rawRunId.matches(Regex("[0-9a-f]{32}")),
+                            "开发板控制会话编号无效")
                         val ready = DriveReady(
                             port = reply.getString("port"), dryRun = reply.getBoolean("dryRun"),
                             watchdogMs = reply.getInt("watchdogMs"), maxRpm = reply.getInt("maxRpm"),
                             parkingSupported = parkingSupported, parking = parking,
+                            infraredSupported = rawInfraredSupported == true,
                         )
                         control.requireMessage(ready.dryRun == dryRun, "开发板控制模式不匹配")
                         control.requireMessage(ready.maxRpm in 1..100 && ready.watchdogMs == 600, "开发板限速或超时参数不匹配")
                         control.ready = ready
                         control.confirmedParking = parking
+                        if (rawRunId is String) control.diagnosticContext = diagnostic.copy(runId = rawRunId)
                         control.phase = "idle"
-                        Diagnostics.event("drive.ready", diagnostic, fields = mapOf(
+                        Diagnostics.event("drive.ready", control.diagnosticContext, fields = mapOf(
                             "dryRun" to ready.dryRun, "port" to ready.port,
                             "parkingSupported" to ready.parkingSupported,
+                            "infraredSupported" to ready.infraredSupported,
                             "elapsedMs" to elapsedMillis(started)), critical = true)
                         control
                     }
                 } catch (timeout: TimeoutCancellationException) {
                     val failure = SocketTimeoutException("启动摇杆控制超时，请检查串口、电机电源和控制脚本")
-                    Diagnostics.failure(diagnostic, "drive.open_timeout", failure,
+                    Diagnostics.failure(opened?.diagnosticContext ?: diagnostic, "drive.open_timeout", failure,
                         (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
                             mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to START_TIMEOUT_MS))
                     opened?.close("ready_timeout", invalidateTransport = true)
@@ -379,9 +436,9 @@ class BoardDriveChannel private constructor(
                     val fields = (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
                         mapOf("elapsedMs" to elapsedMillis(started), "originalExceptionClass" to failure.javaClass.name)
                     if (failure is CancellationException) {
-                        Diagnostics.event("drive.open_cancelled", diagnostic, fields = fields, critical = true)
+                        Diagnostics.event("drive.open_cancelled", opened?.diagnosticContext ?: diagnostic, fields = fields, critical = true)
                     } else {
-                        Diagnostics.failure(diagnostic, "drive.open_failed", safeFailure, fields)
+                        Diagnostics.failure(opened?.diagnosticContext ?: diagnostic, "drive.open_failed", safeFailure, fields)
                     }
                     opened?.close(if (failure is CancellationException) "open_cancelled" else "open_failed")
                     throw safeFailure

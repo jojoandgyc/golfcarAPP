@@ -1,5 +1,6 @@
 """Offline tests: fake motors or --dry-run subprocesses only; no board access."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -7,12 +8,14 @@ import time
 import unittest
 from unittest.mock import patch
 import threading
+from tempfile import TemporaryDirectory
 
 import app_joystick_bridge as bridge
 from app_joystick_bridge import Motors, ProtocolSession, SessionError, strict_message
 
 
 SCRIPT = Path(__file__).with_name("app_joystick_bridge.py")
+ROOT = SCRIPT.parent.parent
 
 
 class FakeClient:
@@ -60,6 +63,13 @@ def parking_request(session, enabled=True, current=5, **extra):
 
 
 class BridgeTests(unittest.TestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        environment = patch.dict(os.environ, {"APP_DRIVE_DIAGNOSTIC_TEST_DIR": temporary.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_ready_clears_existing_currents_and_reports_default_setting(self):
         client = FakeClient()
         session = ProtocolSession(Motors(client), port="fake", dry_run=False)
@@ -454,8 +464,9 @@ class BridgeTests(unittest.TestCase):
                 clock[0] += duration
 
             def drive(self, left, right):
-                super().drive(left, right)
+                target = super().drive(left, right)
                 clock[0] += duration
+                return target
 
         class Output:
             def __init__(self, _fd):

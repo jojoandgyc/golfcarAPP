@@ -53,6 +53,7 @@ data class BoardUiState(
     val driveEnabled: Boolean = false,
     val driveStopping: Boolean = false,
     val driveStatus: String = "手动控制未启用",
+    val driveInterlock: DriveInterlock? = null,
     val drivePort: String = "自动检测串口",
     val driveError: String? = null,
     val driveFirstFailure: DiagnosticFailure? = null,
@@ -970,6 +971,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         while (driveWakeup.tryReceive().isSuccess) { /* Discard signals from the previous session. */ }
         mutableState.update {
             it.copy(driveStarting = true, driveConfirmedStopped = false, driveError = null, driveFirstFailure = null,
+                driveInterlock = null,
                 driveStatus = "正在开启视频…", parkingSupported = false, parkingSettings = null,
                 parkingUpdating = false, parkingStatus = "正在读取驻车设置…")
         }
@@ -1044,12 +1046,22 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     val target = desiredWheels
                     val sentGeneration = desiredGeneration
+                    val heartbeatStarted = System.nanoTime()
                     val ack = activeChannel.exchange(target.left, target.right)
+                    val interlock = ack.interlock?.takeIf { it.blocked }
+                    if (interlock != state.value.driveInterlock) Diagnostics.event("drive.infrared_interlock",
+                        driveDiagnostic, fields = mapOf("blocked" to (interlock != null),
+                            "directions" to interlock?.directions?.sorted()), critical = true)
                     mutableState.update {
-                        it.copy(driveConfirmedStopped = ack.stopped && desiredWheels.stopped && sentGeneration == desiredGeneration)
+                        it.copy(driveConfirmedStopped = ack.stopped && desiredWheels.stopped && sentGeneration == desiredGeneration,
+                            driveInterlock = interlock,
+                            driveStatus = interlock?.message() ?: if (activeChannel.ready.dryRun)
+                                "模拟控制 · 不驱动电机" else "手动控制已就绪 · 松手停车")
                     }
-                    // Keep at most one request in flight; always sample the latest joystick value.
-                    withTimeoutOrNull(100L) { driveWakeup.receive() }
+                    // Never queue motion or overlap requests. A slow ACK must not incur another
+                    // full 100 ms sleep before sampling the current target/stop request.
+                    val remaining = driveHeartbeatWaitMs(heartbeatStarted)
+                    if (remaining > 0) withTimeoutOrNull(remaining) { driveWakeup.receive() }
                 }
             } catch (cancelled: CancellationException) {
                 Diagnostics.event("drive.cancelled", driveDiagnostic, critical = true)
@@ -1079,7 +1091,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 mutableState.update {
                     it.withTransportState(client.isConnected).copy(driveStarting = false, driveEnabled = false, driveStopping = false,
-                        parkingSupported = false, parkingSettings = null, parkingUpdating = false,
+                        parkingSupported = false, parkingSettings = null, parkingUpdating = false, driveInterlock = null,
                         parkingStatus = if (parkingCleared && channel?.ready?.dryRun == true) "模拟驻车已关闭，模拟电流已清零"
                             else if (parkingCleared) "驻车已关闭，电机驻车电流已清零"
                             else if (it.driveError != null) it.parkingStatus

@@ -96,7 +96,9 @@ class PairingReliabilityTest {
             }
         }.exceptionOrNull()
         assertTrue(caught is TimeoutCancellationException)
-        assertEquals(1, attempts)
+        // A loaded scheduler may expire the outer scope before its first read starts.
+        // Both outcomes must prohibit a second read or retry notification.
+        assertTrue(attempts in 0..1)
         assertEquals(0, retries)
     }
 

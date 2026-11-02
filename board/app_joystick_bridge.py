@@ -23,11 +23,49 @@ import threading
 import time
 from typing import Any
 
+try:
+    from app_diagnostic_log import DiagnosticLog, NullDiagnosticLog
+except Exception:
+    DiagnosticLog = None
+
+    class NullDiagnosticLog:
+        """A missing optional logger must never disable parking or heartbeat handling."""
+        available = False
+
+        def event(self, *_args, **_kwargs):
+            pass
+
+        def failure(self, *_args, **_kwargs):
+            pass
+
+        def close(self, *_args, **_kwargs):
+            pass
+
+
+class BestEffortDiagnostic:
+    """Even an unavailable optional writer cannot interrupt STOP or control cleanup."""
+
+    def __init__(self, writer):
+        self.writer = writer
+
+    def event(self, *args, **kwargs):
+        with contextlib.suppress(Exception):
+            self.writer.event(*args, **kwargs)
+
+    def failure(self, *args, **kwargs):
+        with contextlib.suppress(Exception):
+            self.writer.failure(*args, **kwargs)
+
+    def close(self, *args, **kwargs):
+        with contextlib.suppress(Exception):
+            self.writer.close(*args, **kwargs)
+
 MAX_RPM = 100
 WATCHDOG_SECONDS = 0.6
 PARKING_TRANSACTION_SECONDS = 2.0
 MAX_PARKING_CURRENT = 60
 SERIAL_TIMEOUT = 0.15
+IR_POLL_SECONDS = 0.02
 MAX_LINE_BYTES = 512
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUEST_KEYS = {"seq", "token", "cmd", "left", "right"}
@@ -38,24 +76,98 @@ class SessionError(Exception):
     pass
 
 
+class InfraredInterlock:
+    """Read the three board IR inputs without writing to the SSH JSON stream."""
+
+    DEVICES = {"forward": 3, "right": 4, "left": 5}
+
+    def __init__(self, root: Path = Path("/sys/bus/iio/devices"), *, trigger_value: int = 0) -> None:
+        if trigger_value not in (0, 1):
+            raise ValueError("IR trigger value must be 0 or 1")
+        self.root = Path(root)
+        self.trigger_value = trigger_value
+
+    def blocked_directions(self) -> set[str]:
+        blocked = set()
+        for direction, device in self.DEVICES.items():
+            try:
+                raw = int((self.root / f"iio:device{device}" / "in_proximity_raw").read_text(encoding="ascii").strip())
+                if raw not in (0, 1):
+                    raise ValueError("IR value must be 0 or 1")
+                triggered = raw == self.trigger_value
+            except (OSError, ValueError):
+                triggered = True
+            if triggered:
+                blocked.add(direction)
+        return blocked
+
+
 class Motors:
     """Control motion and the launcher's verified electronic parking-current setting."""
 
-    def __init__(self, client: Any = None) -> None:
+    def __init__(self, client: Any = None, *, infrared: InfraredInterlock | None = None) -> None:
         self.client = client
+        self.infrared = infrared
         self.last_target: tuple[int, int] | None = None
+        self.requested_target = (0, 0)
+        self.ir_latched_directions: set[str] = set()
         self.parking_enabled = False
         self.parking_current = 5
 
-    def drive(self, left: int, right: int) -> None:
+    def drive(self, left: int, right: int) -> tuple[int, int]:
+        if (left, right) == (0, 0):
+            self.stop()
+            return (0, 0)
+        self.requested_target = (left, right)
+        # Recheck before deduplicating repeated joystick/heartbeat targets.
+        if self.check_infrared():
+            return (0, 0)
         if self.last_target == (left, right):
-            return
+            return self.last_target
         if self.client is not None:
             self.client.set_left_speed(left)
             self.client.set_right_speed(right)
         self.last_target = (left, right)
+        # Also cover a trigger that arrives during the serial transactions.
+        self.check_infrared()
+        return self.last_target
 
-    def stop(self, *, force: bool = False, emergency: bool = False) -> None:
+    def check_infrared(self) -> bool:
+        if self.infrared is None or self.requested_target == (0, 0):
+            return False
+        directions = self.requested_directions()
+        self.ir_latched_directions.update(directions & self.infrared.blocked_directions())
+        if not directions & self.ir_latched_directions:
+            return False
+        if self.last_target != (0, 0):
+            self.stop(emergency=True, release_interlock=False)
+        return True
+
+    def requested_directions(self) -> set[str]:
+        left, right = self.requested_target
+        directions = set()
+        # Raw motor signs on this board match keyboard --swap-turns:
+        # W=(+,-), D=(+,+), A=(-,-). Test both components for curved paths.
+        if left - right > 0:
+            directions.add("forward")
+        if left + right > 0:
+            directions.add("right")
+        elif left + right < 0:
+            directions.add("left")
+        return directions
+
+    def infrared_state(self) -> dict[str, Any]:
+        # Pure snapshot. Protocol formatting never performs another sysfs read.
+        directions = sorted(self.requested_directions() & self.ir_latched_directions)
+        blocked = (self.infrared is not None and self.requested_target != (0, 0)
+                   and self.last_target == (0, 0) and bool(directions))
+        return {"infraredBlocked": blocked, "infraredDirections": directions if blocked else []}
+
+    def stop(self, *, force: bool = False, emergency: bool = False, release_interlock: bool = True) -> None:
+        if release_interlock:
+            # An explicit stop/neutral joystick releases the blocked request.
+            self.requested_target = (0, 0)
+            self.ir_latched_directions.clear()
         if self.last_target == (0, 0) and not force and not emergency:
             return
         # Electronic parking locks the phase only after NORMAL stop (0).
@@ -92,7 +204,9 @@ class Motors:
         self.parking_current = current
         if changed and enabled:
             # A prior emergency stop will not engage a newly configured parking current.
-            self.stop(force=True)
+            # Updating parking is not a neutral joystick input and must not
+            # release an IR latch for a still-held movement request.
+            self.stop(force=True, release_interlock=False)
 
     def _write_parking_current(self, current: int) -> None:
         if self.client is None:
@@ -174,13 +288,15 @@ class ProtocolSession:
         self.dry_run = dry_run
         self.token = secrets.token_hex(16)
         self.next_seq = 1
+        self.run_id = secrets.token_hex(16)
 
     def ready(self) -> dict[str, Any]:
         # Match the keyboard launcher's initial parking OFF state, with readback.
         self.motors.shutdown()
-        return {"type": "ready", "token": self.token, "dryRun": self.dry_run,
+        return {"type": "ready", "token": self.token, "dryRun": self.dry_run, "runId": self.run_id,
                 "port": self.port, "maxRpm": MAX_RPM,
                 "watchdogMs": int(WATCHDOG_SECONDS * 1000), "parkingSupported": True,
+                "infraredSupported": self.motors.infrared is not None,
                 **self.motors.parking_state()}
 
     def accept(self, message: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -209,12 +325,14 @@ class ProtocolSession:
             self.motors.stop()
             left, right = 0, 0
         else:
-            self.motors.drive(left, right)
+            left, right = self.motors.drive(left, right)
+        infrared = (self.motors.infrared_state() if command == "drive" else
+                    {"infraredBlocked": False, "infraredDirections": []})
         self.next_seq += 1
         self.token = secrets.token_hex(16)
         return {"type": "ack", "seq": seq, "token": self.token, "left": left,
                 "right": right, "stopped": (left, right) == (0, 0),
-                **self.motors.parking_state()}, closing
+                **self.motors.parking_state(), **infrared}, closing
 
 
 class InputPump:
@@ -222,8 +340,11 @@ class InputPump:
 
     def __init__(self, fd: int) -> None:
         self.fd = fd
+        self.poll = lambda: None
         self.chunks: queue.Queue[bytes | Exception] = queue.Queue(maxsize=1)
         self.buffer = bytearray()
+        self.max_poll_seconds = 0.0
+        self.last_poll_seconds = 0.0
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self) -> None:
@@ -243,6 +364,21 @@ class InputPump:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SessionError("Control watchdog expired")
+            # Run on the motor-owning thread even when no new complete request
+            # arrives. A partial line must not postpone IR protection.
+            poll_started = time.monotonic()
+            try:
+                self.poll()
+            finally:
+                self.last_poll_seconds = time.monotonic() - poll_started
+                self.max_poll_seconds = max(self.max_poll_seconds, self.last_poll_seconds)
+            # A sensor read/stop may consume the remaining lease. Never use the
+            # old remaining value or accept a buffered request after expiry.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SessionError("Control watchdog expired")
+            if stopped.is_set():
+                raise SessionError("Session terminated")
             split = self.buffer.find(b"\n")
             if split >= 0:
                 if split > MAX_LINE_BYTES:
@@ -253,7 +389,7 @@ class InputPump:
             if len(self.buffer) > MAX_LINE_BYTES:
                 raise SessionError("Request line too long")
             try:
-                chunk = self.chunks.get(timeout=min(remaining, 0.05))
+                chunk = self.chunks.get(timeout=min(remaining, IR_POLL_SECONDS))
             except queue.Empty:
                 continue
             if isinstance(chunk, Exception):
@@ -277,26 +413,67 @@ class JsonOutput:
             raise SessionError("Control output blocked")
 
 
-def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Event) -> int:
+def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Event,
+                *, diagnostic_directory: Path | None = None, diagnostic: Any = None) -> int:
     output = JsonOutput(sys.stdout.fileno())
     session = ProtocolSession(motors, port=port, dry_run=dry_run)
+    if diagnostic is None:
+        directory = diagnostic_directory or (os.environ.get("APP_DRIVE_DIAGNOSTIC_TEST_DIR") if dry_run else None)
+        try:
+            diagnostic = (DiagnosticLog(Path(directory or PROJECT_ROOT / "app_drive_diagnostic_logs"), session.run_id)
+                          if DiagnosticLog is not None else NullDiagnosticLog())
+        except Exception:
+            diagnostic = NullDiagnosticLog()
+    diagnostic = BestEffortDiagnostic(diagnostic)
+    diagnostic.event("drive.session_started", critical=True, dryRun=dry_run, parentPid=os.getppid(),
+                     watchdogMs=int(WATCHDOG_SECONDS * 1000), infraredSupported=motors.infrared is not None)
     failed = False
     error_message = None
     cleanup_confirmed = False
+    phase = "ready"
+    pump = None
+    deadline = 0.0
+    last_received = None
+    last_ack_at = None
+    last_ack_seq = 0
+    last_request = None
+    request = None
+    received = None
+    processed_ms = None
+    request_gap_ms = None
+    prior_ir = False
+    previous_command = None
+    summary_at = time.monotonic()
+    sample_count = 0
+    max_processing_ms = 0.0
+    max_request_gap_ms = 0.0
     try:
         output.send(session.ready())
+        diagnostic.event("drive.ready_sent", critical=True)
         deadline = time.monotonic() + WATCHDOG_SECONDS
         pump = InputPump(sys.stdin.fileno())
+        pump.poll = motors.check_infrared
         while True:
+            phase = "request_wait"
             message = strict_message(pump.line(deadline, stopped))
             received = time.monotonic()
             if received >= deadline or stopped.is_set():
                 raise SessionError("Control watchdog expired or session terminated")
+            # Only bounded primitive metadata is retained. No request object or token
+            # can leak into this session's diagnostic timeline.
+            request = {key: message[key] if type(message[key]) is int and
+                       (1 <= message[key] <= 2**63 - 1 if key == "seq" else -MAX_RPM <= message[key] <= MAX_RPM)
+                       else None for key in ("seq", "left", "right")}
+            request["cmd"] = message["cmd"] if message["cmd"] in (
+                "drive", "stop", "estop", "close", "parking") else "invalid"
+            request_gap_ms = None if last_received is None else (received - last_received) * 1000
+            phase = "motor_transaction"
             response, closing = session.accept(message)
             # Terminal acceptance already verified emergency stop and both current clears.
             # Even if sending its ACK fails, repeating persistent writes adds no safety.
             cleanup_confirmed = closing
             completed = time.monotonic()
+            processed_ms = (completed - received) * 1000
             parking = message["cmd"] == "parking"
             # Only configuration with already stopped motors may outlive the motion lease.
             # Serial transactions themselves remain bounded by SERIAL_TIMEOUT.
@@ -306,23 +483,66 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
                                    "Motor transaction exceeded control watchdog")
             if stopped.is_set():
                 raise SessionError("Session terminated")
+            phase = "ack_write"
             output.send(response)
+            ack_at = time.monotonic()
+            last_ack_at = ack_at
+            last_ack_seq = response["seq"]
+            last_request = request
+            last_received = received
+            sample_count += 1
+            max_processing_ms = max(max_processing_ms, processed_ms)
+            max_request_gap_ms = max(max_request_gap_ms, request_gap_ms or 0.0)
+            blocked = response["infraredBlocked"]
+            if closing or blocked != prior_ir or previous_command != message["cmd"] or completed - summary_at >= 1:
+                diagnostic.event("drive.ack_sent", critical=closing or blocked != prior_ir,
+                    lastValidRequest=last_request, lastAckSeq=last_ack_seq,
+                    receivedMonotonicMs=received * 1000, ackMonotonicMs=ack_at * 1000,
+                    requestGapMs=request_gap_ms, processingMs=processed_ms,
+                    sampleCount=sample_count, maxProcessingMs=max_processing_ms,
+                    maxRequestGapMs=max_request_gap_ms,
+                    maxIrPollMs=getattr(pump, "max_poll_seconds", 0) * 1000,
+                    infraredBlocked=blocked, infraredDirections=response["infraredDirections"])
+                summary_at, sample_count = completed, 0
+                max_processing_ms = max_request_gap_ms = 0.0
+            prior_ir, previous_command = blocked, message["cmd"]
             if closing:
                 break
             deadline = (completed if parking else received) + WATCHDOG_SECONDS
     except Exception as error:
         failed = True
         error_message = f"{type(error).__name__}: {error}"
+        now = time.monotonic()
+        source = ("signal" if stopped.is_set() else
+                  "motor_transaction_timeout" if phase == "motor_transaction" and "watchdog" in str(error) else
+                  "parking_transaction_timeout" if phase == "motor_transaction" and "Parking transaction exceeded" in str(error) else
+                  "heartbeat_timeout" if "watchdog" in str(error)
+                  else "input_eof" if "input closed" in str(error) else "control_error")
+        diagnostic.failure("drive.failure", error, phase=phase, stopSource=source,
+            request=request, lastValidRequest=last_request, lastAckSeq=last_ack_seq,
+            requestGapMs=request_gap_ms, processingMs=processed_ms,
+            lastRequestAgeMs=None if last_received is None else (now - last_received) * 1000,
+            lastAckAgeMs=None if last_ack_at is None else (now - last_ack_at) * 1000,
+            leaseRemainingMs=(deadline - now) * 1000,
+            lastIrPollMs=getattr(pump, "last_poll_seconds", 0) * 1000,
+            maxIrPollMs=getattr(pump, "max_poll_seconds", 0) * 1000,
+            infrared=motors.infrared_state())
     finally:
+        diagnostic.event("drive.cleanup_started", critical=True, alreadyStopped=cleanup_confirmed)
         if not cleanup_confirmed:
             try:
                 motors.shutdown()
+                cleanup_confirmed = True
             except Exception as error:
                 failed = True
                 error_message = f"{error_message + '; ' if error_message else ''}{error}"
+                diagnostic.failure("drive.cleanup_failed", error)
         if error_message:
             with contextlib.suppress(Exception):
-                output.send({"type": "error", "error": error_message[:700]})
+                output.send({"type": "error", "error": error_message[:700], "runId": session.run_id})
+        diagnostic.event("drive.finished", critical=True, exitCode=1 if failed else 0,
+                         cleanupConfirmed=cleanup_confirmed)
+        diagnostic.close(timeout=.1)  # Bounded flush after motor cleanup, never on a heartbeat.
     return 1 if failed else 0
 
 
@@ -357,7 +577,7 @@ def reject_other_serial_owners(port: str) -> None:
 
 
 @contextlib.contextmanager
-def open_hardware(port_choice: str):
+def open_hardware(port_choice: str, *, infrared: InfraredInterlock | None = None):
     import fcntl
     import termios
 
@@ -366,6 +586,9 @@ def open_hardware(port_choice: str):
     from lz30ema_rs485 import LZ30EMAClient
     import serial
 
+    # Hardware sessions always enable IR; no launcher flag is required.
+    if infrared is None:
+        infrared = InfraredInterlock()
     lock_path = PROJECT_ROOT / ".app_joystick.lock"
     with lock_path.open("a") as lock:
         try:
@@ -390,7 +613,7 @@ def open_hardware(port_choice: str):
                     client = LZ30EMAClient(transport, slave=1)
                     client.read_device_info()  # Probe only; never initialize settings or telemetry.
                     selected = client
-                    yield Motors(client), port
+                    yield Motors(client, infrared=infrared), port
                     return
                 except (SessionError, KeyboardInterrupt):
                     raise
@@ -410,6 +633,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--port", default="auto", choices=("auto", "/dev/ttyS0", "/dev/ttyS3"))
+    parser.add_argument(
+        "--ir-sysfs-root", type=Path, default=os.environ.get("LZ_IR_SYSFS_ROOT"),
+        help="IR IIO directory (hardware default: /sys/bus/iio/devices); also enables simulated IR in dry-run.",
+    )
+    parser.add_argument(
+        "--ir-trigger-value", type=int, choices=(0, 1), default=os.environ.get("LZ_IR_TRIGGER_VALUE", "0"),
+        help="Digital IR trigger value. Default: 0 (active low).",
+    )
     args = parser.parse_args()
     stopped = threading.Event()
     for name in ("SIGTERM", "SIGINT", "SIGHUP"):
@@ -418,8 +649,12 @@ def main() -> int:
             signal.signal(value, lambda *_: stopped.set())
     try:
         if args.dry_run:
-            return run_session(Motors(), "dry-run", True, stopped)
-        with open_hardware(args.port) as (motors, port):
+            infrared = (InfraredInterlock(args.ir_sysfs_root, trigger_value=args.ir_trigger_value)
+                        if args.ir_sysfs_root is not None else None)
+            return run_session(Motors(infrared=infrared), "dry-run", True, stopped)
+        infrared = InfraredInterlock(args.ir_sysfs_root or Path("/sys/bus/iio/devices"),
+                                     trigger_value=args.ir_trigger_value)
+        with open_hardware(args.port, infrared=infrared) as (motors, port):
             return run_session(motors, port, False, stopped)
     except Exception as error:
         with contextlib.suppress(Exception):
