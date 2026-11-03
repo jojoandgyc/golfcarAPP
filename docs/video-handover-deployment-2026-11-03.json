@@ -134,9 +134,119 @@
       "temporaryTestIdentityAndImportFileRemoved": true
     }
   },
-  "pending": [
-    "Phone APK installation: phone was unplugged before installation.",
-    "Real Wi-Fi to cellular and back validation: opt-in test is implemented but not executed this round. Emulator recovery injects a network notice; it does not change the physical network."
-  ],
-  "scope": "Only domestic relay deployed. Overseas services, board Wi-Fi, motor configuration, control heartbeat and stop rules unchanged."
+  "pending": [],
+  "scope": "Only domestic relay deployed. Overseas services, board Wi-Fi, motor configuration, control heartbeat and stop rules unchanged.",
+  "phoneDelivery": {
+    "installed": true,
+    "versionName": "1.8.6-video-handover",
+    "versionCode": 17,
+    "deviceModel": "Samsung SM-S9280",
+    "codeCommit": "7f7c53f",
+    "verifiedDate": "2026-11-03",
+    "test": "RemoteVideoIntegrationTest with remoteVideoSynthetic=true and remoteVideoHandover=true",
+    "passed": true,
+    "durationSeconds": 72.299,
+    "metrics": [
+      {
+        "marker": "REMOTE_VIDEO_STEADY_STATE",
+        "phoneLocalTime": "11-03 18:46:57.435",
+        "data": {
+          "sampleSeconds": 30.484514832,
+          "decodedFrameDelta": 601,
+          "decodedFps": 19.714927507034567,
+          "rttSamples": 11,
+          "rttP50Ms": 106,
+          "rttP95Ms": 152,
+          "rttValuesMs": [
+            101,
+            102,
+            102,
+            104,
+            104,
+            106,
+            106,
+            107,
+            108,
+            112,
+            152
+          ],
+          "protocols": "udp/udp/udp"
+        }
+      },
+      {
+        "marker": "REMOTE_VIDEO_SYNTHETIC_OK",
+        "phoneLocalTime": "11-03 18:46:57.784",
+        "data": {
+          "state": "playing",
+          "failure": "",
+          "candidateType": "relay",
+          "title": "FollowingCarVideo:playing",
+          "messageEmpty": true,
+          "roundTripMs": 104,
+          "statsSequence": 13,
+          "localProtocol": "udp",
+          "relayProtocol": "udp",
+          "remoteProtocol": "udp",
+          "readerGeneration": 1,
+          "framesDecoded": 675,
+          "width": 1280,
+          "height": 480,
+          "readyState": 4
+        }
+      },
+      {
+        "marker": "REMOTE_VIDEO_RECOVERY_OK",
+        "phoneLocalTime": "11-03 18:47:14.077",
+        "data": {
+          "stage": "wifi_to_cellular",
+          "recoveryMs": 7962,
+          "stableSampleMs": 8250,
+          "readerGenerationBefore": 1,
+          "readerGenerationAfter": 5,
+          "decodedFrameDelta": 121,
+          "frameAdvanceSamples": 2,
+          "phoneTransport": "移动网络",
+          "internetValidated": true,
+          "localProtocol": "udp",
+          "relayProtocol": "udp",
+          "roundTripMs": 119,
+          "controlConnected": false
+        }
+      },
+      {
+        "marker": "REMOTE_VIDEO_RECOVERY_OK",
+        "phoneLocalTime": "11-03 18:47:31.396",
+        "data": {
+          "stage": "cellular_to_wifi",
+          "recoveryMs": 9090,
+          "stableSampleMs": 8224,
+          "readerGenerationBefore": 5,
+          "readerGenerationAfter": 7,
+          "decodedFrameDelta": 121,
+          "frameAdvanceSamples": 2,
+          "phoneTransport": "Wi-Fi",
+          "internetValidated": true,
+          "localProtocol": "udp",
+          "relayProtocol": "udp",
+          "roundTripMs": 99,
+          "controlConnected": false
+        }
+      }
+    ],
+    "wifiRestored": true,
+    "vpnActive": false,
+    "originalKeepAwakeSettingPreserved": true,
+    "existingRemoteIdentityPreserved": true,
+    "originalTestApkRestored": true,
+    "appLeftForeground": true,
+    "testScope": "Real phone Wi-Fi to cellular to Wi-Fi, using physical network switching and real domestic WHEP/TURN media. SSH-disconnected UI state is injected; no live drive/follow control session is started. Recovery time includes network switching and confirming new decoded frames; it is not steady-state video latency.",
+    "cleanup": {
+      "ownedSyntheticSourceStopped": true,
+      "port8554Closed": true,
+      "controlAvailable": true,
+      "originalVideoServices": "inactive",
+      "cameraOpened": false,
+      "motorOpened": false
+    }
+  }
 }
