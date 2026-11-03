@@ -30,6 +30,26 @@ class BoardPagesTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
 
     @Test
+    fun parkingCurrentEditorIsReachableWithoutStartingDriveOrReadingRegisters() {
+        val vm = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        compose.onNodeWithTag("pageJoystick").performClick()
+        compose.onNodeWithTag("manualParkingTab").performClick()
+        compose.onNodeWithTag("parkingCurrentSettingsButton").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("parkingSwitch").assertDoesNotExist()
+        compose.onNodeWithTag("enableDrive").assertDoesNotExist()
+        compose.onNodeWithTag("parkingCurrentDone").assertIsDisplayed().assertIsEnabled()
+        compose.runOnIdle {
+            assertFalse(vm.state.value.manualActive)
+            assertFalse(vm.state.value.busy)
+            assertNull(vm.motorConfiguration.value.snapshot)
+            assertFalse(vm.motorConfiguration.value.busy)
+        }
+        compose.onNodeWithTag("parkingCurrentDone").performClick()
+        compose.onNodeWithTag("parkingSwitch").assertExists()
+        compose.onNodeWithTag("enableDrive").assertIsDisplayed().assertIsNotEnabled()
+    }
+
+    @Test
     fun tabsShowConnectionFollowJoystickMotorAndTerminalControls() {
         showLocalLoginSettings()
         compose.onNodeWithTag("host").assertExists()

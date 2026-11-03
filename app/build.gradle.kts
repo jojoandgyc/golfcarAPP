@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 20
-        versionName = "1.8.9-parking-status"
+        versionCode = 21
+        versionName = "1.8.10-parking-current"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

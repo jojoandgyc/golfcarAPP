@@ -790,20 +790,31 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshMotorConfiguration() {
+        refreshMotorConfiguration(preserveDrafts = false)
+    }
+
+    /** The parking editor reads the same guarded snapshot without clearing motor-page edits. */
+    fun refreshParkingCurrentConfiguration() {
+        refreshMotorConfiguration(preserveDrafts = true)
+    }
+
+    private fun refreshMotorConfiguration(preserveDrafts: Boolean) {
         if (disconnecting || !state.value.canReadMotorConfiguration || motorConfiguration.value.busy) return
         val recoveringAction = state.value.motorActionUnconfirmed
         val connection = motorConfiguration.value.connection
         val writeMode = motorConfiguration.value.writeMode
+        val savedDrafts = if (preserveDrafts) motorConfiguration.value.draftValues else emptyMap()
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         mutableState.update { it.copy(busy = true, status = "正在读取电机配置…") }
         mutableMotorConfiguration.update { it.copy(reading = true, error = null) }
-        Diagnostics.event("motor_config.read_requested", diagnostic, source = "USER_MOTOR_CONFIG")
+        Diagnostics.event("motor_config.read_requested", diagnostic,
+            source = if (preserveDrafts) "USER_PARKING_CURRENT" else "USER_MOTOR_CONFIG")
         operation = viewModelScope.launch {
             try {
                 val reply = client.motorConfigurationRequest(diagnostic = diagnostic, connection = connection)
                 val recovered = recoveringAction && motorActionRecoveryReadConfirmed(reply) && persistMotorActionLock(false)
                 mutableMotorConfiguration.value = MotorConfigurationUiState(snapshot = reply.snapshot,
-                    connection = connection, writeMode = writeMode,
+                    connection = connection, writeMode = writeMode, draftValues = savedDrafts,
                     requiresRead = !reply.ok, message = when {
                         recovered -> "板端占用、零转速/输出及通讯控制来源已核对，恢复控制；这是读取观测，不代表物理停稳"
                         recoveringAction -> "电机操作状态仍未确认，控制保持锁定；需读取到空闲、零转速/输出及通讯控制来源"
@@ -811,6 +822,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         else -> null
                     },
                     error = reply.error ?: if (!reply.ok) "读取未完成，请重试" else null)
+                rememberReadParkingSettings(reply.snapshot)
                 Diagnostics.event("motor_config.read_completed", diagnostic, fields = mapOf("ok" to reply.ok), critical = true)
             } catch (cancelled: CancellationException) {
                 if (recoveringAction) retainMotorActionLock()
@@ -861,12 +873,29 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun applyMotorConfiguration(plan: MotorConfigurationWritePlan) {
         if (disconnecting || !state.value.canConfigureMotor ||
             plan != motorConfigurationWritePlan(motorConfiguration.value)) return
+        executeMotorConfigurationWrite(plan, preserveDrafts = false)
+    }
+
+    /** Only these two reviewed persistent settings may be submitted from the parking page. */
+    fun applyParkingCurrentConfiguration(plan: MotorConfigurationWritePlan) {
+        if (disconnecting || !state.value.canConfigureMotor ||
+            !parkingCurrentWritePlanIsCurrent(motorConfiguration.value, plan)) return
+        executeMotorConfigurationWrite(plan, preserveDrafts = true)
+    }
+
+    private fun rememberReadParkingSettings(snapshot: MotorConfigurationSnapshot?) {
+        val settings = parkingCurrentSettings(snapshot) ?: return
+        mutableState.update { it.copy(lastReadParkingSettings = settings) }
+    }
+
+    private fun executeMotorConfigurationWrite(plan: MotorConfigurationWritePlan, preserveDrafts: Boolean) {
         val connection = motorConfiguration.value.connection
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         mutableState.update { it.copy(busy = true, status = "正在保存电机配置…") }
         mutableMotorConfiguration.update { it.copy(applying = true, requiresRead = true,
             writeResults = emptyList(), error = null, message = "正在写入并核对回读，请等待结果") }
-        Diagnostics.event("motor_config.write_requested", diagnostic, source = "USER_MOTOR_CONFIG",
+        Diagnostics.event("motor_config.write_requested", diagnostic,
+            source = if (preserveDrafts) "USER_PARKING_CURRENT" else "USER_MOTOR_CONFIG",
             fields = mapOf("fields" to plan.changes.map { it.field.id }, "count" to plan.changes.size,
                 "writeMode" to plan.writeMode.name), critical = true)
         operation = viewModelScope.launch {
@@ -878,7 +907,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                             MotorConfigurationWriteOutcome.WRITE_OUTCOME_UNKNOWN else MotorConfigurationWriteOutcome.NOT_ATTEMPTED)
                 }
                 mutableMotorConfiguration.update { current -> current.copy(snapshot = reply.snapshot ?: current.snapshot,
-                    draftValues = if (reply.ok) emptyMap() else current.draftValues,
+                    draftValues = if (reply.ok && !preserveDrafts) emptyMap() else current.draftValues,
                     requiresRead = !reply.ok || reply.reconnectRequired,
                     writeResults = results,
                     message = when {
@@ -888,6 +917,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         else -> "已写入并回读确认，使用驱动器的断电保存指令"
                     },
                     error = reply.error ?: if (!reply.ok) "请核对下方每项结果" else null) }
+                rememberReadParkingSettings(reply.snapshot)
                 Diagnostics.event("motor_config.write_completed", diagnostic,
                     fields = mapOf("ok" to reply.ok, "writeMayHaveOccurred" to reply.writeMayHaveOccurred,
                         "results" to results.map { "${it.field.id}:${it.outcome.name}" }), critical = true)

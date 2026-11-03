@@ -1,0 +1,90 @@
+{
+  "recordedAtUtc": "2026-11-03T15:14:30.427617+00:00",
+  "app": {
+    "versionCode": 21,
+    "versionName": "1.8.10-parking-current",
+    "apkSha256": "264403bd2c6477dc39fc9063df7828b4ec43f233507eef6fb4a70ae4143efd66",
+    "phoneInstallation": {
+      "status": "installed",
+      "installedAtUtc": "2026-11-03T15:14:53.436258+00:00",
+      "versionCode": 21,
+      "versionName": "1.8.10-parking-current",
+      "installedApkSha256": "264403bd2c6477dc39fc9063df7828b4ec43f233507eef6fb4a70ae4143efd66",
+      "connectionPreferencesPreserved": true,
+      "preInstallControlCheck": {
+        "activeControls": [],
+        "serialIdle": true
+      },
+      "appLaunchedByAgent": false,
+      "hardwareCommandsSent": false
+    }
+  },
+  "sourceBaseCommit": "f25debe",
+  "boardChanges": false,
+  "entry": "Manual > Parking > Set parking current",
+  "behavior": {
+    "explicitReadRequired": true,
+    "leftAndRightEditedIndependently": true,
+    "stepAmps": 1,
+    "supportsExactDecimalInput": true,
+    "limits": "0..60 A and not above the saved maximum output current",
+    "writeMode": "persistent FC10",
+    "previewAndExplicitApplyRequired": true,
+    "allowedFields": [
+      "left_parking_current",
+      "right_parking_current"
+    ],
+    "unchangedFieldsNotSubmitted": true,
+    "otherMotorPageDraftsPreserved": true,
+    "controlMustBeIdle": true,
+    "snapshotAndOriginalValuesRechecked": true,
+    "perSideReadbackRequired": true,
+    "automaticRetry": false,
+    "automaticParkingOrDriveStart": false,
+    "zeroAmpsBlocksParkingEnable": true
+  },
+  "validation": {
+    "jvm": {
+      "tests": 268,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorUiAndProtocol": {
+      "tests": 54,
+      "passed": 54,
+      "skipped": 0
+    },
+    "boardConfigurationOffline": {
+      "tests": 44,
+      "passed": 44
+    },
+    "productionAppToPythonSimulator": {
+      "includedInEmulatorCount": true,
+      "requestedCurrentsAmps": [
+        5,
+        5
+      ],
+      "writes": [
+        {
+          "address": "0x006D",
+          "function": 16,
+          "raw": 500
+        },
+        {
+          "address": "0x0076",
+          "function": 16,
+          "raw": 500
+        }
+      ],
+      "otherRegistersUnchanged": true,
+      "staleSnapshotRejectedWithoutWrites": true
+    },
+    "realHardwareConfigurationWritesByAgent": false,
+    "realMotorTestsPerformed": false
+  },
+  "limitations": [
+    "The two saved currents are written sequentially, not atomically; partial or uncertain results require an explicit fresh read.",
+    "The existing configuration guard observes zero RPM/PWM and communication ownership; it is not proof of electrical isolation or mechanical standstill."
+  ]
+}
