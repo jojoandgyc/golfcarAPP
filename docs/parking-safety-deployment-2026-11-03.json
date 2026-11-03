@@ -6,8 +6,20 @@
     "apkSha256": "9f426e16eab9688a1b6bfe59416fecbb30d906c1c809eb3005b576d6df7348c3",
     "previousApkSha256": "58d67c35070ac85d49f44a7e688be851b6f518c43eb3249181e439a533dd4da1",
     "phoneInstallation": {
-      "status": "pending",
-      "reason": "Physical phone is not currently detected by adb; only emulator is connected."
+      "status": "installed",
+      "installedAtUtc": "2026-11-03T14:45:31.561281+00:00",
+      "model": "SM-S9280",
+      "verifiedVersionCode": 19,
+      "verifiedVersionName": "1.8.8-parking-feedback",
+      "installedApkSha256": "9f426e16eab9688a1b6bfe59416fecbb30d906c1c809eb3005b576d6df7348c3",
+      "connectionPreferencesPreserved": true,
+      "preInstallControlCheck": {
+        "activeControls": [],
+        "serialIdle": true,
+        "bridgeSha256": "71db3daaae6c666120a02a9ec0377ba24170a68bf67ef149a9261bdebb43c021"
+      },
+      "appLaunchedByAgent": false,
+      "hardwareCommandsSent": false
     }
   },
   "bridge": {
