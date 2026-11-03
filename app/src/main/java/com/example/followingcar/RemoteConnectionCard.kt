@@ -34,7 +34,7 @@ internal fun RemoteConnectionCard(state: BoardUiState, onImport: () -> Unit) {
                 Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("remoteProfileError"))
             }
             if (state.remoteProfileLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            OutlinedButton(onClick = onImport, enabled = state.canManageConnectionMode,
+            OutlinedButton(onClick = onImport, enabled = state.canSelectRemoteMode,
                 modifier = Modifier.fillMaxWidth().testTag("importRemoteProfile")) {
                 Text(if (profile == null) "导入远程配置" else "更换远程配置")
             }

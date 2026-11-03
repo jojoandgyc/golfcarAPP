@@ -87,6 +87,7 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         if (::boardViewModel.isInitialized) {
             boardViewModel.recordUiEvent("ui.activity_paused")
+            boardViewModel.setNetworkForeground(false)
             boardViewModel.onControlSurfaceHidden("App 已离开前台", ControlStopSource.APP_PAUSED)
         }
         super.onPause()
@@ -96,6 +97,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         if (::boardViewModel.isInitialized) {
             boardViewModel.recordUiEvent("ui.activity_resumed")
+            boardViewModel.setNetworkForeground(true)
             if (!boardViewModel.pairing.state.value.busy) boardViewModel.wifiDirect.refreshStatus()
             boardViewModel.pairing.refresh()
         }
@@ -129,6 +131,9 @@ private enum class ManualSection { DRIVE, PARKING, CAMERA }
 @Composable
 private fun BoardScreen(viewModel: BoardViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val networkHealth by viewModel.networkHealth.collectAsStateWithLifecycle()
+    val networkNow by viewModel.networkNow.collectAsStateWithLifecycle()
+    val networkRefreshing by viewModel.networkRefreshing.collectAsStateWithLifecycle()
     val wireless by viewModel.wifiDirect.state.collectAsStateWithLifecycle()
     val pairing by viewModel.pairing.state.collectAsStateWithLifecycle()
     val motorConfiguration by viewModel.motorConfiguration.collectAsStateWithLifecycle()
@@ -146,7 +151,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     }
     val networkPermission = "android.permission.ACCESS_LOCAL_NETWORK"
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
-        if (allowed) viewModel.connect(viaWifiDirect = useWifiDirect) else viewModel.permissionDenied()
+        if (allowed) viewModel.connect(viaWifiDirect = useWifiDirect && !viewModel.state.value.remoteMode) else viewModel.permissionDenied()
     }
     val remoteImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(viewModel::importRemoteConfiguration)
@@ -195,12 +200,13 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     val connect: () -> Unit = {
         val current = viewModel.state.value
         val currentWireless = viewModel.wifiDirect.state.value
-        if (current.canRecoverConnection && !current.pairingBusy && !current.pairingUnconfirmed && !currentWireless.busy && !currentWireless.confirmationRequired &&
-            (!useWifiDirect || !currentWireless.discovering)) {
+        if (current.canRecoverConnection && !current.pairingBusy && !viewModel.wifiDirect.mutationPending &&
+            (current.remoteMode || (!current.pairingUnconfirmed && !currentWireless.busy && !currentWireless.confirmationRequired &&
+            (!useWifiDirect || !currentWireless.discovering)))) {
             keyboard?.hide()
             if (!current.remoteMode && Build.VERSION.SDK_INT >= 37 &&
                 ContextCompat.checkSelfPermission(context, networkPermission) != PackageManager.PERMISSION_GRANTED
-            ) permissionLauncher.launch(networkPermission) else viewModel.connect(viaWifiDirect = useWifiDirect)
+            ) permissionLauncher.launch(networkPermission) else viewModel.connect(viaWifiDirect = useWifiDirect && !current.remoteMode)
         }
     }
     val selectPage: (BoardPage) -> Unit = { next ->
@@ -280,6 +286,15 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     )
                 }
             }
+            if (page == BoardPage.JOYSTICK || page == BoardPage.FOLLOW || page == BoardPage.MOTOR) {
+                BoardNetworkStatusCard(networkHealth, networkNow, state.connected, state.remoteMode,
+                    canReconnectRemote = state.canReconnectViaRemote && !viewModel.wifiDirect.mutationPending,
+                    refreshing = networkRefreshing, onRefresh = viewModel::refreshNetworkHealth,
+                    onReconnectRemote = { useWifiDirect = false; viewModel.reconnectViaRemote() },
+                    modifier = Modifier.fillMaxWidth(), compact = true,
+                    canRefresh = !state.busy && !state.manualActive && !state.followActive &&
+                        !state.followStopping && !state.videoServiceBusy && !state.pairingBusy)
+            }
             if (page == BoardPage.JOYSTICK) {
                 JoystickCard(state, viewModel,
                     modifier = Modifier.fillMaxWidth().weight(1f).testTag("manualPage"))
@@ -336,6 +351,12 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                     }
                     when (page) {
                         BoardPage.CONNECTION -> {
+                            BoardNetworkStatusCard(networkHealth, networkNow, state.connected, state.remoteMode,
+                                canReconnectRemote = state.canReconnectViaRemote && !viewModel.wifiDirect.mutationPending,
+                                refreshing = networkRefreshing, onRefresh = viewModel::refreshNetworkHealth,
+                                onReconnectRemote = { useWifiDirect = false; viewModel.reconnectViaRemote() },
+                                canRefresh = !state.busy && !state.manualActive && !state.followActive &&
+                                    !state.followStopping && !state.videoServiceBusy && !state.pairingBusy)
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 FilterChip(selected = !state.remoteMode && !useWifiDirect, onClick = { viewModel.setRemoteMode(false); useWifiDirect = false },
                                     enabled = state.canManageConnectionMode && !wireless.busy && (!useWifiDirect || !wireless.discovering),
@@ -346,11 +367,11 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                     label = { Text("Wi-Fi 直连") }, modifier = Modifier.weight(1f).testTag("connectionDirectMode"))
                                 FilterChip(selected = state.remoteMode,
                                     onClick = { viewModel.setRemoteMode(true); useWifiDirect = false },
-                                    enabled = state.canManageConnectionMode && !wireless.busy && !wireless.discovering,
+                                    enabled = state.canSelectRemoteMode && !viewModel.wifiDirect.mutationPending,
                                     label = { Text("远程") }, modifier = Modifier.weight(1f).testTag("connectionRemoteMode"))
                             }
                             if (state.remoteMode) RemoteConnectionCard(state,
-                                onImport = { if (viewModel.state.value.canManageConnectionMode) {
+                                onImport = { if (viewModel.state.value.canSelectRemoteMode && !viewModel.wifiDirect.mutationPending) {
                                     keyboard?.hide()
                                     remoteImportLauncher.launch(arrayOf("application/json", "application/octet-stream", "text/plain"))
                                 } })
@@ -358,7 +379,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                 sshConnected = state.connected, onPair = pair, onCancel = viewModel.pairing::cancel,
                                 onCheck = viewModel.pairing::retryStatus, onStopHotspot = viewModel.pairing::stopHotspot,
                                 onCheckBluetooth = { address -> beginPairingAction(address, true) })
-                            if (!useWifiDirect && wireless.confirmationRequired) {
+                            if (!state.remoteMode && !useWifiDirect && wireless.confirmationRequired) {
                                 Text("上次直连操作结果尚未确认，请先刷新无线状态再连接 SSH。", style = MaterialTheme.typography.bodySmall)
                                 OutlinedButton(onClick = viewModel.wifiDirect::refresh, enabled = !wireless.busy,
                                     modifier = Modifier.testTag("connectionRefreshWireless")) { Text("刷新无线状态") }
@@ -382,8 +403,9 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                 onUseAddress = viewModel::selectWifiDirectAddress,
                             )
                             if (!state.connected) ConnectionCard(state, viewModel, connect,
-                                networkReady = !pairing.busy && !pairing.confirmationRequired && !wireless.busy && !wireless.confirmationRequired && (!useWifiDirect || !wireless.discovering) &&
-                                    (!useWifiDirect || (DirectNetworkLease.from(wireless) != null && wifiDirectHostForConnection(wireless, state.host) != null)),
+                                networkReady = !pairing.busy && !viewModel.wifiDirect.mutationPending && (state.remoteMode ||
+                                    (!pairing.confirmationRequired && !wireless.busy && !wireless.confirmationRequired && (!useWifiDirect || !wireless.discovering) &&
+                                    (!useWifiDirect || (DirectNetworkLease.from(wireless) != null && wifiDirectHostForConnection(wireless, state.host) != null)))),
                                 networkHint = if (useWifiDirect && wireless.groupExists && !wireless.busy && !wireless.discovering && !wireless.confirmationRequired)
                                     "请选择已加入的开发板 IP，或填写当前无线组内的地址；不能沿用原热点 IP。"
                                     else "请先完成无线组操作并停止搜索。",

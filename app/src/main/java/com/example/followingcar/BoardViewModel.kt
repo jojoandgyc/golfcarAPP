@@ -91,6 +91,9 @@ data class BoardUiState(
     val connectionPort: String get() = if (remoteMode) (remoteProfile?.controlPort ?: DEFAULT_REMOTE_CONTROL_PORT).toString() else port
     val canManageConnectionMode: Boolean get() = canRecoverConnection && !pairingBusy &&
         !pairingUnconfirmed && !remoteProfileLoading
+    // An uncertain local wireless group must not block recovery through an independent public route.
+    val canSelectRemoteMode: Boolean get() = canRecoverConnection && !pairingBusy && !remoteProfileLoading
+    val canReconnectViaRemote: Boolean get() = canSelectRemoteMode && remoteProfile != null && remoteProfileError == null
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followStopping || followUncertain
     val canEnableDrive: Boolean get() = connected && !busy && !motorActionUnconfirmed && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
@@ -133,6 +136,20 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     internal val remoteVideo = mutableRemoteVideo.asStateFlow()
     private var followRecovery = FollowRecoverySnapshot.restore(recoveryPreferences.all)
     private val client = BoardSshClient()
+    private val networkMonitor = BoardNetworkMonitor(application)
+    private val reachabilityProbe = BoardReachabilityProbe()
+    private val localPresenceDiagnostic = Diagnostics.newContext()
+    private val remotePresenceDiagnostic = Diagnostics.newContext()
+    private val mutableNetworkHealth = MutableStateFlow(BoardNetworkHealth())
+    val networkHealth = mutableNetworkHealth.asStateFlow()
+    private val mutableNetworkNow = MutableStateFlow(SystemClock.elapsedRealtime())
+    val networkNow = mutableNetworkNow.asStateFlow()
+    private val mutableNetworkRefreshing = MutableStateFlow(false)
+    val networkRefreshing = mutableNetworkRefreshing.asStateFlow()
+    private var networkForeground = false
+    private var networkProbeJob: Job? = null
+    private var networkProbeGeneration = 0L
+    private var nextNetworkProbeAt = 0L
     private val ownerDiagnostic = Diagnostics.newContext()
     private var followDiagnostic = followRecovery?.context ?: DiagnosticContext(
         preferences.getString("last_follow_operation", null) ?: Diagnostics.newContext().operationId)
@@ -199,6 +216,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val videoServiceMutex = Mutex()
     private var videoServiceJob: Job? = null
     private var disconnecting = false
+    private var intentionalConnectionClose = false
     private var driveJob: Job? = null
     private var driveChannel: BoardDriveChannel? = null
     private var desiredWheels = WheelSpeeds()
@@ -215,6 +233,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         Diagnostics.event("viewmodel.created", ownerDiagnostic)
+        observeNetworkHealth()
         viewModelScope.launch {
             try { reloadRemoteIdentity() }
             catch (_: Exception) {
@@ -305,6 +324,169 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         else -> motorActionDiagnostic ?: ownerDiagnostic.copy(connectionId = client.diagnosticConnectionId)
     }
 
+    /** Observation is independent of the control socket and never sends a control command. */
+    private fun observeNetworkHealth() {
+        viewModelScope.launch {
+            networkMonitor.state.collect { phone ->
+                val previous = mutableNetworkHealth.value.phone
+                mutableNetworkHealth.update { it.copy(phone = phone) }
+                if (phone.revision != previous.revision) {
+                    cancelNetworkProbe()
+                    // A default-network/Internet change does not prove the local car link was lost.
+                    // Keep bounded, authenticated evidence until a path-specific check/ACK replaces it.
+                    nextNetworkProbeAt = 0L
+                }
+            }
+        }
+        viewModelScope.launch {
+            var previous = state.value
+            var settings: List<Any?>? = null
+            state.collect { current ->
+                // Compared only in memory: never log the credential or its digest.
+                val currentSettings = listOf(current.host, current.port, current.username, current.password,
+                    current.remoteProfile, current.remoteProfileError, current.remoteProfileLoading)
+                if (settings != currentSettings) {
+                    settings = currentSettings
+                    cancelNetworkProbe()
+                    mutableNetworkHealth.update { it.copy(local = RouteHealth(), remote = RouteHealth(
+                        status = if (current.remoteProfile == null && !current.remoteProfileLoading)
+                            Reachability.NOT_CONFIGURED else Reachability.UNKNOWN)) }
+                    nextNetworkProbeAt = 0L
+                }
+                if (previous.connected && !current.connected && !disconnecting && !intentionalConnectionClose) {
+                    val route = if (previous.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL
+                    mutableNetworkHealth.update { health ->
+                        health.updateRoute(route, health.route(route).unavailable(SystemClock.elapsedRealtime()))
+                    }
+                    cancelNetworkProbe()
+                    nextNetworkProbeAt = 0L
+                    Diagnostics.event("network.control_connection_lost", activeDiagnostic(), fields = mapOf(
+                        "route" to route.name, "phoneInternetValidated" to mutableNetworkHealth.value.phone.internetValidated,
+                        "phoneWifiAvailable" to mutableNetworkHealth.value.phone.wifiAvailable), critical = true)
+                }
+                if (current.connected && current.followLastReplyElapsedMs != null &&
+                    current.followLastReplyElapsedMs != previous.followLastReplyElapsedMs) {
+                    markBoardReachable(if (current.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL,
+                        current.followLastReplyElapsedMs)
+                }
+                if (!canProbeNetwork(current) && networkProbeJob != null) cancelNetworkProbe()
+                if (!canProbeNetwork(previous) && canProbeNetwork(current)) nextNetworkProbeAt = 0L
+                previous = current
+            }
+        }
+        viewModelScope.launch {
+            while (true) {
+                if (networkForeground) {
+                    val now = SystemClock.elapsedRealtime()
+                    mutableNetworkNow.value = now
+                    if (now >= nextNetworkProbeAt && canProbeNetwork(state.value) && networkProbeJob == null)
+                        probeBoardRoutes()
+                }
+                delay(1_000)
+            }
+        }
+    }
+
+    private fun canProbeNetwork(current: BoardUiState) = !disconnecting && !current.busy &&
+        !current.manualActive && !current.followActive && !current.followStopping &&
+        !current.videoServiceBusy && !current.pairingBusy && !current.remoteProfileLoading
+
+    private fun cancelNetworkProbe() {
+        networkProbeGeneration++
+        networkProbeJob?.cancel()
+        networkProbeJob = null
+        mutableNetworkRefreshing.value = false
+        mutableNetworkHealth.update { health -> health.copy(
+            local = if (health.local.status == Reachability.CHECKING) health.local.invalidate() else health.local,
+            remote = if (health.remote.status == Reachability.CHECKING) health.remote.invalidate() else health.remote) }
+    }
+
+    fun setNetworkForeground(foreground: Boolean) {
+        networkForeground = foreground
+        if (foreground) {
+            networkMonitor.refresh()
+            nextNetworkProbeAt = 0L
+        } else cancelNetworkProbe()
+    }
+
+    fun refreshNetworkHealth() {
+        if (!networkForeground || !canProbeNetwork(state.value)) return
+        cancelNetworkProbe()
+        mutableNetworkHealth.update { it.copy(local = it.local.invalidate(), remote = it.remote.invalidate()) }
+        networkMonitor.refresh()
+        nextNetworkProbeAt = 0L
+        Diagnostics.event("network.refresh_requested", ownerDiagnostic, source = "USER_REFRESH")
+    }
+
+    private fun markBoardReachable(route: BoardRoute, now: Long = SystemClock.elapsedRealtime()) {
+        mutableNetworkHealth.update { health -> health.updateRoute(route, health.route(route).online(now)) }
+    }
+
+    private fun probeBoardRoutes() {
+        val input = state.value
+        val generation = ++networkProbeGeneration
+        // Rate-limited and cancelled whenever control starts. No extra SSH work during driving.
+        nextNetworkProbeAt = SystemClock.elapsedRealtime() + 20_000L
+        mutableNetworkRefreshing.value = true
+        networkProbeJob = viewModelScope.launch {
+            try {
+                for (route in BoardRoute.entries) {
+                    currentCoroutineContext().ensureActive()
+                    if (!networkForeground || !canProbeNetwork(state.value) || generation != networkProbeGeneration) return@launch
+                    // Invalid credentials require an edit or explicit refresh, not recurring authentication attempts.
+                    if (mutableNetworkHealth.value.route(route).failure in setOf(ReachabilityFailure.AUTHENTICATION,
+                            ReachabilityFailure.IDENTITY, ReachabilityFailure.CONFIGURATION)) continue
+                    val started = SystemClock.elapsedRealtime()
+                    val configured = input.username.isNotBlank() && input.password.isNotEmpty() &&
+                        if (route == BoardRoute.LOCAL) input.host.isNotBlank() && input.port.toIntOrNull() in 1..65535
+                        else input.remoteProfile != null && input.remoteProfileError == null
+                    if (!configured) {
+                        mutableNetworkHealth.update { it.updateRoute(route, RouteHealth(Reachability.NOT_CONFIGURED)) }
+                        continue
+                    }
+                    mutableNetworkHealth.update { it.updateRoute(route, it.route(route).checking()) }
+                    val result = try {
+                        val tls = if (route == BoardRoute.REMOTE) withContext(Dispatchers.IO) {
+                            remoteCredentials.createTlsConfig()
+                        } else null
+                        val config = if (route == BoardRoute.REMOTE) BoardConnection(input.remoteProfile!!.host,
+                            input.remoteProfile.controlPort, input.username.trim(), input.password, tls)
+                        else BoardConnection(input.host.trim(), input.port.toInt(), input.username.trim(), input.password)
+                        reachabilityProbe.check(config, if (route == BoardRoute.LOCAL) localPresenceDiagnostic else remotePresenceDiagnostic)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        RouteHealth().unavailable(SystemClock.elapsedRealtime(), ReachabilityFailure.CONFIGURATION)
+                    }
+                    currentCoroutineContext().ensureActive()
+                    if (generation != networkProbeGeneration) return@launch
+                    mutableNetworkHealth.update { health ->
+                        health.updateRoute(route, health.route(route).acceptProbe(result, started))
+                    }
+                    Diagnostics.event("network.board_probe", ownerDiagnostic, fields = mapOf("route" to route.name,
+                        "result" to result.status.name, "failure" to result.failure?.name,
+                        "durationMs" to SystemClock.elapsedRealtime() - started))
+                }
+            } finally {
+                if (generation == networkProbeGeneration) {
+                    mutableNetworkRefreshing.value = false
+                    networkProbeJob = null
+                    nextNetworkProbeAt = SystemClock.elapsedRealtime() + 15_000L
+                }
+            }
+        }
+    }
+
+    /** Explicit recovery only: connect() checks occupation; it never restarts the previous session. */
+    fun reconnectViaRemote() {
+        if (disconnecting || !state.value.canReconnectViaRemote || wifiDirect.mutationPending) return
+        Diagnostics.event("connection.remote_recovery_requested", ownerDiagnostic, source = "USER_REMOTE_RECOVERY",
+            fields = mapOf("followUncertain" to state.value.followUncertain,
+                "motorActionUnconfirmed" to state.value.motorActionUnconfirmed), critical = true)
+        setRemoteMode(true)
+        if (state.value.remoteMode) connect()
+    }
+
     private fun persistFollowRecovery(first: DiagnosticFailure? = state.value.followFirstFailure) {
         val previous = followRecovery?.takeIf { it.context.operationId == followDiagnostic.operationId }
         val snapshot = FollowRecoverySnapshot(followDiagnostic,
@@ -346,8 +528,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun updateCommand(value: String) { mutableState.update { it.copy(command = value) } }
 
     fun setRemoteMode(remote: Boolean) {
-        if (!state.value.canManageConnectionMode || wifiDirect.mutationPending ||
-            wifiDirect.state.value.busy || wifiDirect.state.value.confirmationRequired) return
+        if (!(if (remote) state.value.canSelectRemoteMode else state.value.canManageConnectionMode) ||
+            wifiDirect.mutationPending || (!remote &&
+            (wifiDirect.state.value.busy || wifiDirect.state.value.confirmationRequired))) return
         preferences.edit().putBoolean("remote_mode", remote).apply()
         mutableState.update { it.copy(remoteMode = remote, error = null, result = null) }
         Diagnostics.event("connection.mode_changed", ownerDiagnostic,
@@ -364,7 +547,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun importRemoteConfiguration(uri: Uri) {
-        if (!state.value.canManageConnectionMode || wifiDirect.mutationPending || wifiDirect.state.value.busy) return
+        if (!state.value.canSelectRemoteMode || wifiDirect.mutationPending) return
         mutableState.update { it.copy(busy = true, remoteProfileLoading = true, remoteProfileError = null) }
         operation = viewModelScope.launch {
             try {
@@ -448,14 +631,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connect(viaWifiDirect: Boolean = false) {
         val input = state.value
-        if (disconnecting || input.busy || input.remoteProfileLoading || input.pairingBusy || input.pairingUnconfirmed || input.connected || input.manualActive ||
+        if (disconnecting || input.busy || input.remoteProfileLoading || input.pairingBusy || (!input.remoteMode && input.pairingUnconfirmed) || input.connected || input.manualActive ||
             input.followActive || input.followStopping || input.videoServiceBusy) return
         if (input.remoteMode && (viaWifiDirect || input.remoteProfile == null || input.remoteProfileError != null)) {
             mutableState.update { it.copy(error = "请先导入有效的远程连接配置，并选择远程连接模式") }
             return
         }
         val wireless = wifiDirect.state.value
-        if (wifiDirect.mutationPending || wireless.confirmationRequired || (viaWifiDirect && (wireless.busy || wireless.discovering))) {
+        if (wifiDirect.mutationPending || (!input.remoteMode && wireless.confirmationRequired) || (viaWifiDirect && (wireless.busy || wireless.discovering))) {
             mutableState.update { it.copy(error = if (wireless.confirmationRequired) "上次无线操作结果未确认，请点击刷新无线状态后再连接 SSH。"
                 else "请等待无线组操作结束，并停止搜索设备后再连接 SSH。") }
             return
@@ -475,6 +658,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val diagnostic = Diagnostics.newContext()
+        intentionalConnectionClose = false
         val pairedAddress = input.host.trim().takeIf { !input.remoteMode && !viaWifiDirect && pairing.state.value.hotspotActive &&
             pairing.state.value.boardIp == it && !pairing.state.value.confirmationRequired }
         hotspotConnectionAddress = pairedAddress
@@ -513,6 +697,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     ensurePairingNetwork(pairedAddress)
                 }
                 sshEstablished = true
+                markBoardReachable(if (input.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
                 preferences.edit().apply {
                     if (!input.remoteMode && directGroup == null && pairedAddress == null)
                         putString("host", host).putString("port", port.toString())
@@ -864,6 +1049,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         if (disconnecting) return
+        intentionalConnectionClose = true
+        cancelNetworkProbe()
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         Diagnostics.event("connection.disconnect_requested", diagnostic, source = ControlStopSource.DISCONNECT.name, critical = true)
         disconnecting = true
@@ -945,6 +1132,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        networkProbeJob?.cancel()
+        networkMonitor.close()
         Diagnostics.event("viewmodel.cleared", activeDiagnostic(), source = ControlStopSource.VIEW_MODEL_CLEARED.name,
             fields = mapOf("ownerId" to ownerDiagnostic.operationId), critical = true)
         desiredWheels = WheelSpeeds()
@@ -998,6 +1187,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     // request before enabling input; the existing ACK/watchdog deadlines apply.
                     mutableState.update { it.copy(driveStatus = "正在确认停车回执…") }
                     val initialAck = activeChannel.exchange(0, 0)
+                    markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
                     check(initialAck.stopped) { "初始停车回执未确认" }
                     Diagnostics.event("drive.initial_stop_acknowledged", driveDiagnostic, critical = true)
                 }
@@ -1048,6 +1238,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     val sentGeneration = desiredGeneration
                     val heartbeatStarted = System.nanoTime()
                     val ack = activeChannel.exchange(target.left, target.right)
+                    markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
                     val interlock = ack.interlock?.takeIf { it.blocked }
                     if (interlock != state.value.driveInterlock) Diagnostics.event("drive.infrared_interlock",
                         driveDiagnostic, fields = mapOf("blocked" to (interlock != null),

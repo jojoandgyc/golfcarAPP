@@ -30,21 +30,38 @@ class FollowNetworkRecoveryIntegrationTest {
 
     @Test fun sshTransportEofEndsDryRunAndReconnectNeverRestartsIt() = verifyRecovery(blackhole = false)
 
-    private fun verifyRecovery(blackhole: Boolean) = runBlocking {
+    @Test fun blackholedLocalNetworkReconnectsViaPublicRouteWithoutRestartingControl() =
+        verifyRecovery(blackhole = true, remoteRecovery = true)
+
+    private fun verifyRecovery(blackhole: Boolean, remoteRecovery: Boolean = false) = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Requires explicit dry-run fault injection opt-in",
             args.getString("useSavedBoardCredentials") == "true" && args.getString("injectFollowNetworkFaults") == "true")
+        if (remoteRecovery) assumeTrue("Public-route recovery requires its own explicit opt-in",
+            args.getString("remoteRecovery") == "true")
         val vm = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        if (remoteRecovery) compose.waitUntil(15_000) { !vm.state.value.remoteProfileLoading }
         val saved = vm.state.value
         assumeTrue("Saved direct board connection required", saved.password.isNotEmpty() && saved.host != "127.0.0.1")
+        if (remoteRecovery) {
+            assumeTrue("Start with an idle disconnected App; never interrupt another session",
+                saved.canRecoverConnection && !saved.pairingBusy && !saved.pairingUnconfirmed)
+            assumeTrue("Import the domestic remote profile before this test",
+                saved.remoteProfile != null && saved.remoteProfileError == null && !saved.remoteProfileLoading)
+        }
         val reader = BoardSshClient()
         val relay = IsolatedSshRelay(saved.host, saved.port.toInt())
         try {
             reader.connect(BoardConnection(saved.host, saved.port.toInt(), saved.username, saved.password))
             assertTrue("Never interfere with an occupied board", reader.readFollowAvailability().controlAvailable)
             compose.runOnUiThread {
+                if (remoteRecovery) vm.setRemoteMode(false)
                 vm.updateHost("127.0.0.1")
                 vm.updatePort(relay.port.toString())
+                if (remoteRecovery) {
+                    assertFalse("The injected fault must affect the local connection", vm.state.value.remoteMode)
+                    assertEquals("127.0.0.1", vm.state.value.host)
+                }
                 vm.connect()
             }
             compose.waitUntil(40_000) { !vm.state.value.busy }
@@ -124,8 +141,19 @@ class FollowNetworkRecoveryIntegrationTest {
             assertEquals("Dry-run worker must be gone", 0, reader.execute("test ! -d /proc/$pid").exitCode)
             assertTrue("Read-only observer must not release App's pending lock", vm.state.value.followUncertain)
 
-            // New relay connections are healthy; there is no automatic follow restart.
-            compose.runOnUiThread { vm.connect() }
+            // Public recovery is an explicit connection request, not a retry of the old control.
+            // The other scenarios continue to use a fresh, healthy connection through the relay.
+            if (remoteRecovery) {
+                assertFalse(vm.state.value.remoteMode)
+                assertTrue("Public recovery must remain available without clearing the pending lock",
+                    vm.state.value.canReconnectViaRemote)
+                assertTrue(vm.state.value.followUncertain)
+                assertEquals(first, vm.state.value.followFirstFailure)
+                Diagnostics.event("test.remote_recovery_begin",
+                    DiagnosticContext(first.context.operationId, first.context.connectionId, runId),
+                    source = "TEST_REMOTE_RECOVERY", fields = mapOf("dryRun" to true, "execute" to false), critical = true)
+            }
+            compose.runOnUiThread { if (remoteRecovery) vm.reconnectViaRemote() else vm.connect() }
             compose.waitUntil(45_000) { !vm.state.value.busy }
             val recovered = vm.state.value
             assertTrue(recovered.error, recovered.connected)
@@ -134,6 +162,36 @@ class FollowNetworkRecoveryIntegrationTest {
             assertFalse(recovered.followExecute)
             assertTrue("Recovery allows an explicit user start without fetching configuration; it never starts automatically", recovered.canStartFollow)
             assertEquals(first, recovered.followFirstFailure)
+            if (remoteRecovery) {
+                assertTrue("Recovery must use the selected public route", recovered.remoteMode)
+                val remoteProfile = requireNotNull(saved.remoteProfile)
+                assertEquals(remoteProfile.host, recovered.connectionHost)
+                assertEquals(remoteProfile.controlPort.toString(), recovered.connectionPort)
+                assertFalse(recovered.manualActive)
+                assertFalse(recovered.driveEnabled)
+                assertFalse(recovered.followStopping)
+                assertFalse(recovered.videoServiceBusy)
+                assertEquals("Public reconnection only inspects video; it must not start it",
+                    VideoServiceState.STOPPED, recovered.videoServiceState)
+                val recoveryEvents = Diagnostics.snapshot().events.map(::JSONObject)
+                    .dropWhile { it.optString("event") != "test.remote_recovery_begin" || it.optString("runId") != runId }
+                assertTrue("Recovery marker must survive diagnostic flush", recoveryEvents.isNotEmpty())
+                assertTrue("User recovery must retain the pending lock until read-only inspection",
+                    recoveryEvents.any { it.optString("event") == "connection.remote_recovery_requested" &&
+                        it.optJSONObject("fields")?.optBoolean("followUncertain") == true })
+                assertTrue("The new public connection must check ownership of the original run",
+                    recoveryEvents.any { it.optString("event") == "follow.availability_requested" &&
+                        it.optJSONObject("fields")?.optString("runId") == runId })
+                assertTrue(recoveryEvents.any { it.optString("event") == "follow.availability_result" &&
+                    it.optJSONObject("fields")?.optBoolean("controlAvailable") == true })
+                assertFalse("Recovery must never issue a new follow or drive start", recoveryEvents.any {
+                    it.optString("event") in setOf("follow.start_requested", "drive.start_requested")
+                })
+                assertFalse("Recovery must never start the video service", recoveryEvents.any {
+                    it.optString("event") == "video.change_started" &&
+                        it.optJSONObject("fields")?.optBoolean("enabled") == true
+                })
+            }
             assertTrue(reader.readFollowAvailability().controlAvailable)
             assertTrue(Diagnostics.snapshot().events.map(::JSONObject).any {
                 it.optString("event") == "follow.availability_result" &&
@@ -150,8 +208,13 @@ class FollowNetworkRecoveryIntegrationTest {
                 reader.disconnect("network_recovery_test_complete")
                 val target = InstrumentationRegistry.getInstrumentation().targetContext
                 target.getSharedPreferences("board_connection", 0).edit()
-                    .putString("host", saved.host).putString("port", saved.port).putString("username", saved.username).commit()
-                compose.runOnUiThread { vm.updateHost(saved.host); vm.updatePort(saved.port) }
+                    .putString("host", saved.host).putString("port", saved.port).putString("username", saved.username)
+                    .putBoolean("remote_mode", saved.remoteMode).commit()
+                compose.runOnUiThread {
+                    vm.updateHost(saved.host)
+                    vm.updatePort(saved.port)
+                    vm.setRemoteMode(saved.remoteMode)
+                }
             }
         }
     }

@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "dateLocal": "2026-11-03",
+  "timezone": "Asia/Taipei",
+  "versionName": "1.8.3-network-status",
+  "versionCode": 14,
+  "apkSha256": "a8196121d94f769580f04d6bace04c2f1d95807b0bb02382828495f466f7c518",
+  "features": [
+    "Separate phone Internet, local board and public board presence with 30-second evidence expiry.",
+    "Pinned SSH authentication confirms board presence; public TCP/TLS alone never implies the board is online.",
+    "Background probes own independent sockets, run only while foreground and control idle, and never execute remote commands.",
+    "Active control uses existing ACKs; heartbeat periods, deadlines, stop rules and motor settings are unchanged.",
+    "Explicit public-route recovery preserves first faults and pending control locks, then reuses read-only ownership inspection.",
+    "Local wireless confirmation does not block public profile import or connection; it is not silently cleared."
+  ],
+  "validation": {
+    "jvmTestsPassed": 197,
+    "composeTestsPassed": 11,
+    "boardDryRunScenariosPassed": [
+      "local_blackhole_then_domestic_public_recovery",
+      "ssh_eof_then_local_recovery"
+    ],
+    "remoteRecoveryAutomaticallyStartsControl": false,
+    "realMotorTests": false,
+    "realCameraTests": false,
+    "latestAuthenticatedProbeResults": [
+      {
+        "time": "2026-11-03T06:46:55.845814Z",
+        "route": "LOCAL",
+        "result": "ONLINE"
+      },
+      {
+        "time": "2026-11-03T06:46:56.798676Z",
+        "route": "REMOTE",
+        "result": "ONLINE"
+      }
+    ],
+    "manualPageVisualCheck": "All controls remain visible without vertical scrolling.",
+    "originalTestApkRestored": true,
+    "phoneStayOnSettingUnchanged": 2
+  },
+  "incident": {
+    "runId": "6fd6f38c3da129be3f5cda01d4fb260a",
+    "ackTimeoutLocal": "2026-11-03 14:07:44.866 +08:00",
+    "timeoutMs": 1200,
+    "lastPhoneAckSeq": 70,
+    "lastBoardAcceptedSeq": 71,
+    "boardAckGenerationMs": 1,
+    "boardFirstStop": "input_eof",
+    "workerExitCode": 0,
+    "phoneProcessCrashed": false,
+    "wholeDeviceNetworkLossConfirmed": false,
+    "phoneRoamCompletedLocal": "2026-11-03 14:07:35.795 +08:00",
+    "rootCauseLimit": "Initial packet/transport/scheduling delay is unresolved; earlier Wi-Fi roaming is a lead, not proven causation. Device clocks were not calibrated."
+  },
+  "deployment": {
+    "phoneInstalled": true,
+    "boardCodeChanged": false,
+    "boardNetworkChanged": false,
+    "serverServicesChanged": false
+  }
+}
