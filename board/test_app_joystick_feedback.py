@@ -746,7 +746,7 @@ class ParkingFeedbackTests(unittest.TestCase):
         self.assertFalse(self.motors.stopped_confirmed)
         self.assert_no_parameter_writes()
 
-    def test_deceleration_is_not_reported_as_stopped_and_times_out(self):
+    def test_deceleration_timeout_keeps_an_emergency_stopped_session_waiting(self):
         self.initialize()
         self.motors.drive(20, -20)
         self.client.feedback = (20, -20, 0, 0)
@@ -757,8 +757,12 @@ class ParkingFeedbackTests(unittest.TestCase):
             self.motors.poll_safety()
             self.assertFalse(self.motors.stopped_confirmed)
         self.clock.sleep(.2)
-        with self.assertRaises(bridge.SessionError):
-            self.motors.poll_safety()
+        self.motors.poll_safety()
+        self.assertTrue(self.motors.standstill_pending)
+        self.assertIsNotNone(self.motors.standstill_wait_at)
+        self.assertIsNone(self.motors.fault_reason)
+        self.assertFalse(self.motors.stopped_confirmed)
+        self.assertFalse(self.motors.parking_enabled)
         self.assert_emergency_attempted()
 
     def test_signed_feedback_and_zero_target_are_independent(self):

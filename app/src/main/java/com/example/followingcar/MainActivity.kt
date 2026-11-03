@@ -573,7 +573,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
     }
     val controlling = state.driveEnabled || state.driveStarting || state.driveStopping
     val canAdjustSpeed = !state.parkingUpdating && !state.followBlocksControl &&
-        !state.driveFeedbackRecheck && !state.driveRecoveryNeedsRelease &&
+        !state.driveFeedbackRecheck && !state.driveStandstillPending && !state.driveRecoveryNeedsRelease &&
         (!controlling || (state.driveEnabled && state.driveLeft == 0 && state.driveRight == 0 && state.driveConfirmedStopped))
     val latestError = state.driveError ?: state.videoServiceError ?: state.error
     val errorText = state.driveFirstFailure?.let {
@@ -747,6 +747,11 @@ internal fun ParkingControls(
         state.followBlocksControl -> "自动跟随占用或状态待确认"
         state.motorActionUnconfirmed -> "电机状态待核对"
         state.busy -> "其他操作正在进行"
+        state.driveStandstillPending -> when {
+            !feedbackFresh -> "停车等待中，轮速反馈待更新"
+            state.driveConfirmedStopped -> "车轮已停稳，请松手后再操作"
+            else -> "正在减速，等待停车确认"
+        }
         state.driveFeedbackRecheck -> if (state.driveConfirmedStopped) "反馈已恢复，请松手后再操作" else "轮速反馈复核中，保持停车"
         state.driveRecoveryNeedsRelease -> "请松手完成控制恢复"
         !enabled && !settings.canEnable -> parkingCurrentIssue(settings)
@@ -808,6 +813,8 @@ internal fun ParkingControls(
                 !feedbackKnown -> "最近轮速反馈：尚无可信读数"
                 !state.driveFeedbackVerified -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 未验证或已过期"
                 !feedbackFresh -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 已过期"
+                state.driveStandstillPending && !state.driveConfirmedStopped -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 正在减速，等待停车确认"
+                state.driveStandstillPending -> "最近轮速反馈已回零，松手后完成停车确认"
                 state.driveFeedbackRecheck && !state.driveConfirmedStopped -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 复核中，保持停车"
                 state.driveFeedbackRecheck -> "最近轮速反馈已回零，松手后再操作"
                 !feedbackStopped -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 尚未停稳"
@@ -825,6 +832,7 @@ internal fun ParkingControls(
             !state.parkingSupported -> "板端驻车安全接口不可用，暂不能切换。"
             settings == null -> "尚未读取电机驻车配置，暂不能切换。"
             state.parkingUpdating -> "正在确认驻车切换，请稍候；需要停止时可使用下方急停。"
+            state.driveStandstillPending -> "停车确认超时后继续停车，电子驻车已暂停；电流参数未改变。等待真实轮速归零后松手再操作。"
             !state.canEditParkingAt(observedNow) -> "请松手停车，等待新鲜的实测停车确认及当前操作结束。"
             else -> "沿用当前电机配置，开关不修改电流参数。调整电流请先停用手动控制，再到电机页操作。"
         }, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingHint"))

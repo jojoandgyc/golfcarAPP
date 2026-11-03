@@ -58,6 +58,7 @@ data class BoardUiState(
     val driveInterlock: DriveInterlock? = null,
     val driveRecoveryNeedsRelease: Boolean = false,
     val driveFeedbackRecheck: Boolean = false,
+    val driveStandstillPending: Boolean = false,
     val drivePort: String = "自动检测串口",
     val driveError: String? = null,
     val driveFirstFailure: DiagnosticFailure? = null,
@@ -1223,6 +1224,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 driveLastFeedbackNanos = 0L, driveFeedbackAgeAtReceiptMs = Long.MAX_VALUE,
                 driveInterlock = null,
                 driveStatus = "正在开启视频…", driveRecoveryNeedsRelease = false, driveFeedbackRecheck = false,
+                driveStandstillPending = false,
                 parkingSupported = false, parkingSettings = null,
                 parkingUpdating = false, parkingStatus = "正在读取驻车设置…")
         }
@@ -1295,6 +1297,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     if (requestedParking != null) {
                         val current = state.value
                         val blocked = when {
+                            current.driveStandstillPending -> "STANDSTILL_PENDING"
                             current.driveFeedbackRecheck -> "FEEDBACK_RECHECK"
                             current.driveRecoveryNeedsRelease || driveRecoveryGate.needsRelease -> "CONTROL_RECOVERY"
                             !desiredWheels.stopped || !current.driveConfirmedStopped -> "STOP_UNCONFIRMED"
@@ -1334,6 +1337,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     val sentGeneration = desiredGeneration
                     val heartbeatStarted = System.nanoTime()
                     val ack = activeChannel.exchange(target.left, target.right)
+                    val wasStandstillPending = state.value.driveStandstillPending
                     handleDriveRecovery(ack, neutralRequest = target.stopped)
                     markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
                     val interlock = ack.interlock?.takeIf { it.blocked }
@@ -1344,8 +1348,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         it.withDriveFeedback(ack).copy(driveConfirmedStopped = ack.stopped && ack.hasFreshFeedback() && desiredWheels.stopped &&
                             (sentGeneration == desiredGeneration || ack.recoveryRequired),
                             driveInterlock = interlock,
+                            parkingSettings = ack.parking,
+                            parkingStatus = when {
+                                it.driveStandstillPending && !ack.hasFreshFeedback() -> "停车等待中 · 轮速反馈待更新，电子驻车已暂停"
+                                it.driveStandstillPending && !ack.stopped -> "正在减速，等待停车确认 · 电子驻车已暂停"
+                                it.driveStandstillPending -> "车轮已停稳，松手后可重新开启电子驻车"
+                                wasStandstillPending ->
+                                    "停车已确认，电子驻车保持关闭；需要时请重新开启"
+                                else -> it.parkingStatus
+                            },
                             driveStatus = when {
                                 !ack.hasFreshFeedback() -> "轮速反馈待更新 · 驻车设置暂不可用"
+                                it.driveStandstillPending && !ack.stopped -> "正在减速，等待停车确认"
+                                it.driveStandstillPending -> "车轮已停稳 · 松手后再操作"
                                 it.driveFeedbackRecheck && !ack.stopped -> "轮速反馈复核中 · 保持停车"
                                 it.driveFeedbackRecheck -> "反馈已恢复 · 松手后再操作"
                                 driveRecoveryGate.needsRelease -> "网络恢复 · 目标已归零，请松手再操作"
@@ -1366,7 +1381,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     fields = mapOf("stopAcknowledged" to false), critical = true)
                 // An earlier neutral ACK is not acknowledgement of this stop/close request.
                 mutableState.update { it.copy(driveConfirmedStopped = false,
-                    driveFeedbackVerified = false,
+                    driveFeedbackVerified = false, driveStandstillPending = false,
                     driveStatus = if (stopRequest != null) "$stopReason · 停车回执未确认" else "手动控制已中止 · 停车回执未确认",
                     parkingStatus = "驻车状态未确认，重新启用后读取") }
                 throw cancelled
@@ -1374,7 +1389,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 val first = Diagnostics.failure(driveDiagnostic, "drive.failed", failure)
                 mutableState.update {
                     it.withTransportState(client.isConnected).copy(driveStatus = "手动控制已停用", driveConfirmedStopped = false,
-                        driveFeedbackVerified = false, driveFirstFailure = first,
+                        driveFeedbackVerified = false, driveStandstillPending = false, driveFirstFailure = first,
                         parkingStatus = "驻车状态未确认，请重新启用手动控制",
                         driveError = if (it.remoteMode && failure.message.orEmpty().contains("watchdog", ignoreCase = true))
                             "远程指令未能在停车保护期限内到达，手动控制已退出。请检查网络延迟后重新启用。"
@@ -1389,7 +1404,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 // Motor stop/close always precedes service cleanup. Retain manual ownership
                 // until cleanup finishes so follow cannot race a late camera-service start.
                 mutableState.update { it.copy(driveStarting = false, driveEnabled = false,
-                    driveStopping = true, driveLeft = 0, driveRight = 0) }
+                    driveStopping = true, driveLeft = 0, driveRight = 0, driveStandstillPending = false) }
                 withContext(NonCancellable) {
                     if (client.isConnected) {
                         try { changeVideoService(false, driveDiagnostic) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
@@ -1399,7 +1414,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     it.withTransportState(client.isConnected).copy(driveStarting = false, driveEnabled = false, driveStopping = false,
                         parkingSupported = false, parkingSettings = null, parkingUpdating = false, driveInterlock = null,
                         driveFeedbackVerified = false,
-                        driveRecoveryNeedsRelease = false, driveFeedbackRecheck = false,
+                        driveRecoveryNeedsRelease = false, driveFeedbackRecheck = false, driveStandstillPending = false,
                         parkingStatus = if (parkingModeReleased && channel?.ready?.dryRun == true) "模拟驻车模式已退出，电流参数未修改"
                             else if (parkingModeReleased) "驻车模式已退出，电机电流参数未修改"
                             else if (it.driveError != null) it.parkingStatus
@@ -1415,8 +1430,13 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleDriveRecovery(ack: DriveAck, neutralRequest: Boolean = false) {
+        val before = state.value
+        val hadMotionTarget = !desiredWheels.stopped
         mutableState.update { it.copy(driveFeedbackRecheck = ack.feedbackRecheck ||
-            (it.driveFeedbackRecheck && driveRecoveryGate.needsRelease)) }
+            (it.driveFeedbackRecheck && driveRecoveryGate.needsRelease),
+            driveStandstillPending = ack.standstillPending ||
+                (it.driveStandstillPending && driveRecoveryGate.needsRelease),
+            parkingSettings = if (ack.standstillPending) ack.parking else it.parkingSettings) }
         if (!ack.recoveryRequired) {
             driveRecoveryGate.healthyAck(neutralRequest)
             return
@@ -1425,18 +1445,32 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         // It must reset newly held input instead of being discarded as that duplicate ACK.
         if (!driveRecoveryGate.recovered(neutralRequest && !ack.feedbackRecheck)) return
         desiredWheels = WheelSpeeds()
-        desiredGeneration += 1
+        val changed = hadMotionTarget || before.driveFeedbackRecheck != ack.feedbackRecheck ||
+            before.driveStandstillPending != ack.standstillPending ||
+            before.driveRecoveryNeedsRelease != driveRecoveryGate.needsRelease
+        if (changed) desiredGeneration += 1
         mutableState.update { it.copy(driveLeft = 0, driveRight = 0,
             driveRecoveryNeedsRelease = driveRecoveryGate.needsRelease) }
-        Diagnostics.event("drive.recovery_input_reset", driveDiagnostic,
-            source = if (ack.feedbackRecheck) "FEEDBACK_RECHECK" else "NETWORK_RECOVERY",
+        if (changed) Diagnostics.event("drive.recovery_input_reset", driveDiagnostic,
+            source = when {
+                ack.standstillPending -> "STANDSTILL_PENDING"
+                ack.feedbackRecheck -> "FEEDBACK_RECHECK"
+                else -> "NETWORK_RECOVERY"
+            },
             fields = mapOf("needsRelease" to driveRecoveryGate.needsRelease), critical = true)
     }
 
     fun moveJoystick(x: Float, forward: Float) {
         if (!state.value.driveEnabled || state.value.followBlocksControl || state.value.parkingUpdating || pendingParking != null || stopRequest != null) return
         if (!driveRecoveryGate.input()) return
-        if (state.value.driveFeedbackRecheck) return
+        if (state.value.driveFeedbackRecheck || state.value.driveStandstillPending) {
+            // Input can begin after the final recovery ACK but before its healthy
+            // successor. Latch the release now, rather than waiting for another
+            // recovery ACK that may never arrive.
+            driveRecoveryGate.recovered(neutralRequest = false)
+            mutableState.update { it.copy(driveRecoveryNeedsRelease = true) }
+            return
+        }
         val previous = desiredWheels
         desiredWheels = joystickToWheels(x, forward, state.value.speedLimit)
         if (previous != desiredWheels) desiredGeneration += 1
@@ -1454,13 +1488,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         if (!desiredWheels.stopped) desiredGeneration += 1
         desiredWheels = WheelSpeeds()
         mutableState.update { it.copy(driveLeft = 0, driveRight = 0, driveRecoveryNeedsRelease = false,
-            driveStatus = if (it.driveRecoveryNeedsRelease && it.driveEnabled)
-                "已回中 · 可以重新操作" else it.driveStatus) }
+            driveStatus = when {
+                it.driveStandstillPending && !it.driveConfirmedStopped -> "已回中 · 等待停车确认"
+                it.driveStandstillPending -> "已回中 · 等待停车恢复回执"
+                it.driveFeedbackRecheck -> "已回中 · 等待反馈恢复回执"
+                it.driveRecoveryNeedsRelease && it.driveEnabled -> "已回中 · 可以重新操作"
+                else -> it.driveStatus
+            }) }
         driveWakeup.trySend(Unit)
     }
 
     fun changeSpeedLimit(value: Int) {
-        if (state.value.parkingUpdating || state.value.driveFeedbackRecheck || state.value.driveRecoveryNeedsRelease ||
+        if (state.value.parkingUpdating || state.value.driveFeedbackRecheck || state.value.driveStandstillPending ||
+            state.value.driveRecoveryNeedsRelease ||
             !desiredWheels.stopped || (state.value.driveEnabled &&
                 (!state.value.driveConfirmedStopped || !state.value.hasFreshDriveFeedback()))) return
         mutableState.update { it.copy(speedLimit = value.coerceIn(10, 100)) }
@@ -1512,7 +1552,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         stopRequest = if (emergency) "estop" else "close"
         stopReason = reason
         mutableState.update {
-            it.copy(driveEnabled = false, driveStopping = true, driveStatus = "正在发送停车指令…")
+            it.copy(driveEnabled = false, driveStopping = true, driveStandstillPending = false,
+                driveStatus = "正在发送停车指令…")
         }
         interruptDriveForActiveStop(reason, emergency, source)
         driveWakeup.trySend(Unit)

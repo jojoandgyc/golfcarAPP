@@ -1,0 +1,104 @@
+{
+  "recordedAtUtc": "2026-11-03T16:06:41.884266+00:00",
+  "sourceBaseCommit": "bc9091b6749f406e74c4ff74e5c8956e7de44b88",
+  "status": "validated_pending_paired_deployment",
+  "app": {
+    "versionCode": 24,
+    "versionName": "1.8.13-standstill-wait",
+    "apkSha256": "bc5a0aee65685062e39393971cbe807e6298ff3258ec128ee4815ddc620e201b",
+    "phoneInstalledThisRevision": false
+  },
+  "board": {
+    "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+    "sha256": "fef016e2d71911b639f4776451ddfb66a38c8063a9d719845282595046d987b8",
+    "safetyVersion": 2,
+    "deployedThisRevision": false,
+    "lastVerifiedDeployedSha256": "e3da7324aac2ede6c0938e91891136ae1f21d1c4f4735342a283393e679617e9"
+  },
+  "incident": {
+    "runId": "664c7632636388e4beaa9fb9e41f3e33",
+    "parkingSwitchConfirmedUtc": "2026-11-03T15:49:26.301+00:00",
+    "stopRequestUtc": "2026-11-03T15:49:34.416+00:00",
+    "initialStopFeedbackRpm": [
+      53,
+      -34
+    ],
+    "failureUtc": "2026-11-03T15:49:35.922+00:00",
+    "failure": "Standstill timeout: left=7, right=-3 RPM",
+    "motorFaultCodes": [
+      0,
+      0
+    ],
+    "targetRpm": [
+      0,
+      0
+    ],
+    "normalStopDeadlineSeconds": 1.5,
+    "cleanupStartedUtc": "2026-11-03T15:49:35.932+00:00",
+    "cleanupFinishedUtc": "2026-11-03T15:49:36.375+00:00",
+    "cleanupConfirmed": true,
+    "parkingCurrentsA": [
+      2,
+      2
+    ],
+    "currentParameterWritesByAgent": false,
+    "physicalCauseOfResidualFeedbackProven": false
+  },
+  "behavior": {
+    "scope": "Normal runtime stop after motion, before the first fresh two-zero standstill confirmation",
+    "normalStopTimeoutSeconds": 1.5,
+    "onTimeout": "Record warning once, retain session, command emergency zero/stop, suspend parking mode without changing its current registers",
+    "whilePending": "Keep zero targets and 200 ms stop refresh; valid original neutral requests renew communication leases",
+    "release": "Two fresh error-free zero observations, then explicit neutral; the releasing ACK still advertises the recovery latch",
+    "heldInputNeverReplayed": true,
+    "newPressDuringRecoveryRequiresAnotherRelease": true,
+    "parkingUiRequiresFreshStoppedFeedbackAndReleasedLatch": true,
+    "optionalAckField": "standstillPending",
+    "appAcceptsParkingReleaseOnlyWithValidPendingAndUnchangedCurrents": true,
+    "logs": "Immediate state changes and one-second summaries; no fatal first-failure entry for normal stopping delay",
+    "unchangedProtections": [
+      "Motor fault codes",
+      "Feedback and motor-write failures",
+      "600 ms network soft stop and 5 s hard network grace",
+      "Unexpected >2 RPM motion after confirmed standstill",
+      "600 ms existing small-motion recheck",
+      "Bounded startup, parking transition and terminal cleanup"
+    ]
+  },
+  "validation": {
+    "jvm": {
+      "tests": 268,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "boardFakeHardwareAndProtocol": {
+      "tests": 134,
+      "passed": 134,
+      "skipped": 0
+    },
+    "emulatorFirstPass": {
+      "tests": 77,
+      "passed": 77
+    },
+    "emulatorFinalAffectedSuites": {
+      "tests": 26,
+      "passed": 26
+    },
+    "emulatorUniqueCases": 79,
+    "realHardwareDriveOrParkingTestsPerformed": false,
+    "stagedBoardSshProbe": {
+      "completed": false,
+      "reason": "LAN SSH connection timed out before staging or running any code"
+    }
+  },
+  "deployment": {
+    "deferredByUser": true,
+    "pairingRequired": "Install compatible App 1.8.13 first; then back up and replace the board bridge while controls and serial ports are idle. Verify hashes and run SSH dry-run after deployment.",
+    "reasonForPairing": "App 1.8.12 rejects automatic parking release in a normal ACK; the new pending response needs the compatible App parser.",
+    "phoneInstalled": false,
+    "liveBoardFileReplaced": false,
+    "motorConfigurationWritten": false,
+    "networkOrFollowRuntimeChanged": false
+  }
+}

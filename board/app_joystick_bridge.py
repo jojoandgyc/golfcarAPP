@@ -141,6 +141,8 @@ class Motors:
         self.standstill_seen = False
         self.motion_recheck_at: float | None = None
         self.motion_recovery_required = False
+        self.standstill_wait_at: float | None = None
+        self.standstill_pending = False
         self.fault_reason: str | None = None
         self.diagnostic = BestEffortDiagnostic(NullDiagnosticLog())
 
@@ -191,12 +193,30 @@ class Motors:
                                   errorClass=type(error).__name__)
         raise SessionError(self.fault_reason)
 
+    def _enter_standstill_wait(self) -> None:
+        """Retain the emergency response to slow stopping, without ending ownership."""
+        if self.standstill_pending:
+            return
+        self.standstill_wait_at = time.monotonic()
+        self.standstill_pending = True
+        parking_was_enabled = self.parking_enabled
+        self.parking_enabled = False
+        self.emergency_hold = True
+        self.diagnostic.event("drive.standstill_wait_started", critical=True,
+            reason="normal_stop_confirmation_timeout", parkingWasEnabled=parking_was_enabled,
+            **self.feedback_state(), **self.parking_state())
+        try:
+            self._write_stop(emergency=True)
+        except Exception as error:
+            self._trip(f"Standstill emergency stop failed: {error}")
+
     @staticmethod
     def _signed32(high: int, low: int) -> int:
         value = (high << 16) | low
         return value - 2**32 if value >= 2**31 else value
 
-    def _sample_feedback(self, *, force: bool = False, cleanup: bool = False) -> None:
+    def _sample_feedback(self, *, force: bool = False, cleanup: bool = False,
+                         allow_standstill_wait: bool = True) -> None:
         now = time.monotonic()
         if not cleanup and self.motion_recheck_at is not None and (
             now - self.motion_recheck_at >= MOTION_RECHECK_SECONDS
@@ -257,7 +277,10 @@ class Motors:
             if not cleanup and not self.standstill_seen and self.stop_requested_at is not None and (
                 self.feedback_at - self.stop_requested_at >= STANDSTILL_TIMEOUT_SECONDS
             ):
-                self._trip(f"Standstill timeout: left={left}, right={right} RPM")
+                if allow_standstill_wait:
+                    self._enter_standstill_wait()
+                else:
+                    self._trip(f"Standstill timeout: left={left}, right={right} RPM")
             return
         # Distinct hardware observations are separated in time, not duplicate cached reads.
         if self.last_zero_at is None or self.client is None or (
@@ -268,6 +291,12 @@ class Motors:
             self.last_zero_at = self.feedback_at
         if self.zero_samples >= 2:
             self.standstill_seen = True
+            if self.standstill_wait_at is not None:
+                elapsed = observed_at - self.standstill_wait_at
+                self.standstill_wait_at = None
+                self.diagnostic.event("drive.standstill_wait_zero_confirmed", critical=True,
+                    elapsedMs=int(elapsed * 1000), releaseRequired=self.standstill_pending,
+                    **self.feedback_state())
             if self.motion_recheck_at is not None:
                 elapsed = observed_at - self.motion_recheck_at
                 self.motion_recheck_at = None
@@ -290,6 +319,7 @@ class Motors:
     def stopped_confirmed(self) -> bool:
         return (self.fault_reason is None and self.last_target == (0, 0) and self.zero_samples >= 2
                 and self.motion_recheck_at is None
+                and self.standstill_wait_at is None
                 and self.feedback == (0, 0, 0, 0) and self.feedback_at is not None
                 and time.monotonic() - self.feedback_at <= FEEDBACK_MAX_AGE_SECONDS)
 
@@ -300,8 +330,18 @@ class Motors:
                 "feedbackAgeMs": age, "feedbackSamples": self.zero_samples,
                 "feedbackSource": "simulated" if self.client is None else "hardware"}
 
+    @property
+    def feedback_recovery_required(self) -> bool:
+        return self.motion_recovery_required or self.standstill_pending
+
     def release_motion_recovery(self) -> None:
-        if self.motion_recovery_required and self.motion_recheck_at is None and self.stopped_confirmed:
+        if self.motion_recheck_at is not None or self.standstill_wait_at is not None or not self.stopped_confirmed:
+            return
+        if self.standstill_pending:
+            self.standstill_pending = False
+            self.emergency_hold = False
+            self.diagnostic.event("drive.standstill_wait_released", critical=True, **self.feedback_state())
+        if self.motion_recovery_required:
             self.motion_recovery_required = False
             self.diagnostic.event("drive.feedback_recheck_released", critical=True, **self.feedback_state())
 
@@ -313,7 +353,9 @@ class Motors:
                 if cleanup:
                     raise SessionError("Cleanup standstill not confirmed")
                 self._trip("Standstill confirmation timed out")
-            self._sample_feedback(force=True, cleanup=cleanup)
+            # Startup, parking transitions and terminal cleanup retain their
+            # bounded confirmation contract; only normal session polling may wait.
+            self._sample_feedback(force=True, cleanup=cleanup, allow_standstill_wait=False)
             measured = self.last_target == (0, 0) and self.zero_samples >= 2 and self.feedback == (0, 0, 0, 0)
             if time.monotonic() >= deadline:
                 if cleanup:
@@ -353,7 +395,7 @@ class Motors:
         self.poll_safety()
         # Even after feedback recovers, discard held/queued motion until an
         # explicit neutral request has acknowledged the new zero-speed evidence.
-        if self.motion_recovery_required:
+        if self.feedback_recovery_required:
             return (0, 0)
         self.requested_target = (left, right)
         if self.check_infrared():
@@ -416,7 +458,7 @@ class Motors:
         if release_interlock:
             self.requested_target = (0, 0)
             self.ir_latched_directions.clear()
-            self.emergency_hold = emergency
+            self.emergency_hold = emergency or self.standstill_pending
         if refresh:
             try:
                 self._write_stop(emergency=emergency or self.emergency_hold)
@@ -437,6 +479,8 @@ class Motors:
         transaction_deadline = time.monotonic() + PARKING_TRANSACTION_SECONDS
         if type(enabled) is not bool:
             raise SessionError("Parking requires a boolean switch; current configuration is read-only")
+        if self.standstill_pending:
+            raise SessionError("Parking unavailable until standstill recovery is released")
         if self.last_target != (0, 0):
             raise SessionError("Parking requires zero targets and measured standstill")
         self.await_standstill(deadline=transaction_deadline)
@@ -518,7 +562,7 @@ class ProtocolSession:
 
     @property
     def recovery_active(self) -> bool:
-        return self.recovery_required or self.motors.motion_recovery_required
+        return self.recovery_required or self.motors.feedback_recovery_required
 
     def pause_for_network(self) -> None:
         # Do not use shutdown(): network grace must not write parking registers.
@@ -538,6 +582,7 @@ class ProtocolSession:
                 "networkGraceMs": int(NETWORK_GRACE_SECONDS * 1000),
                 "motionRecheckMaxRpm": MOTION_RECHECK_MAX_RPM,
                 "motionRecheckMs": int(MOTION_RECHECK_SECONDS * 1000),
+                "standstillWaitSupported": True,
                 "infraredSupported": self.motors.infrared is not None,
                 **self.motors.parking_state()}
 
@@ -559,7 +604,8 @@ class ProtocolSession:
         if command != "drive" and (left != 0 or right != 0):
             raise SessionError("Non-drive commands require zero motor targets")
         closing = command in ("estop", "close")
-        feedback_recheck = self.motors.motion_recovery_required
+        feedback_recheck = self.motors.feedback_recovery_required
+        standstill_pending = self.motors.standstill_pending
         recovering = self.recovery_active
         neutral = command == "stop" or (command == "drive" and (left, right) == (0, 0))
         if command == "parking":
@@ -571,7 +617,9 @@ class ProtocolSession:
             if neutral:
                 # The network pause used emergency stop even when parking was enabled.
                 # Reapply its confirmed normal-stop mode without rewriting its registers.
-                self.motors.stop(force=True)
+                # Network recovery reapplies the stop once. A long physical
+                # standstill wait uses the existing 200 ms refresh cadence.
+                self.motors.stop(force=self.recovery_required or not self.motors.standstill_pending)
                 self.recovery_required = False
             left, right = 0, 0
         elif command != "drive" or (left, right) == (0, 0):
@@ -590,7 +638,8 @@ class ProtocolSession:
         # The recheck can start in drive.poll or in the final feedback sample,
         # after the original request branch was chosen. Its ACK must still
         # explain a suppressed target and discard stale input on the App.
-        feedback_recheck = feedback_recheck or self.motors.motion_recovery_required
+        feedback_recheck = feedback_recheck or self.motors.feedback_recovery_required
+        standstill_pending = standstill_pending or self.motors.standstill_pending
         recovering = recovering or self.recovery_active
         if neutral:
             self.motors.release_motion_recovery()
@@ -606,6 +655,7 @@ class ProtocolSession:
                 # still tell the App to discard the held target and require fresh input.
                 "recoveryRequired": recovering,
                 "feedbackRecheck": feedback_recheck,
+                "standstillPending": standstill_pending,
                 **self.motors.parking_state(), **infrared}, closing
 
 
@@ -720,6 +770,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
     processed_ms = None
     request_gap_ms = None
     prior_ir = False
+    prior_standstill_pending = False
     previous_command = None
     summary_at = time.monotonic()
     sample_count = 0
@@ -801,7 +852,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             last_ack_seq = response["seq"]
             last_request = request
             last_received = received
-            if response["recoveryRequired"]:
+            if response["recoveryRequired"] and not response["standstillPending"]:
                 diagnostic.event("drive.feedback_recheck_ack" if response["feedbackRecheck"] else
                     "drive.network_recovery_ack", critical=True, request=request,
                     recoveryRequired=True, neutralAccepted=not session.recovery_active,
@@ -811,8 +862,9 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             max_processing_ms = max(max_processing_ms, processed_ms)
             max_request_gap_ms = max(max_request_gap_ms, request_gap_ms or 0.0)
             blocked = response["infraredBlocked"]
-            if closing or blocked != prior_ir or previous_command != message["cmd"] or completed - summary_at >= 1:
-                diagnostic.event("drive.ack_sent", critical=closing or blocked != prior_ir,
+            pending_changed = response["standstillPending"] != prior_standstill_pending
+            if closing or blocked != prior_ir or pending_changed or previous_command != message["cmd"] or completed - summary_at >= 1:
+                diagnostic.event("drive.ack_sent", critical=closing or blocked != prior_ir or pending_changed,
                     lastValidRequest=last_request, lastAckSeq=last_ack_seq,
                     receivedMonotonicMs=received * 1000, ackMonotonicMs=ack_at * 1000,
                     requestGapMs=request_gap_ms, processingMs=processed_ms,
@@ -822,15 +874,21 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
                     infraredBlocked=blocked, infraredDirections=response["infraredDirections"],
                     targetStopped=response["targetStopped"], stopped=response["stopped"],
                     feedbackRecheck=response["feedbackRecheck"],
+                    standstillPending=response["standstillPending"],
                     **motors.feedback_state(), **motors.parking_state())
                 summary_at, sample_count = completed, 0
                 max_processing_ms = max_request_gap_ms = 0.0
             prior_ir, previous_command = blocked, message["cmd"]
+            prior_standstill_pending = response["standstillPending"]
             if closing:
                 break
-            # Suppressed held commands and parking during recovery cannot renew
-            # either deadline. Only a validated neutral request releases the latch.
-            if not session.recovery_active:
+            # Only an authenticated original neutral request may keep a physical
+            # standstill wait alive. A suppressed nonzero target is not neutral;
+            # neither it nor a parking request can extend recovery deadlines.
+            standstill_heartbeat = response["standstillPending"] and (
+                message["cmd"] == "stop" or
+                message["cmd"] == "drive" and (message["left"], message["right"]) == (0, 0))
+            if not session.recovery_active or standstill_heartbeat:
                 deadline = (completed if parking else received) + WATCHDOG_SECONDS
                 session_deadline = (completed if parking else received) + NETWORK_GRACE_SECONDS
                 motion_expired = False
@@ -852,7 +910,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             leaseRemainingMs=(deadline - now) * 1000,
             networkGraceRemainingMs=(session_deadline - now) * 1000,
             recoveryRequired=session.recovery_active,
-            feedbackRecheck=motors.motion_recovery_required,
+            feedbackRecheck=motors.feedback_recovery_required,
+            standstillPending=motors.standstill_pending,
             lastIrPollMs=getattr(pump, "last_poll_seconds", 0) * 1000,
             maxIrPollMs=getattr(pump, "max_poll_seconds", 0) * 1000,
             infrared=motors.infrared_state())

@@ -31,7 +31,8 @@ internal fun BoardUiState.canEditParkingAt(nowNanos: Long): Boolean =
     connected && driveEnabled && driveConfirmedStopped && driveLeft == 0 && driveRight == 0 &&
         hasFreshDriveFeedback(nowNanos) && driveFeedbackLeftRpm == 0 && driveFeedbackRightRpm == 0 &&
         !busy && !driveStarting && !driveStopping && !parkingUpdating && parkingSupported && parkingSettings != null &&
-        !followBlocksControl && !motorActionUnconfirmed && !driveFeedbackRecheck && !driveRecoveryNeedsRelease
+        !followBlocksControl && !motorActionUnconfirmed && !driveFeedbackRecheck && !driveStandstillPending &&
+        !driveRecoveryNeedsRelease
 
 internal fun DriveAck.hasFreshFeedback(nowNanos: Long = System.nanoTime()): Boolean = feedback != null &&
     driveFeedbackIsFresh(feedbackReceivedNanos, feedbackAgeAtReceiptMs, nowNanos)

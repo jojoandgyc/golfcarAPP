@@ -197,6 +197,34 @@ class ParkingControlsTest {
         compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
     }
 
+    @Test fun standstillWaitingShowsPausedParkingAndMeasuredMotionWithoutCallingItAControlFailure() {
+        val state = mutableStateOf(ready().copy(driveStandstillPending = true, driveFeedbackRecheck = true,
+            driveConfirmedStopped = false, driveFeedbackLeftRpm = 7, driveFeedbackRightRpm = -3))
+        var requests = 0
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { requests++ } } }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("正在减速，等待停车确认")
+        compose.onNodeWithTag("parkingSwitch").assertIsOff().assertIsNotEnabled().performClick()
+        compose.onNodeWithTag("parkingFeedback").assertTextContains("左 7 / 右 -3 RPM", substring = true)
+        compose.onNodeWithTag("parkingHint").assertTextContains("电子驻车已暂停", substring = true)
+        compose.runOnIdle { state.value = ready().copy(driveStandstillPending = true, driveFeedbackRecheck = true) }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("车轮已停稳，请松手后再操作")
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.runOnIdle { assertEquals(0, requests); state.value = ready() }
+        compose.onNodeWithTag("parkingSwitch").assertIsOff().assertIsEnabled()
+    }
+
+    @Test fun pendingZeroFeedbackThatExpiresDoesNotClaimCurrentStandstill() {
+        val state = ready().copy(driveStandstillPending = true, driveFeedbackRecheck = true)
+        var requests = 0
+        compose.setContent { MaterialTheme {
+            ParkingControls(state, TEST_NOW_NANOS + 501_000_000L) { requests++ }
+        } }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("停车等待中，轮速反馈待更新")
+        compose.onNodeWithTag("parkingFeedback").assertTextContains("已过期", substring = true)
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.runOnIdle { assertEquals(0, requests) }
+    }
+
     @Test fun zeroCurrentReasonNamesAffectedSideBesideSwitchAndShowsRealValues() {
         var requests = 0
         val state = mutableStateOf(ready(ParkingSettings(maxCurrentAmps = 15.0)))

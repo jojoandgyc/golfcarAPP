@@ -42,6 +42,7 @@ data class DriveAck(
     val feedbackReceivedNanos: Long = 0L,
     val feedbackAgeAtReceiptMs: Long = Long.MAX_VALUE,
     val feedbackRecheck: Boolean = false,
+    val standstillPending: Boolean = false,
 )
 
 /**
@@ -75,6 +76,8 @@ class BoardDriveChannel private constructor(
     private var summaryCount = 0
     private var summaryRttTotal = 0L
     private var summaryRttMax = 0L
+    private var recoveryReportState = 0
+    private var recoveryReportNanos = 0L
     lateinit var ready: DriveReady
         private set
 
@@ -219,26 +222,53 @@ class BoardDriveChannel private constructor(
                     val feedbackRecheck = rawFeedbackRecheck == true
                     requireMessage(!feedbackRecheck || recoveryRequired && measured.targetStopped,
                         "轮速复核时必须保持零目标并重新确认输入")
+                    val rawStandstillPending = reply.opt("standstillPending")
+                    requireMessage(!reply.has("standstillPending") || rawStandstillPending is Boolean,
+                        "开发板停车等待回执格式无效")
+                    val standstillPending = rawStandstillPending == true
+                    requireMessage(!standstillPending || feedbackRecheck && recoveryRequired && measured.targetStopped,
+                        "停车等待时必须保持零目标与输入恢复锁")
                     val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight,
                         measured.targetStopped, recoveryRequired)
                     val actualParking = if (ready.parkingSupported) readParking(reply) else null
                     if (ready.parkingSupported) {
                         val expectedParking = if (closing) confirmedParking?.copy(enabled = false)
                             else parking ?: confirmedParking
-                        requireMessage(actualParking == expectedParking, "开发板驻车回执与设置不一致")
+                        requireMessage(!standstillPending || actualParking?.enabled == false,
+                            "停车等待时电子驻车必须保持关闭")
+                        val safeParkingRelease = standstillPending &&
+                            actualParking == expectedParking?.copy(enabled = false)
+                        requireMessage(actualParking == expectedParking || safeParkingRelease,
+                            "开发板驻车回执与设置不一致")
                     }
                     token = nextToken
                     confirmedParking = actualParking
                     lastAckSequence = sentSequence
                     lastAckNanos = System.nanoTime()
                     val rtt = elapsedMillis(started)
-                    if (recoveryRequired || rtt >= 900L) Diagnostics.event(
-                        if (feedbackRecheck) "drive.feedback_recheck" else "drive.network_recovery", diagnosticContext,
-                        fields = mapOf("seq" to sentSequence, "elapsedMs" to rtt,
-                            "recoveryRequired" to recoveryRequired, "feedbackRecheck" to feedbackRecheck,
-                            "stopped" to stopped, "feedbackLeftRpm" to measured.feedback.leftRpm,
-                            "feedbackRightRpm" to measured.feedback.rightRpm,
-                            "networkGraceMs" to ready.networkGraceMs), critical = true)
+                    val recoveryState = (if (recoveryRequired) 1 else 0) or (if (feedbackRecheck) 2 else 0) or
+                        (if (standstillPending) 4 else 0) or (if (stopped) 8 else 0)
+                    val recoveryActive = (recoveryState and 7) != 0
+                    val recoveryChanged = (recoveryActive || (recoveryReportState and 7) != 0) &&
+                        recoveryState != recoveryReportState
+                    if (recoveryChanged || (recoveryActive || rtt >= 900L) &&
+                        elapsedMillis(recoveryReportNanos) >= 1_000L) {
+                        val event = when {
+                            standstillPending || (recoveryReportState and 4) != 0 -> "drive.standstill_wait"
+                            feedbackRecheck || (recoveryReportState and 2) != 0 -> "drive.feedback_recheck"
+                            else -> "drive.network_recovery"
+                        }
+                        Diagnostics.event(event, diagnosticContext,
+                            fields = mapOf("seq" to sentSequence, "elapsedMs" to rtt,
+                                "recoveryRequired" to recoveryRequired, "feedbackRecheck" to feedbackRecheck,
+                                "standstillPending" to standstillPending,
+                                "severity" to if (standstillPending) "warning" else "info",
+                                "stopped" to stopped, "feedbackLeftRpm" to measured.feedback.leftRpm,
+                                "feedbackRightRpm" to measured.feedback.rightRpm,
+                                "networkGraceMs" to ready.networkGraceMs), critical = recoveryChanged)
+                        recoveryReportNanos = System.nanoTime()
+                    }
+                    recoveryReportState = recoveryState
                     lastAckRttMs = rtt
                     summaryCount += 1
                     summaryRttTotal += rtt
@@ -252,6 +282,7 @@ class BoardDriveChannel private constructor(
                             "leftRpm" to actualLeft, "rightRpm" to actualRight, "targetStopped" to measured.targetStopped,
                             "stopped" to stopped, "feedbackLeftRpm" to measured.feedback.leftRpm,
                             "feedbackRecheck" to feedbackRecheck,
+                            "standstillPending" to standstillPending,
                             "feedbackRightRpm" to measured.feedback.rightRpm,
                             "feedbackLeftError" to measured.feedback.leftError,
                             "feedbackRightError" to measured.feedback.rightError,
@@ -266,7 +297,7 @@ class BoardDriveChannel private constructor(
                     phase = "idle"
                     DriveAck(actualLeft, actualRight, stopped, actualParking, interlock, recoveryRequired,
                         measured.targetStopped, measured.feedback, lastAckNanos, measured.feedback.ageMs + rtt,
-                        feedbackRecheck)
+                        feedbackRecheck, standstillPending)
                 }
             } catch (timeout: TimeoutCancellationException) {
                 transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }

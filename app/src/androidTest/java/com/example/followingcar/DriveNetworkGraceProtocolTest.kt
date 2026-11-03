@@ -115,6 +115,7 @@ class DriveNetworkGraceProtocolTest {
         val reply = control.exchange(30, -30)
         assertFalse(reply.recoveryRequired)
         assertFalse(reply.feedbackRecheck)
+        assertFalse(reply.standstillPending)
         assertFalse(reply.stopped)
         assertEquals(30, reply.left)
         assertEquals(-30, reply.right)
@@ -227,6 +228,67 @@ class DriveNetworkGraceProtocolTest {
             assertFalse(control.isOpen)
         }
     }
+
+    @Test fun standstillWaitSafelyReleasesParkingAndPreservesCurrentWhileKeepingChannelAlive() = runBlocking {
+        val control = open(ready(), ack(recovery = false).put("parkingEnabled", true),
+            waitingAck(seq = 2), waitingAck(seq = 3), waitingAck(seq = 4, stopped = true),
+            ack(seq = 5, recovery = false))
+        val original = requireNotNull(control.ready.parking)
+        control.configureParking(original.copy(enabled = true))
+        val pending = control.exchange(0, 0)
+        assertTrue(pending.standstillPending)
+        assertTrue(pending.feedbackRecheck && pending.recoveryRequired && pending.targetStopped)
+        assertFalse(pending.stopped)
+        assertEquals(7, pending.feedback?.leftRpm)
+        assertEquals(-3, pending.feedback?.rightRpm)
+        assertEquals(original, pending.parking)
+        assertTrue(control.exchange(0, 0).standstillPending)
+        val finalNeutral = control.exchange(0, 0)
+        assertTrue(finalNeutral.standstillPending && finalNeutral.stopped)
+        val released = control.exchange(0, 0)
+        assertFalse(released.standstillPending)
+        assertTrue(released.stopped)
+        assertEquals(original, released.parking)
+        assertTrue(control.isOpen)
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
+    @Test fun standstillWaitRejectsMalformedFlagsChangedCurrentAndUnsafeParkingState() = runBlocking {
+        for (reply in listOf(waitingAck().put("standstillPending", "true"),
+            waitingAck().put("standstillPending", 1), waitingAck().put("standstillPending", JSONObject.NULL),
+            waitingAck().put("feedbackRecheck", false), waitingAck().put("recoveryRequired", false),
+            waitingAck().put("left", 1).put("targetStopped", false),
+            waitingAck().put("parkingEnabled", true), waitingAck().put("parkingLeftCurrentAmps", 6.0),
+            waitingAck().put("parkingRightCurrentAmps", 6.0), waitingAck().put("parkingMaxCurrentAmps", 50.0))) {
+            val control = open(ready(), reply)
+            assertTrue(runCatching { control.exchange(0, 0) }.exceptionOrNull() is IOException)
+            assertFalse(control.isOpen)
+        }
+    }
+
+    @Test fun ongoingStandstillWaitLogsStateChangesAndRateLimitedWarningsInsteadOfFailures() = runBlocking {
+        val control = open(ready(), *(1..20).map { waitingAck(seq = it) }.toTypedArray(),
+            waitingAck(seq = 21, stopped = true), ack(seq = 22, recovery = false))
+        val started = System.nanoTime()
+        repeat(20) { assertTrue(control.exchange(0, 0).standstillPending) }
+        val elapsed = (System.nanoTime() - started) / 1_000_000L
+        val ongoing = engine.snapshot().events.map(::JSONObject).filter { it.optString("event") == "drive.standstill_wait" }
+        assertTrue(ongoing.isNotEmpty())
+        assertTrue("Repeated ACKs must not create one critical record per heartbeat", ongoing.size <= elapsed / 1000 + 2)
+        assertTrue(ongoing.all { it.getJSONObject("fields").getString("severity") == "warning" })
+        control.exchange(0, 0)
+        control.exchange(0, 0)
+        val events = engine.snapshot().events.map(::JSONObject)
+        assertTrue(events.any { it.optString("event") == "drive.standstill_wait" &&
+            !it.getJSONObject("fields").getBoolean("standstillPending") })
+        assertFalse(events.any { it.optString("event") == "drive.network_recovery" })
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
+    private fun waitingAck(seq: Int = 1, stopped: Boolean = false) = ack(seq = seq, recovery = true)
+        .put("feedbackRecheck", true).put("standstillPending", true).put("stopped", stopped)
+        .put("feedbackLeftRpm", if (stopped) 0 else 7).put("feedbackRightRpm", if (stopped) 0 else -3)
+        .put("feedbackSamples", if (stopped) 2 else 0)
 
     private suspend fun open(vararg replies: JSONObject): BoardDriveChannel {
         val memory = GraceMemoryChannel(replies.joinToString("\n", postfix = "\n"))

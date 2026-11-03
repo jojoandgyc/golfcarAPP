@@ -22,6 +22,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
@@ -304,6 +305,132 @@ class DriveStartupStateTest {
         assertTrue(engine.snapshot().failures.isEmpty())
     }
 
+    @Test fun sustainedStandstillWaitKeepsNeutralHeartbeatsAndShowsActualParkingRelease() = runBlocking {
+        val waiting = AtomicBoolean()
+        val release = AtomicBoolean()
+        val finalNeutral = AtomicBoolean()
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, transformAck = { request, ack ->
+            if (request.getString("cmd") == "stop" && ack.getBoolean("parkingEnabled")) waiting.set(true)
+            if (request.getString("cmd") == "stop" && waiting.get()) {
+                if (release.get() && finalNeutral.get()) {
+                    waiting.set(false)
+                } else {
+                    val zero = release.get()
+                    if (zero) finalNeutral.set(true)
+                    ack.put("standstillPending", true).put("feedbackRecheck", true).put("recoveryRequired", true)
+                        .put("parkingEnabled", false).put("stopped", zero)
+                        .put("feedbackLeftRpm", if (zero) 0 else 7).put("feedbackRightRpm", if (zero) 0 else -3)
+                        .put("feedbackSamples", if (zero) 2 else 0)
+                }
+            }
+        })
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) { fixture.vm.setParkingEnabled(true) }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(5_000) { while (fixture.bridge.requests.size < 25) delay(10) }
+        withContext(Dispatchers.Main) {
+            val state = fixture.vm.state.value
+            assertTrue(state.driveEnabled && state.driveStandstillPending)
+            assertFalse(state.driveConfirmedStopped)
+            assertFalse(state.canEditParking)
+            assertEquals(7, state.driveFeedbackLeftRpm)
+            assertEquals(-3, state.driveFeedbackRightRpm)
+            assertEquals(ParkingSettings(false, 5.0, 5.0, 60.0), state.parkingSettings)
+            assertTrue(state.driveStatus.contains("正在减速"))
+            assertTrue(state.parkingStatus.contains("电子驻车已暂停"))
+            fixture.vm.releaseJoystick()
+            assertTrue(fixture.vm.state.value.driveStatus.contains("等待停车确认"))
+            fixture.vm.setParkingEnabled(true) // Still cannot queue a reenable while physically moving.
+        }
+        assertTrue(fixture.updates.any { it.parkingSettings?.enabled == true })
+        assertEquals(1, fixture.bridge.requests.count { it.getString("cmd") == "parking" })
+        assertTrue(fixture.bridge.requests.all { it.getInt("left") == 0 && it.getInt("right") == 0 })
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertTrue(engine.snapshot().failures.isEmpty())
+        val resetEvents = engine.snapshot().events.map(::JSONObject).filter {
+            it.optString("event") == "drive.recovery_input_reset" && it.optString("source") == "STANDSTILL_PENDING"
+        }
+        assertEquals("An unchanged pending heartbeat does not reset/log critical state again", 1, resetEvents.size)
+        release.set(true)
+        withTimeout(3_000) { fixture.vm.state.first { !it.driveStandstillPending && it.driveConfirmedStopped } }
+        assertTrue(fixture.updates.any { it.driveStandstillPending && it.driveConfirmedStopped && !it.canEditParking })
+        withContext(Dispatchers.Main) {
+            assertTrue(fixture.vm.state.value.canEditParking)
+            assertEquals(false, fixture.vm.state.value.parkingSettings?.enabled)
+            fixture.vm.disableDrive("test stop")
+        }
+        awaitFinished(fixture)
+        assertFalse(fixture.vm.state.value.driveStandstillPending)
+    }
+
+    @Test fun standstillWaitNeverResumesAHeldTargetWhenTheWheelsBecomeZero() = runBlocking {
+        val release = AtomicBoolean()
+        val releasedAcks = AtomicInteger()
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, allowMovement = true,
+            transformAck = { request, ack ->
+                if (request.getString("cmd") == "stop" && request.getLong("seq") >= 2L) {
+                    val pending = !release.get() || releasedAcks.getAndIncrement() == 0
+                    if (pending) ack.put("standstillPending", true).put("feedbackRecheck", true)
+                        .put("recoveryRequired", true).put("stopped", release.get())
+                        .put("feedbackLeftRpm", if (release.get()) 0 else 7)
+                        .put("feedbackRightRpm", if (release.get()) 0 else -3)
+                        .put("feedbackSamples", if (release.get()) 2 else 0)
+                }
+            })
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) { fixture.vm.moveJoystick(0f, 1f) }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { fixture.vm.state.first { it.driveStandstillPending && it.driveRecoveryNeedsRelease } }
+        release.set(true)
+        withTimeout(3_000) { while (fixture.bridge.requests.size < 6) delay(10) }
+        withContext(Dispatchers.Main) {
+            assertTrue(fixture.vm.state.value.driveStandstillPending)
+            assertTrue(fixture.vm.state.value.driveConfirmedStopped)
+            assertFalse(fixture.vm.state.value.canEditParking)
+            fixture.vm.moveJoystick(0f, 1f)
+            assertEquals(0, fixture.vm.state.value.driveLeft)
+            fixture.vm.releaseJoystick()
+        }
+        assertTrue(fixture.bridge.requests.all { it.getInt("left") == 0 && it.getInt("right") == 0 })
+        withTimeout(3_000) { fixture.vm.state.first { !it.driveStandstillPending && !it.driveFeedbackRecheck } }
+        withContext(Dispatchers.Main) { fixture.vm.moveJoystick(0f, 1f) }
+        withTimeout(3_000) { while (fixture.bridge.requests.none { it.getString("cmd") == "drive" }) delay(10) }
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
+    @Test fun inputPressedBetweenFinalPendingAckAndHealthyAckStillRequiresRelease() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 3, allowMovement = true,
+            transformAck = { request, ack ->
+                if (request.getLong("seq") == 2L) ack.put("standstillPending", true)
+                    .put("feedbackRecheck", true).put("recoveryRequired", true)
+            })
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            assertTrue(fixture.vm.state.value.driveStandstillPending)
+            assertFalse(fixture.vm.state.value.driveRecoveryNeedsRelease)
+            fixture.vm.moveJoystick(0f, 1f)
+            assertTrue(fixture.vm.state.value.driveRecoveryNeedsRelease)
+            assertEquals(0, fixture.vm.state.value.driveLeft)
+        }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { while (fixture.bridge.requests.size < 5) delay(10) }
+        withContext(Dispatchers.Main) {
+            assertTrue(fixture.vm.state.value.driveStandstillPending)
+            assertTrue(fixture.vm.state.value.driveRecoveryNeedsRelease)
+            assertFalse(fixture.vm.state.value.canEditParking)
+            fixture.vm.moveJoystick(0f, 1f)
+            assertEquals(0, fixture.vm.state.value.driveLeft)
+            fixture.vm.releaseJoystick()
+        }
+        assertTrue(fixture.bridge.requests.all { it.getInt("left") == 0 && it.getInt("right") == 0 })
+        withTimeout(3_000) { fixture.vm.state.first { !it.driveStandstillPending && !it.driveFeedbackRecheck } }
+        withContext(Dispatchers.Main) { fixture.vm.moveJoystick(0f, 1f) }
+        withTimeout(3_000) { while (fixture.bridge.requests.none { it.getString("cmd") == "drive" }) delay(10) }
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
     private suspend fun startFixture(networkGrace: Boolean = false, blockWrite: Boolean = false,
         holdSequence: Long = 1, allowMovement: Boolean = false,
         transformAck: (JSONObject, JSONObject) -> Unit = { _, _ -> }): Fixture {
@@ -395,6 +522,7 @@ class DriveStartupStateTest {
         private val writeReleased = CountDownLatch(1)
         private var expectedSequence = 1L
         private var token = tokenFor(1)
+        private var parkingEnabled = false
         @Volatile private var connected = false
         @Volatile private var disconnected = false
         @Volatile private var pending: JSONObject? = null
@@ -444,12 +572,18 @@ class DriveStartupStateTest {
             if (released.compareAndSet(false, true)) acknowledge(request)
         }
         private fun acknowledge(request: JSONObject) {
+            when (request.getString("cmd")) {
+                "parking" -> parkingEnabled = request.getBoolean("parkingEnabled")
+                "close", "estop" -> parkingEnabled = false
+            }
             token = tokenFor(request.getLong("seq") + 1)
             val ack = JSONObject().put("type", "ack").put("seq", request.getLong("seq"))
                 .put("token", token).put("left", request.getInt("left")).put("right", request.getInt("right"))
                 .withDriveSafetyFixture()
+                .put("parkingEnabled", parkingEnabled)
             if (networkGrace) ack.put("recoveryRequired", false)
             transformAck(request, ack)
+            parkingEnabled = ack.getBoolean("parkingEnabled")
             replies.append(ack)
         }
         override fun isConnected(): Boolean = connected && !disconnected
