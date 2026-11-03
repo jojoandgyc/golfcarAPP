@@ -151,6 +151,48 @@ class MotorConfigurationProtocolTest {
         assertRejected(fixture().put("ok", "true"))
     }
 
+    @Test fun oldSchemaIsReportedAsVersionMismatchRatherThanMotorValueOutOfRange() {
+        // The old snapshot shape must not be read or silently accepted as a v2 baseline.
+        val old = fixture().put("schemaVersion", 1).put("snapshot", JSONObject().put("oldFormat", true))
+        val failure = runCatching { parse(old) }.exceptionOrNull()
+        assertTrue(failure is IOException)
+        assertTrue(failure!!.message.orEmpty().contains("接口版本不兼容"))
+        assertNotNull(failure.cause)
+        val summary = generateSequence(failure) { it.cause }.joinToString(" ") { it.message.orEmpty() }
+        assertTrue(summary.contains("板端返回版本 1"))
+        assertTrue(summary.contains("需要电机配置接口版本 2"))
+        assertFalse(summary.contains("配置数值超出协议范围"))
+    }
+
+    @Test fun malformedSchemaNeverLeaksRawTextOrBecomesARegisterRangeError() {
+        for (raw in listOf("private-token-must-not-appear", "2", true, 1.5, JSONObject.NULL)) {
+            val failure = runCatching { parse(fixture().put("schemaVersion", raw)) }.exceptionOrNull()
+            assertTrue(failure is IOException)
+            val summary = generateSequence(requireNotNull(failure)) { it.cause }
+                .joinToString(" ") { it.message.orEmpty() }
+            assertTrue(summary.contains("未返回有效的整数版本号"))
+            assertFalse(summary.contains("private-token-must-not-appear"))
+            assertFalse(summary.contains("配置数值超出协议范围"))
+        }
+        val missing = fixture().apply { remove("schemaVersion") }
+        val failure = runCatching { parse(missing) }.exceptionOrNull()
+        assertTrue(failure?.cause?.message.orEmpty().contains("未返回有效的整数版本号"))
+    }
+
+    @Test fun futureSchemaAndActionRepliesKeepExplicitVersionAndUnknownOutcome() {
+        val future = runCatching { parse(fixture().put("schemaVersion", 3)) }.exceptionOrNull()
+        assertTrue(future?.cause?.message.orEmpty().contains("板端返回版本 3"))
+        val plan = MotorActionPlan(requireNotNull(parse().snapshot).snapshotId, MotorAction.RIGHT_STOP, 1, 0)
+        val reply = fixture().put("schemaVersion", 1).put("op", "action")
+        val failure = runCatching {
+            parseMotorActionReply(command(reply), REQUEST_ID, plan, simulation = true)
+        }.exceptionOrNull()
+        assertTrue(failure is IOException)
+        assertTrue(failure!!.message.orEmpty().contains("动作结果未确认"))
+        assertTrue(failure.message.orEmpty().contains("不要直接重复执行"))
+        assertTrue(failure.cause?.message.orEmpty().contains("板端返回版本 1"))
+    }
+
     @Test fun requiredFieldsAndRegisterWordsMustRemainCompleteAndIntegral() {
         val missing = fixture()
         val fields = missing.getJSONObject("snapshot").getJSONArray("fields")

@@ -1,0 +1,115 @@
+{
+  "recordedAtUtc": "2026-11-03T15:48:19.175300+00:00",
+  "sourceBaseCommit": "ffb4e0bb453df90fc9168f21d10c6caa9b324cc8",
+  "incident": {
+    "firstFailureUtc": "2026-11-03T15:36:29.301811Z",
+    "rootCause": "App requires motor configuration protocol 2; deployed bridge was protocol 1 and rejected the request before opening serial. Version mismatch was incorrectly presented as a register value outside its range.",
+    "oldBridgeSha256": "6c7f437e9f5d48b5471ff4f670d3c125784b626db24b748fc0f4e1075b576b83",
+    "realParameterWritesDuringFailedRead": false
+  },
+  "app": {
+    "installedAtUtc": "2026-11-03T15:46:29.619354+00:00",
+    "versionCode": 23,
+    "versionName": "1.8.12-parking-config",
+    "apkSha256": "2335b547f799b51b45e4c4c2cd2aba702b1a1427de74409893ab0a85a1e0cd98",
+    "installedApkSha256": "2335b547f799b51b45e4c4c2cd2aba702b1a1427de74409893ab0a85a1e0cd98",
+    "connectionPreferencesPreserved": true,
+    "preInstallControlCheck": {
+      "controlIdle": true,
+      "serialIdle": true
+    },
+    "realMotorWritesSent": false
+  },
+  "bridge": {
+    "deployedAtUtc": "2026-11-03T15:43:34.048093+00:00",
+    "files": [
+      {
+        "file": "/home/topeet/lianzhan/scripts/motor_register_catalog.py",
+        "oldSha256": null,
+        "sha256": "94366d11759ec1a5ac4e350a90bbeb34c061841297dbd52c0322a70a8e49070b",
+        "backup": null
+      },
+      {
+        "file": "/home/topeet/lianzhan/scripts/app_motor_config_bridge.py",
+        "oldSha256": "6c7f437e9f5d48b5471ff4f670d3c125784b626db24b748fc0f4e1075b576b83",
+        "sha256": "1a32fb8c71a78128c3e78ee093ca12f2c61032e6f728f4d9ae45e6880a0717bf",
+        "backup": "/home/topeet/lianzhan/scripts/app_motor_config_bridge.py.bak.parking-read-20261103T154334Z"
+      }
+    ],
+    "controlIdle": true,
+    "serialIdle": true,
+    "simulationPassed": true,
+    "hardwareCommandsSent": false
+  },
+  "behavior": {
+    "parkingFlow": "Read current values, edit left/right, review live old/new values, save once.",
+    "extraPreviewClickRemoved": true,
+    "onlyParkingCurrentFieldsWrittenByShortcut": true,
+    "inputLimitsIdleGuardAndReadbackPreserved": true,
+    "schemaErrorsDistinctFromParameterRangeErrors": true
+  },
+  "validation": {
+    "jvm": {
+      "tests": 268,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "boardOfflineMotorAndGuard": {
+      "tests": 53,
+      "passed": 53
+    },
+    "emulatorProtocolUiAndParkingSimulation": {
+      "tests": 27,
+      "passed": 27
+    },
+    "emulatorDeployedBridgeSsh": {
+      "tests": 2,
+      "passed": 2,
+      "coverage": [
+        "Real deployed interface snapshot only",
+        "Deployed interface --simulate write/readback/stale-baseline rejection"
+      ]
+    },
+    "phoneReadOnlyVerification": {
+      "completedAtUtc": "2026-11-03T15:47:50.109852Z",
+      "operationId": "c205e1b2-27c7-4ef1-b82a-df98a24a6eab",
+      "ok": true,
+      "leftParkingCurrentA": 0,
+      "rightParkingCurrentA": 0,
+      "maxOutputCurrentA": 15,
+      "editableInputsVisible": true,
+      "unchangedSaveDisabled": true,
+      "realWriteTestPerformed": false
+    },
+    "snapshotRead": {
+      "exitCode": 0,
+      "ok": true,
+      "schemaVersion": 2,
+      "writeMayHaveOccurred": false,
+      "error": null,
+      "snapshotId": "9c711866f5937042b16e58273e8ee1c04e1dab30e20f3574b456c65aeee532e6",
+      "fieldCount": 69,
+      "gate": {
+        "controlAvailable": true,
+        "zeroSpeedObserved": true,
+        "zeroPwmObserved": true,
+        "communicationControl": true,
+        "disabledVerified": null,
+        "writeAllowed": true,
+        "reason": null,
+        "samples": 2
+      },
+      "max_output_current": 15.0,
+      "right_parking_current": 0.0,
+      "left_parking_current": 0.0
+    }
+  },
+  "deploymentConstraints": {
+    "motorParametersChangedByAgent": false,
+    "drivingOrParkingModeStartedByAgent": false,
+    "followRuntimeChanged": false,
+    "joystickBridgeChanged": false,
+    "networkSettingsChanged": false
+  }
+}

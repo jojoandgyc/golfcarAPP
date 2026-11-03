@@ -12,6 +12,34 @@ import org.junit.runner.RunWith
 /** Real SSH and production codec; every bridge request explicitly uses in-memory simulation. */
 @RunWith(AndroidJUnit4::class)
 class MotorConfigurationBridgeIntegrationTest {
+    /** Explicit opt-in: deployed production bridge, snapshot only, never a write/action plan. */
+    @Test fun deployedBridgeReadOnlySnapshotMatchesAppProtocol() = runBlocking {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Opt in with runMotorConfigurationReadOnly=true",
+            args.getString("runMotorConfigurationReadOnly") == "true")
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val saved = context.getSharedPreferences("board_connection", 0)
+        val password = context.getSharedPreferences("board_credentials", 0).getString("password", null)
+        require(!password.isNullOrEmpty())
+        val client = BoardSshClient()
+        try {
+            withTimeout(60_000) {
+                client.connect(BoardConnection(args.getString("boardHost") ?: saved.getString("host", null)!!,
+                    saved.getString("port", "22")!!.toInt(), saved.getString("username", "topeet")!!, password))
+                val reply = client.motorConfigurationRequest()
+                assertTrue(reply.error, reply.ok)
+                assertFalse(reply.writeMayHaveOccurred)
+                assertTrue(reply.results.isEmpty())
+                val snapshot = requireNotNull(reply.snapshot)
+                assertEquals(MotorConfigurationField.entries.toSet(), snapshot.values.keys)
+                assertNotNull(parkingCurrentSettings(snapshot))
+                assertTrue(client.isConnected)
+            }
+        } finally {
+            client.disconnect()
+        }
+    }
+
     @Test fun simulatedMotorConfigurationUsesStdinWritesAndConfirmsReadback() = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Opt in with runMotorConfigurationSimulation=true",

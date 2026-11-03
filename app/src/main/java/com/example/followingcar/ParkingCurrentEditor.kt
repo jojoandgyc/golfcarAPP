@@ -55,14 +55,6 @@ internal fun ParkingCurrentEditor(
         leftOriginal != null && rightOriginal != null && maximum != null && !submitted
     val analysis = parkingCurrentDraftAnalysis(configuration, leftText, rightText)
     val plan = parkingCurrentWritePlan(configuration, leftText, rightText)
-    var preview by remember(snapshot, configuration.connection, configuration.requiresRead,
-        configuration.busy, configuration.error, configuration.writeResults, configuration.draftValues,
-        boardState.connected, boardState.busy, boardState.manualActive, boardState.followBlocksControl,
-        boardState.motorActionUnconfirmed, boardState.pairingBusy, boardState.pairingUnconfirmed,
-        boardState.videoServiceBusy, boardState.parkingUpdating, boardState.remoteMode,
-        boardState.connectionHost, boardState.connectionPort, leftText, rightText) {
-        mutableStateOf<MotorConfigurationWritePlan?>(null)
-    }
     val status = when {
         !boardState.connected -> "请先连接小车，再读取当前配置。"
         boardState.manualActive -> "请先用页底按钮停用手动控制，再读取和设置电流。"
@@ -89,7 +81,7 @@ internal fun ParkingCurrentEditor(
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("驻车电流设置", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = {
-                if (canRead) { keyboard?.hide(); preview = null; onRead() }
+                if (canRead) { keyboard?.hide(); onRead() }
             }, enabled = canRead, modifier = Modifier.testTag("parkingCurrentRead")) { Text("读取") }
         }
         Text(status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingCurrentEditorStatus"))
@@ -97,9 +89,9 @@ internal fun ParkingCurrentEditor(
         // viewport. Editing returns after an explicit successful read replaces the result.
         if (!(configuration.requiresRead && results.isNotEmpty())) {
             ParkingCurrentInput("左", "Left", leftText, canEdit, leftRaw, upper,
-                onChange = { leftText = it.take(32); preview = null })
+                onChange = { leftText = it.take(32) })
             ParkingCurrentInput("右", "Right", rightText, canEdit, rightRaw, upper,
-                onChange = { rightText = it.take(32); preview = null })
+                onChange = { rightText = it.take(32) })
         }
         Text("读取值：左 ${leftOriginal?.let(leftField::display) ?: "—"} / 右 ${rightOriginal?.let(rightField::display) ?: "—"} A · 上限 ${maximum?.let(maximumField::display) ?: "—"} A",
             style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingCurrentBaseline"))
@@ -113,31 +105,25 @@ internal fun ParkingCurrentEditor(
             Text("任一侧为 0 A 时，电子驻车不能开启。", style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.testTag("parkingCurrentZeroHint"))
         }
-        val reviewed = preview
-        if (reviewed != null && canEdit && reviewed == plan) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.testTag("parkingCurrentPreview")) {
-                Text("确认保存参数（断电后保留）", fontWeight = FontWeight.Medium)
-                reviewed.changes.forEach { change ->
+        if (canEdit && plan != null) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.testTag("parkingCurrentChanges")) {
+                Text("本次修改（保存后断电保留）", fontWeight = FontWeight.Medium)
+                plan.changes.forEach { change ->
                     Text("${if (change.field == leftField) "左" else "右"}：${change.field.display(change.expectedRaw)} A → ${change.field.display(change.raw)} A",
                         style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.testTag("parkingCurrentPreview_${change.field.id}"))
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { preview = null }, modifier = Modifier.weight(1f)
-                        .testTag("parkingCurrentCancelPreview")) { Text("返回修改") }
-                    Button(onClick = {
-                        if (canEdit && !submitted && preview == plan && reviewed == plan) {
-                            submitted = true
-                            preview = null
-                            keyboard?.hide()
-                            onApply(reviewed)
-                        }
-                    }, modifier = Modifier.weight(1f).testTag("parkingCurrentConfirm")) { Text("确认应用") }
+                        modifier = Modifier.testTag("parkingCurrentChange_${change.field.id}"))
                 }
             }
-        } else Button(onClick = { if (canEdit && plan != null) { keyboard?.hide(); preview = plan } },
+        }
+        Button(onClick = {
+            if (canEdit && !submitted && plan != null) {
+                submitted = true
+                keyboard?.hide()
+                onApply(plan)
+            }
+        },
             enabled = canEdit && plan != null,
-            modifier = Modifier.fillMaxWidth().testTag("parkingCurrentReview")) { Text("预览电流修改") }
+            modifier = Modifier.fillMaxWidth().testTag("parkingCurrentSave")) { Text("保存驻车电流") }
         if (configuration.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
         configuration.error?.let {
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,

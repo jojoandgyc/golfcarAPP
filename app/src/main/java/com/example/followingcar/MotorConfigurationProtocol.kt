@@ -129,6 +129,19 @@ private fun parseConnection(json: JSONObject): MotorSerialSettings {
         exactInteger(json.get("baudRate"), 9600, 115200).toInt(), code).also { require(it.isValid) }
 }
 
+/** Schema negotiation is not a motor-register range check. Never print an arbitrary field value. */
+private class MotorConfigurationVersionException(message: String) : IOException(message)
+
+private fun requireMotorConfigurationVersion(root: JSONObject) {
+    val raw = root.opt("schemaVersion")
+    val version = if (raw is Number) runCatching { BigDecimal(raw.toString()).longValueExact() }.getOrNull()
+        else null
+    if (version == 2L) return
+    val observed = if (version != null && version in 0L..65535L) "板端返回版本 $version"
+        else "板端未返回有效的整数版本号"
+    throw MotorConfigurationVersionException("$observed，当前 App 需要电机配置接口版本 2；请更新板端接口后重新读取")
+}
+
 private fun envelope(result: CommandResult, requestId: String, op: String, simulation: Boolean,
     connection: MotorSerialSettings): JSONObject {
     require(!result.truncated && result.stdout.isNotBlank()) { "电机接口响应不完整" }
@@ -136,7 +149,7 @@ private fun envelope(result: CommandResult, requestId: String, op: String, simul
     val root = tokener.nextValue() as? JSONObject ?: throw IOException("电机接口响应不是对象")
     require(tokener.nextClean() == '\u0000') { "电机接口响应包含额外输出" }
     require(root.shortString("type") == "motor_config")
-    require(exactInteger(root.get("schemaVersion"), 2, 2) == 2L) { "请更新板端电机接口到版本 2" }
+    requireMotorConfigurationVersion(root)
     require(root.shortString("requestId") == requestId && root.shortString("op") == op) { "电机接口响应编号不一致" }
     require(root.strictBoolean("simulation") == simulation) { "真实与模拟响应不一致" }
     require(parseConnection(root.getJSONObject("connection")) == connection) { "串口连接参数与响应不一致" }
@@ -223,7 +236,10 @@ internal fun parseMotorConfigurationReply(result: CommandResult, requestId: Stri
     if (reconnect) require(snapshot == null && !ok && mayHaveWritten)
     MotorConfigurationReply(ok, snapshot, parsed, mayHaveWritten, error, reconnect)
 } catch (failure: Exception) {
-    throw IOException("电机配置响应校验失败，请确认板端已更新并重新读取；不能确认参数状态", protocolDiagnosticFailure(failure))
+    val message = if (failure is MotorConfigurationVersionException)
+        "板端电机配置接口版本不兼容，暂不能读取或保存参数"
+    else "电机配置响应校验失败，请确认板端已更新并重新读取；不能确认参数状态"
+    throw IOException(message, protocolDiagnosticFailure(failure))
 }
 
 internal fun parseMotorActionReply(result: CommandResult, requestId: String, plan: MotorActionPlan,
@@ -259,7 +275,10 @@ internal fun parseMotorActionReply(result: CommandResult, requestId: String, pla
     if (reconnect) require(snapshot == null && mayHaveWritten)
     MotorActionReply(ok, snapshot, action, mayHaveWritten, reconnect, error)
 } catch (failure: Exception) {
-    throw IOException("电机动作回执校验失败，执行结果未确认，请重新读取；不要直接重复执行", protocolDiagnosticFailure(failure))
+    val message = if (failure is MotorConfigurationVersionException)
+        "板端电机配置接口版本不兼容，动作结果未确认；请更新后重新读取，不要直接重复执行"
+    else "电机动作回执校验失败，执行结果未确认，请重新读取；不要直接重复执行"
+    throw IOException(message, protocolDiagnosticFailure(failure))
 }
 
 private fun parseMotorSnapshot(json: JSONObject, connection: MotorSerialSettings): MotorConfigurationSnapshot {

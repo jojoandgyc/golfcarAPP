@@ -59,13 +59,13 @@ class ParkingCurrentEditorTest {
         compose.onNodeWithTag("parkingCurrentRightInput").assertIsNotEnabled()
         assertEquals("", input("Left"))
         assertEquals("", input("Right"))
-        compose.onNodeWithTag("parkingCurrentReview").assertIsNotEnabled()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
         compose.runOnIdle { assertEquals(0, reads); assertEquals(0, writes) }
         compose.onNodeWithTag("parkingCurrentRead").assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(1, reads); assertEquals(0, writes) }
     }
 
-    @Test fun independentOneAmpStepsAndPreviewDoNotWriteUntilOneExplicitConfirmation() {
+    @Test fun independentOneAmpStepsShowLiveChangesAndSaveExactlyOnce() {
         val plans = mutableListOf<MotorConfigurationWritePlan>()
         val config = ready()
         content(config = { config }, apply = { plans += it })
@@ -74,13 +74,13 @@ class ParkingCurrentEditorTest {
         assertEquals("5.5", input("Right"))
         compose.onNodeWithTag("parkingCurrentRightDecrease").performClick()
         assertEquals("4.5", input("Right"))
-        compose.onNodeWithTag("parkingCurrentReview").performScrollTo().performClick()
-        compose.onNodeWithTag("parkingCurrentPreview_${left.id}").assertTextEquals("左：4.25 A → 5.25 A")
-        compose.onNodeWithTag("parkingCurrentPreview_${right.id}").assertTextEquals("右：5.5 A → 4.5 A")
-        compose.runOnIdle { assertTrue(plans.isEmpty()); assertTrue(config.draftValues.isEmpty()) }
-        compose.onNodeWithTag("parkingCurrentConfirm").performScrollTo().performClick()
+        compose.onNodeWithTag("parkingCurrentChange_${left.id}").assertTextEquals("左：4.25 A → 5.25 A")
+        compose.onNodeWithTag("parkingCurrentChange_${right.id}").assertTextEquals("右：5.5 A → 4.5 A")
+        compose.onNodeWithTag("parkingCurrentReview").assertDoesNotExist()
         compose.onNodeWithTag("parkingCurrentConfirm").assertDoesNotExist()
-        compose.onNodeWithTag("parkingCurrentReview").assertIsNotEnabled().performClick()
+        compose.runOnIdle { assertTrue(plans.isEmpty()); assertTrue(config.draftValues.isEmpty()) }
+        compose.onNodeWithTag("parkingCurrentSave").performScrollTo().performClick()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
         compose.runOnIdle {
             assertEquals(1, plans.size)
             assertEquals(config.snapshot!!.snapshotId, plans.single().snapshotId)
@@ -95,6 +95,8 @@ class ParkingCurrentEditorTest {
         var writes = 0
         val board = mutableStateOf(idle())
         content(board = { board.value }, read = { reads++ }, apply = { writes++ })
+        compose.onNodeWithTag("parkingCurrentLeftIncrease").performClick()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsEnabled()
         listOf(idle().copy(driveEnabled = true), idle().copy(driveStarting = true),
             idle().copy(driveStopping = true), idle().copy(followActive = true),
             idle().copy(followStopping = true), idle().copy(followUncertain = true),
@@ -104,26 +106,26 @@ class ParkingCurrentEditorTest {
             compose.onNodeWithTag("parkingCurrentLeftInput").assertIsNotEnabled()
             compose.onNodeWithTag("parkingCurrentRightInput").assertIsNotEnabled()
             compose.onNodeWithTag("parkingCurrentLeftIncrease").assertIsNotEnabled().performClick()
-            compose.onNodeWithTag("parkingCurrentReview").assertIsNotEnabled()
+            compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
         }
         compose.runOnIdle { board.value = idle().copy(driveEnabled = true) }
         compose.onNodeWithTag("parkingCurrentEditorStatus").assertTextContains("先用页底按钮停用手动控制", substring = true)
         compose.runOnIdle { assertEquals(0, reads); assertEquals(0, writes) }
     }
 
-    @Test fun decimalAndOutputLimitValidationRejectBadValuesButZeroRequiresExplicitPreview() {
+    @Test fun decimalAndOutputLimitValidationRejectBadValuesAndZeroStillRequiresExplicitSave() {
         var writes = 0
         content(apply = { writes++ })
         compose.onNodeWithTag("parkingCurrentLeftInput").performTextReplacement("0")
         compose.onNodeWithTag("parkingCurrentZeroHint").assertTextContains("不能开启", substring = true)
-        compose.onNodeWithTag("parkingCurrentReview").assertIsEnabled()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsEnabled()
         listOf("15.01", "60.01", "-1", "NaN", "1.001", "").forEach { invalid ->
             compose.onNodeWithTag("parkingCurrentLeftInput").performScrollTo().performTextReplacement(invalid)
             compose.onNodeWithTag("parkingCurrentValidation").assertExists()
-            compose.onNodeWithTag("parkingCurrentReview").assertIsNotEnabled()
+            compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
         }
         compose.onNodeWithTag("parkingCurrentLeftInput").performScrollTo().performTextReplacement("0.01")
-        compose.onNodeWithTag("parkingCurrentReview").assertIsEnabled()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsEnabled()
         compose.onNodeWithTag("parkingCurrentLeftDecrease").assertIsNotEnabled()
         compose.runOnIdle { assertEquals(0, writes) }
     }
@@ -134,10 +136,9 @@ class ParkingCurrentEditorTest {
         val plans = mutableListOf<MotorConfigurationWritePlan>()
         content(config = { config }, apply = { plans += it })
         compose.onNodeWithTag("parkingCurrentLeftInput").performTextReplacement("16")
-        compose.onNodeWithTag("parkingCurrentReview").assertIsNotEnabled()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled()
         compose.onNodeWithTag("parkingCurrentLeftInput").performTextReplacement("14")
-        compose.onNodeWithTag("parkingCurrentReview").performScrollTo().performClick()
-        compose.onNodeWithTag("parkingCurrentConfirm").performScrollTo().performClick()
+        compose.onNodeWithTag("parkingCurrentSave").performScrollTo().performClick()
         compose.runOnIdle {
             assertEquals(listOf(MotorConfigurationChange(left, 425L, 1400L)), plans.single().changes)
             assertEquals(MotorConfigurationWriteMode.PERSISTENT, plans.single().writeMode)
@@ -146,23 +147,42 @@ class ParkingCurrentEditorTest {
         }
     }
 
-    @Test fun editsDisconnectionAndControlTransitionInvalidatePreviewWithoutApplying() {
+    @Test fun liveChangesUpdateWithoutWritingAndConnectionOrControlLossDisablesSave() {
         var writes = 0
         val board = mutableStateOf(idle())
         content(board = { board.value }, apply = { writes++ })
         compose.onNodeWithTag("parkingCurrentLeftIncrease").performClick()
-        review()
+        compose.onNodeWithTag("parkingCurrentChange_${left.id}").assertTextEquals("左：4.25 A → 5.25 A")
         compose.onNodeWithTag("parkingCurrentLeftInput").performScrollTo().performTextReplacement("6.25")
-        compose.onNodeWithTag("parkingCurrentConfirm").assertDoesNotExist()
-        review()
+        compose.onNodeWithTag("parkingCurrentChange_${left.id}").assertTextEquals("左：4.25 A → 6.25 A")
         compose.runOnIdle { board.value = idle().copy(connected = false) }
-        compose.onNodeWithTag("parkingCurrentPreview").assertDoesNotExist()
+        compose.onNodeWithTag("parkingCurrentChanges").assertDoesNotExist()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
         compose.runOnIdle { board.value = idle() }
-        compose.onNodeWithTag("parkingCurrentConfirm").assertDoesNotExist()
-        review()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsEnabled()
+        compose.runOnIdle { assertEquals(0, writes) }
         compose.runOnIdle { board.value = idle().copy(driveEnabled = true) }
-        compose.onNodeWithTag("parkingCurrentPreview").assertDoesNotExist()
-        compose.onNodeWithTag("parkingCurrentReview").assertIsNotEnabled()
+        compose.onNodeWithTag("parkingCurrentChanges").assertDoesNotExist()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
+        compose.runOnIdle { assertEquals(0, writes) }
+    }
+
+    @Test fun missingOrInvalidatedPlanCannotSaveEvenWithAChangedInput() {
+        var writes = 0
+        val baseline = ready()
+        val config = mutableStateOf(baseline)
+        content(config = { config.value }, apply = { writes++ })
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
+        compose.onNodeWithTag("parkingCurrentLeftIncrease").performClick()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsEnabled()
+        listOf(baseline.copy(requiresRead = true), baseline.copy(reading = true),
+            baseline.copy(applying = true),
+            baseline.copy(snapshot = snapshot().copy(writeAllowed = false)),
+            baseline.copy(snapshot = snapshot().copy(values = snapshot().values - maximum))).forEach { invalid ->
+            compose.runOnIdle { config.value = invalid }
+            compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
+            compose.onNodeWithTag("parkingCurrentChanges").assertDoesNotExist()
+        }
         compose.runOnIdle { assertEquals(0, writes) }
     }
 
@@ -171,9 +191,8 @@ class ParkingCurrentEditorTest {
         val config = mutableStateOf(ready().copy(draftValues = mapOf(maximum to "20")))
         content(config = { config.value }, read = { reads++ })
         compose.onNodeWithTag("parkingCurrentLeftIncrease").performClick()
-        review()
+        compose.onNodeWithTag("parkingCurrentChanges").assertExists()
         compose.onNodeWithTag("parkingCurrentRead").performScrollTo().performClick()
-        compose.onNodeWithTag("parkingCurrentPreview").assertDoesNotExist()
         compose.runOnIdle {
             assertEquals(1, reads)
             config.value = config.value.copy(snapshot = snapshot().copy(snapshotId = "parking-read-2",
@@ -182,6 +201,8 @@ class ParkingCurrentEditorTest {
         }
         assertEquals("6", input("Left"))
         assertEquals("7.25", input("Right"))
+        compose.onNodeWithTag("parkingCurrentChanges").assertDoesNotExist()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled()
         compose.runOnIdle { assertEquals(mapOf(maximum to "20"), config.value.draftValues) }
     }
 
@@ -197,13 +218,13 @@ class ParkingCurrentEditorTest {
         compose.onNodeWithTag("parkingCurrentResult_${right.id}").assertTextContains("结果未知，可能已写入", substring = true)
         compose.onNodeWithTag("parkingCurrentResult_${maximum.id}").assertDoesNotExist()
         compose.onNodeWithTag("parkingCurrentResultHint").assertTextEquals("未自动重试。请先重新读取核对实际值。")
-        compose.onNodeWithTag("parkingCurrentReview").assertIsNotEnabled()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsNotEnabled().performClick()
         compose.runOnIdle { assertEquals(0, reads); assertEquals(0, writes) }
         compose.onNodeWithTag("parkingCurrentRead").performScrollTo().assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(1, reads); assertEquals(0, writes) }
     }
 
-    @Test fun compactViewportShowsReadInputsReviewAndConfirmationWithoutScrolling() {
+    @Test fun compactViewportShowsReadInputsLiveChangesAndSaveWithoutScrolling() {
         compose.setContent { MaterialTheme {
             Box(Modifier.requiredSize(360.dp, 440.dp).clipToBounds()) {
                 ParkingCurrentEditor(idle(), ready(), {}, {}, Modifier.fillMaxSize())
@@ -213,14 +234,12 @@ class ParkingCurrentEditorTest {
         compose.onNodeWithTag("parkingCurrentLeftInput").assertIsDisplayed()
         compose.onNodeWithTag("parkingCurrentRightInput").assertIsDisplayed()
         compose.onNodeWithTag("parkingCurrentLeftIncrease").performClick()
-        compose.onNodeWithTag("parkingCurrentReview").assertIsDisplayed().performClick()
-        compose.onNodeWithTag("parkingCurrentConfirm").assertIsDisplayed()
+        compose.onNodeWithTag("parkingCurrentRightIncrease").performClick()
+        compose.onNodeWithTag("parkingCurrentChange_${left.id}").assertIsDisplayed()
+        compose.onNodeWithTag("parkingCurrentChange_${right.id}").assertIsDisplayed()
+        compose.onNodeWithTag("parkingCurrentSave").assertIsDisplayed()
     }
 
     private fun input(side: String): String = compose.onNodeWithTag("parkingCurrent${side}Input")
         .fetchSemanticsNode().config[SemanticsProperties.EditableText].text
-    private fun review() {
-        compose.onNodeWithTag("parkingCurrentReview").performScrollTo().assertIsEnabled().performClick()
-        compose.onNodeWithTag("parkingCurrentPreview").assertExists()
-    }
 }
