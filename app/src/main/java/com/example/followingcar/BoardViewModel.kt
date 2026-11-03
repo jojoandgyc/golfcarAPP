@@ -71,6 +71,8 @@ data class BoardUiState(
     val driveFeedbackAgeAtReceiptMs: Long = Long.MAX_VALUE,
     val parkingSupported: Boolean = false,
     val parkingSettings: ParkingSettings? = null,
+    // Display-only values from this connection; never authorize a mode from this snapshot.
+    val lastReadParkingSettings: ParkingSettings? = null,
     val parkingUpdating: Boolean = false,
     val parkingStatus: String = "启用手动控制并停车后可设置驻车",
     val followCamera: FollowCamera = FollowCamera.CONFIG,
@@ -688,6 +690,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update {
             it.copy(host = if (input.remoteMode) it.host else host, username = username, busy = true, error = null, result = null,
                 followConfiguration = null, followConfigurationError = null, status = "正在连接…",
+                lastReadParkingSettings = null,
                 videoServiceState = VideoServiceState.UNKNOWN, videoServiceError = null)
         }
         operation = viewModelScope.launch {
@@ -1209,6 +1212,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 channel = activeChannel
                 driveChannel = activeChannel
                 driveDiagnostic = activeChannel.diagnosticContext
+                mutableState.update { it.copy(lastReadParkingSettings = activeChannel.ready.parking?.copy(enabled = false)) }
                 Diagnostics.event("drive.ready", driveDiagnostic, fields = mapOf("dryRun" to activeChannel.ready.dryRun))
                 while (stopRequest == null) {
                     // READY may have spent time in the network. Confirm a current stopped

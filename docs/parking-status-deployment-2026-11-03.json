@@ -1,0 +1,75 @@
+{
+  "recordedAtUtc": "2026-11-03T14:57:40.735622+00:00",
+  "app": {
+    "versionCode": 20,
+    "versionName": "1.8.9-parking-status",
+    "apkSha256": "02a565793f1c8c131c5267e46c91c0226f2198d867d15b8a5fde4017d76b0e06",
+    "phoneInstallation": {
+      "status": "installed",
+      "installedAtUtc": "2026-11-03T14:58:13.637276+00:00",
+      "versionCode": 20,
+      "versionName": "1.8.9-parking-status",
+      "installedApkSha256": "02a565793f1c8c131c5267e46c91c0226f2198d867d15b8a5fde4017d76b0e06",
+      "connectionPreferencesPreserved": true,
+      "preInstallControlCheck": {
+        "activeControls": [],
+        "serialIdle": true
+      },
+      "appLaunchedByAgent": false,
+      "hardwareCommandsSent": false
+    }
+  },
+  "sourceBaseCommit": "a13ede5",
+  "boardBridgeUnchangedSha256": "71db3daaae6c666120a02a9ec0377ba24170a68bf67ef149a9261bdebb43c021",
+  "evidence": {
+    "boardConfigurationReadings": [
+      {
+        "runId": "14a1252215fd619afcd60d8df628f59a",
+        "leftParkingCurrentAmps": 0.0,
+        "rightParkingCurrentAmps": 0.0,
+        "maximumOutputCurrentAmps": 15.0
+      },
+      {
+        "runId": "1d9ca28d1935f5ffff95c4961f040ceb",
+        "leftParkingCurrentAmps": 0.0,
+        "rightParkingCurrentAmps": 0.0,
+        "maximumOutputCurrentAmps": 15.0
+      },
+      {
+        "runId": "e0aaf1f34d43e175d71668c23665c140",
+        "leftParkingCurrentAmps": 0.0,
+        "rightParkingCurrentAmps": 0.0,
+        "maximumOutputCurrentAmps": 15.0
+      }
+    ],
+    "explanation": "Zero saved parking currents block enabling even when actual wheel feedback confirms standstill. The inspected phone was subsequently in a user-requested emergency-stop state."
+  },
+  "changes": [
+    "Specific disabled reason next to the parking switch",
+    "Keep display-only current readings after session end, labeled historical; clear on new SSH connection",
+    "Show unverified or expired RPM without presenting it as fresh feedback",
+    "Include saved parking currents and eligibility in App READY diagnostics"
+  ],
+  "validation": {
+    "jvm": {
+      "tests": 258,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorUi": {
+      "tests": 16,
+      "passed": 16,
+      "failures": 0
+    },
+    "hardwareTestingPerformed": false
+  },
+  "constraints": {
+    "parkingEnableRulesUnchanged": true,
+    "motorConfigurationWritten": false,
+    "boardScriptModified": false,
+    "userProvidedCurrentText": "5A",
+    "providedCurrentApplied": false,
+    "historicalSettingsCannotAuthorizeControl": true
+  }
+}

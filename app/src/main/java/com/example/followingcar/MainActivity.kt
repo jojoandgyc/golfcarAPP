@@ -708,16 +708,44 @@ internal fun ParkingControls(
     // compared against the previous tick and briefly become an apparent clock reversal.
     val observedNow = nowNanos ?: maxOf(clockTick, System.nanoTime())
     val settings = state.parkingSettings
+    // Historical readbacks are display-only. In particular, never restore their enabled bit.
+    val displayedSettings = settings ?: state.lastReadParkingSettings
+    val historicalSettings = settings == null && displayedSettings != null
     val enabled = settings?.enabled == true
     val canSwitch = state.canEditParkingAt(observedNow) && (enabled || settings?.canEnable == true)
-    val feedbackKnown = state.driveFeedbackVerified && state.driveFeedbackLeftRpm != null &&
-        state.driveFeedbackRightRpm != null
+    val feedbackKnown = state.driveFeedbackLeftRpm != null && state.driveFeedbackRightRpm != null
     val feedbackFresh = state.hasFreshDriveFeedback(observedNow)
     val feedbackStopped = feedbackKnown && state.driveFeedbackLeftRpm == 0 &&
         state.driveFeedbackRightRpm == 0
+    val availability = when {
+        !state.connected -> "未连接小车"
+        state.driveStarting -> "手动控制正在启动"
+        state.driveStopping -> "手动控制正在停用"
+        !state.driveEnabled -> "未启用手动控制"
+        !state.parkingSupported -> "板端驻车安全接口不可用"
+        settings == null -> "尚未读取驻车配置"
+        state.parkingUpdating -> "正在切换驻车"
+        state.followBlocksControl -> "自动跟随占用或状态待确认"
+        state.motorActionUnconfirmed -> "电机状态待核对"
+        state.busy -> "其他操作正在进行"
+        !enabled && !settings.canEnable -> parkingCurrentIssue(settings)
+        state.driveLeft != 0 || state.driveRight != 0 -> "目标转速尚未回零"
+        !feedbackKnown -> "等待停车确认"
+        !state.driveFeedbackVerified -> "轮速反馈未验证，等待停车确认"
+        !feedbackFresh -> "轮速反馈已过期"
+        !feedbackStopped || !state.driveConfirmedStopped -> "等待停车确认"
+        !canSwitch -> "暂不能切换驻车"
+        enabled -> "已开启，可关闭"
+        else -> "可开启电子驻车"
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text("电子驻车", style = MaterialTheme.typography.titleMedium)
+            Column(Modifier.weight(1f).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("电子驻车", style = MaterialTheme.typography.titleMedium)
+                Text(availability, style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("parkingAvailability"),
+                    color = if (canSwitch) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             Switch(
                 checked = enabled,
                 onCheckedChange = { next ->
@@ -731,23 +759,33 @@ internal fun ParkingControls(
             )
         }
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("已读取的驻车电流上限", style = MaterialTheme.typography.bodySmall)
+            Text(when {
+                historicalSettings -> "上次读取（非实时）"
+                settings == null -> "尚未读取驻车电流"
+                else -> "已读取的驻车电流上限"
+            },
+                style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingCurrentSource"))
             Row(Modifier.fillMaxWidth().testTag("parkingCurrent"), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("左：${parkingAmps(settings?.leftCurrentAmps)} A", fontWeight = FontWeight.Bold,
+                Text("左：${parkingAmps(displayedSettings?.leftCurrentAmps)} A", fontWeight = FontWeight.Bold,
                     modifier = Modifier.testTag("parkingLeftCurrent"))
-                Text("右：${parkingAmps(settings?.rightCurrentAmps)} A", fontWeight = FontWeight.Bold,
+                Text("右：${parkingAmps(displayedSettings?.rightCurrentAmps)} A", fontWeight = FontWeight.Bold,
                     modifier = Modifier.testTag("parkingRightCurrent"))
             }
-            Text("最大输出电流：${parkingAmps(settings?.maxCurrentAmps)} A",
+            Text("最大输出电流：${parkingAmps(displayedSettings?.maxCurrentAmps)} A",
                 style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingMaxCurrent"))
         }
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(if (state.driveLeft == 0 && state.driveRight == 0 && !feedbackFresh)
-                "目标已回零 · 等待新鲜停车反馈"
-                else "目标转速：左 ${state.driveLeft} / 右 ${state.driveRight} RPM",
+            Text(when {
+                state.driveStarting -> "手动控制正在启动，等待轮速确认"
+                state.driveStopping -> "正在停用手动控制"
+                !state.driveEnabled -> "手动控制未启用，无实时转速目标"
+                state.driveLeft == 0 && state.driveRight == 0 && !feedbackFresh -> "目标已回零 · 等待新鲜停车反馈"
+                else -> "目标转速：左 ${state.driveLeft} / 右 ${state.driveRight} RPM"
+            },
                 style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingTargetSpeeds"))
             Text(when {
                 !feedbackKnown -> "最近轮速反馈：尚无可信读数"
+                !state.driveFeedbackVerified -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 未验证或已过期"
                 !feedbackFresh -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 已过期"
                 !feedbackStopped -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 尚未停稳"
                 !state.driveConfirmedStopped -> "最近轮速反馈已回零，正在复核停车"
@@ -755,10 +793,14 @@ internal fun ParkingControls(
             }, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingFeedback"))
         }
         Text(when {
+            historicalSettings && displayedSettings != null -> "上次左 ${parkingAmps(displayedSettings.leftCurrentAmps)} A、右 ${parkingAmps(displayedSettings.rightCurrentAmps)} A、上限 ${parkingAmps(displayedSettings.maxCurrentAmps)} A；非实时。" +
+                if (displayedSettings.canEnable) "启用手动控制后重新读取核对。" else "按上次读值，${parkingCurrentIssue(displayedSettings)}。请到电机页读取并核对。"
+            settings != null && !settings.canEnable ->
+                (if (enabled) "可关闭驻车；再次开启前需核对电流。" else parkingCurrentIssue(settings) + "。") +
+                    "左 ${parkingAmps(settings.leftCurrentAmps)} A、右 ${parkingAmps(settings.rightCurrentAmps)} A、上限 ${parkingAmps(settings.maxCurrentAmps)} A。先停用手动控制，再到电机页读取并调整。"
             !state.driveEnabled -> "启用手动控制后读取驻车状态。"
             !state.parkingSupported -> "板端驻车安全接口不可用，暂不能切换。"
             settings == null -> "尚未读取电机驻车配置，暂不能切换。"
-            !settings.canEnable -> "左右驻车电流须大于 0 且不超过最大输出电流。先停用手动控制，再到电机页读取并调整。"
             state.parkingUpdating -> "正在确认驻车切换，请稍候；需要停止时可使用下方急停。"
             !state.canEditParkingAt(observedNow) -> "请松手停车，等待新鲜的实测停车确认及当前操作结束。"
             else -> "沿用当前电机配置，开关不修改电流参数。调整电流请先停用手动控制，再到电机页操作。"
@@ -770,6 +812,15 @@ internal fun ParkingControls(
 
 private fun parkingAmps(value: Double?): String = when {
     value == null -> "—"
-    !value.isFinite() || value !in 0.0..60.0 -> "无效"
+    !value.isFinite() || value < 0.0 -> "无效"
+    value >= 1_000_000 -> String.format(Locale.ROOT, "%.2e", value)
     else -> String.format(Locale.ROOT, "%.2f", value).trimEnd('0').trimEnd('.')
+}
+
+private fun parkingCurrentIssue(settings: ParkingSettings): String = when {
+    settings.leftCurrentAmps == 0.0 && settings.rightCurrentAmps == 0.0 -> "左右驻车电流为 0，无法开启"
+    settings.leftCurrentAmps == 0.0 -> "左侧驻车电流为 0，无法开启"
+    settings.rightCurrentAmps == 0.0 -> "右侧驻车电流为 0，无法开启"
+    settings.maxCurrentAmps == 0.0 -> "最大输出电流为 0，无法开启"
+    else -> "驻车电流超出允许上限，无法开启"
 }

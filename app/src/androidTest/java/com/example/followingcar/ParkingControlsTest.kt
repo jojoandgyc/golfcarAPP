@@ -42,6 +42,8 @@ class ParkingControlsTest {
         compose.onNodeWithTag("parkingRightCurrent").assertTextEquals("右：— A")
         compose.onNodeWithTag("parkingMaxCurrent").assertTextEquals("最大输出电流：— A")
         compose.onNodeWithTag("parkingFeedback").assertTextEquals("最近轮速反馈：尚无可信读数")
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("未连接小车")
+        compose.onNodeWithTag("parkingTargetSpeeds").assertTextEquals("手动控制未启用，无实时转速目标")
 
         compose.runOnIdle { state.value = ready().copy(parkingSupported = false) }
         assertControlsDisabled()
@@ -129,6 +131,8 @@ class ParkingControlsTest {
         val requests = mutableListOf<Boolean>()
         val initial = currents(enabled = true).copy(leftCurrentAmps = 0.0)
         compose.setContent { MaterialTheme { ParkingControls(ready(initial), TEST_NOW_NANOS) { requests += it } } }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("已开启，可关闭")
+        compose.onNodeWithTag("parkingHint").assertTextContains("可关闭驻车；再次开启前需核对电流", substring = true)
         compose.onNodeWithTag("parkingSwitch").assertIsOn().assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(listOf(false), requests) }
         assertNoCurrentEditors()
@@ -164,6 +168,7 @@ class ParkingControlsTest {
         compose.runOnIdle { now.value += 501_000_000L }
         compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
         compose.onNodeWithTag("parkingFeedback").assertTextContains("已过期", substring = true)
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("轮速反馈已过期")
         compose.onNodeWithTag("parkingTargetSpeeds").assertTextEquals("目标已回零 · 等待新鲜停车反馈")
         compose.runOnIdle {
             now.value = TEST_NOW_NANOS + 60_000_000L
@@ -175,6 +180,70 @@ class ParkingControlsTest {
             state.value = ready().copy(driveLastFeedbackNanos = now.value)
         }
         compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
+    }
+
+    @Test fun zeroCurrentReasonNamesAffectedSideBesideSwitchAndShowsRealValues() {
+        var requests = 0
+        val state = mutableStateOf(ready(ParkingSettings(maxCurrentAmps = 15.0)))
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { requests++ } } }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("左右驻车电流为 0，无法开启")
+        compose.onNodeWithTag("parkingHint").assertTextContains("左 0 A、右 0 A、上限 15 A", substring = true)
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.runOnIdle {
+            state.value = ready(ParkingSettings(leftCurrentAmps = 0.0, rightCurrentAmps = 4.25, maxCurrentAmps = 15.0))
+        }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("左侧驻车电流为 0，无法开启")
+        compose.onNodeWithTag("parkingHint").assertTextContains("左 0 A、右 4.25 A、上限 15 A", substring = true)
+        compose.runOnIdle {
+            state.value = ready(ParkingSettings(leftCurrentAmps = 4.25, rightCurrentAmps = 0.0, maxCurrentAmps = 15.0))
+        }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("右侧驻车电流为 0，无法开启")
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.runOnIdle { assertEquals(0, requests) }
+    }
+
+    @Test fun historicalCurrentSnapshotNeverRestoresSwitchStateOrAuthorizesControl() {
+        var requests = 0
+        val history = currents(enabled = true)
+        val state = mutableStateOf(ready().copy(driveEnabled = false, parkingSettings = null,
+            lastReadParkingSettings = history, driveFeedbackVerified = false))
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { requests++ } } }
+        compose.onNodeWithTag("parkingCurrentSource").assertTextEquals("上次读取（非实时）")
+        compose.onNodeWithTag("parkingLeftCurrent").assertTextEquals("左：4.25 A")
+        compose.onNodeWithTag("parkingRightCurrent").assertTextEquals("右：5.5 A")
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("未启用手动控制")
+        compose.onNodeWithTag("parkingTargetSpeeds").assertTextEquals("手动控制未启用，无实时转速目标")
+        compose.onNodeWithTag("parkingFeedback").assertTextEquals("最近轮速反馈：左 0 / 右 0 RPM · 未验证或已过期")
+        compose.onNodeWithTag("parkingSwitch").assertIsOff().assertIsNotEnabled().performClick()
+        compose.runOnIdle { state.value = state.value.copy(driveEnabled = true) }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("尚未读取驻车配置")
+        compose.onNodeWithTag("parkingSwitch").assertIsOff().assertIsNotEnabled().performClick()
+        compose.runOnIdle {
+            assertEquals(0, requests)
+            state.value = ready(currents().copy(leftCurrentAmps = 3.5)).copy(lastReadParkingSettings = history)
+        }
+        compose.onNodeWithTag("parkingCurrentSource").assertTextEquals("已读取的驻车电流上限")
+        compose.onNodeWithTag("parkingLeftCurrent").assertTextEquals("左：3.5 A")
+        compose.onNodeWithTag("parkingSwitch").assertIsOff().assertIsEnabled()
+    }
+
+    @Test fun availabilityPrioritizesConnectionLifecycleAndPendingOperationBeforeCurrentIssue() {
+        val zero = ready(ParkingSettings(maxCurrentAmps = 15.0))
+        val state = mutableStateOf(zero)
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) {} } }
+        val cases = listOf(
+            zero.copy(connected = false, driveStarting = true) to "未连接小车",
+            zero.copy(driveStarting = true) to "手动控制正在启动",
+            zero.copy(driveStopping = true) to "手动控制正在停用",
+            zero.copy(driveEnabled = false) to "未启用手动控制",
+            zero.copy(parkingUpdating = true) to "正在切换驻车",
+            zero.copy(busy = true) to "其他操作正在进行",
+        )
+        for ((value, label) in cases) {
+            compose.runOnIdle { state.value = value }
+            compose.onNodeWithTag("parkingAvailability").assertTextEquals(label)
+            compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled()
+        }
     }
 
     private fun assertNoCurrentEditors() {
