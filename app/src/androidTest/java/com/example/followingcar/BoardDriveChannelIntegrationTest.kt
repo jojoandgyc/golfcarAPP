@@ -78,8 +78,8 @@ class BoardDriveChannelIntegrationTest {
             withTimeout(30_000) {
                 val control = client.openDriveChannel(dryRun = true).also { drive = it }
                 control.exchange(30, -30)
-                delay(1200)
-                assertFalse("Watchdog must close the control channel", control.isOpen)
+                delay((control.ready.networkGraceMs ?: control.ready.watchdogMs).toLong() + 500L)
+                assertFalse("The negotiated hard deadline must close the control channel", control.isOpen)
                 try {
                     control.exchange(30, -30)
                     fail("Expired control session accepted motion")

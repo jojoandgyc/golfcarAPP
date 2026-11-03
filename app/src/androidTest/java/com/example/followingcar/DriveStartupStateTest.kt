@@ -19,6 +19,8 @@ import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -140,6 +142,68 @@ class DriveStartupStateTest {
         assertTrue(events.any { it.optString("event") == "ssh.transport_abort" })
     }
 
+    @Test fun graceSessionIntentionalStopsInterruptPendingAckWithoutNetworkFailure() = runBlocking {
+        for (source in listOf(ControlStopSource.EMERGENCY_STOP, ControlStopSource.APP_PAUSED,
+            ControlStopSource.WINDOW_FOCUS_LOST, ControlStopSource.CONTROL_SURFACE_HIDDEN,
+            ControlStopSource.PAGE_CHANGED, ControlStopSource.USER_STOP, ControlStopSource.DISCONNECT)) {
+            val fixture = startFixture(networkGrace = true)
+            withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+            withContext(Dispatchers.Main) {
+                fixture.vm.disableDrive("intentional test stop", emergency = source == ControlStopSource.EMERGENCY_STOP,
+                    source = source)
+            }
+            // The synthetic board never releases this ACK. Completion must not wait for 2.5 s.
+            withTimeout(1_000) {
+                (field(fixture.vm, "driveJob") as Job).join()
+                while (!fixture.bridge.isDisconnected) delay(5)
+            }
+            assertTrue(fixture.bridge.isDisconnected)
+            assertFalse(fixture.vm.state.value.manualActive)
+            assertFalse(fixture.vm.state.value.driveConfirmedStopped)
+            assertNull(fixture.vm.state.value.driveFirstFailure)
+            assertEquals(listOf("stop"), fixture.bridge.requests.map { it.getString("cmd") })
+            assertFalse(fixture.updates.any { it.driveEnabled || it.canConfigureParking })
+        }
+        assertTrue("Intentional closures must not manufacture a first network fault", engine.snapshot().failures.isEmpty())
+        val events = engine.snapshot().events.map(::JSONObject)
+        assertFalse(events.any { it.optString("event") == "drive.stop_acknowledged" })
+        assertFalse(events.any { it.optString("event") == "drive.ack_timeout" })
+    }
+
+    @Test fun graceEmergencyInterruptsBlockedWriteAndInvalidatesTransport() = runBlocking {
+        val fixture = startFixture(networkGrace = true, blockWrite = true)
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            fixture.vm.disableDrive("blocked write emergency", emergency = true)
+        }
+        withTimeout(1_000) { (field(fixture.vm, "driveJob") as Job).join() }
+        assertTrue(fixture.socket.isClosed)
+        assertTrue(fixture.bridge.isDisconnected)
+        assertFalse(fixture.vm.state.value.connected)
+        assertFalse(fixture.vm.state.value.driveConfirmedStopped)
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertTrue(engine.snapshot().failures.isEmpty())
+        assertEquals(listOf(true), fixture.videoActions.toList())
+    }
+
+    @Test fun previousNeutralAckDoesNotConfirmAnInterruptedGraceSessionStop() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2)
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            assertTrue(fixture.vm.state.value.driveEnabled)
+            assertTrue(fixture.vm.state.value.driveConfirmedStopped)
+            fixture.vm.onControlSurfaceHidden("test focus loss", ControlStopSource.WINDOW_FOCUS_LOST)
+        }
+        withTimeout(1_000) { (field(fixture.vm, "driveJob") as Job).join() }
+        assertFalse(fixture.vm.state.value.driveConfirmedStopped)
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertEquals(listOf("stop", "stop"), fixture.bridge.requests.map { it.getString("cmd") })
+        val events = engine.snapshot().events.map(::JSONObject)
+        assertTrue(events.any { it.optString("event") == "drive.initial_stop_acknowledged" })
+        assertFalse(events.any { it.optString("event") == "drive.stop_acknowledged" })
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
     private suspend fun stopWhileInitialAckPending(source: ControlStopSource) {
         val fixture = startFixture()
         withTimeout(3_000) { fixture.bridge.firstRequest.await() }
@@ -162,13 +226,14 @@ class DriveStartupStateTest {
         assertTrue(events.any { it.optString("event") == "drive.stop_acknowledged" })
     }
 
-    private suspend fun startFixture(): Fixture {
+    private suspend fun startFixture(networkGrace: Boolean = false, blockWrite: Boolean = false,
+        holdSequence: Long = 1): Fixture {
         val vm = withContext(Dispatchers.Main) {
             val store = ViewModelStore().also(stores::add)
             ViewModelProvider(store, ViewModelProvider.AndroidViewModelFactory(application))[BoardViewModel::class.java]
         }
         withTimeout(3_000) { vm.state.first { !it.remoteProfileLoading } }
-        val bridge = DelayedInitialAckChannel()
+        val bridge = DelayedInitialAckChannel(networkGrace, blockWrite, holdSequence)
         val videoActions = CopyOnWriteArrayList<Boolean>()
         val queued = ConcurrentLinkedQueue<ChannelExec>().apply {
             add(VideoReplyChannel(true, videoActions)); add(bridge); add(VideoReplyChannel(false, videoActions))
@@ -242,10 +307,12 @@ class DriveStartupStateTest {
         override fun read(): Int = bytes.poll() ?: -1
     }
 
-    private class DelayedInitialAckChannel : ChannelExec() {
+    private class DelayedInitialAckChannel(private val networkGrace: Boolean,
+        private val blockWrite: Boolean, private val holdSequence: Long) : ChannelExec() {
         private val replies = QueuedInput()
         private val buffer = ByteArrayOutputStream()
         private val released = AtomicBoolean()
+        private val writeReleased = CountDownLatch(1)
         private var expectedSequence = 1L
         private var token = tokenFor(1)
         @Volatile private var connected = false
@@ -253,15 +320,19 @@ class DriveStartupStateTest {
         @Volatile private var pending: JSONObject? = null
         val requests = CopyOnWriteArrayList<JSONObject>()
         val firstRequest = CompletableDeferred<JSONObject>()
+        val heldRequest = CompletableDeferred<JSONObject>()
+        val isDisconnected: Boolean get() = disconnected
         override fun setCommand(command: String) {
             check(command == "python3 -u /home/topeet/lianzhan/scripts/app_joystick_bridge.py --dry-run")
         }
         override fun connect(timeout: Int) {
             check(timeout == 5_000)
             connected = true
-            replies.append(JSONObject().put("type", "ready").put("token", token)
+            val ready = JSONObject().put("type", "ready").put("token", token)
                 .put("dryRun", true).put("port", "synthetic-only").put("watchdogMs", 600).put("maxRpm", 60)
-                .put("parkingSupported", true).put("parkingEnabled", false).put("parkingCurrent", 5))
+                .put("parkingSupported", true).put("parkingEnabled", false).put("parkingCurrent", 5)
+            if (networkGrace) ready.put("networkGraceMs", 5_000)
+            replies.append(ready)
         }
         override fun getInputStream(): InputStream = replies
         override fun getOutputStream(): OutputStream = object : OutputStream() {
@@ -273,26 +344,37 @@ class DriveStartupStateTest {
                 check(request.getString("token") == token)
                 check(request.getInt("left") == 0 && request.getInt("right") == 0)
                 requests.add(request)
-                if (request.getLong("seq") == 1L) {
+                if (request.getLong("seq") == holdSequence) {
                     pending = request
-                    firstRequest.complete(request)
-                } else acknowledge(request)
+                    if (request.getLong("seq") == 1L) firstRequest.complete(request)
+                    heldRequest.complete(request)
+                    if (blockWrite) {
+                        check(writeReleased.await(4, TimeUnit.SECONDS)) { "Synthetic write was not interrupted" }
+                        throw IOException("Synthetic channel closed during write")
+                    }
+                } else {
+                    if (request.getLong("seq") == 1L) firstRequest.complete(request)
+                    acknowledge(request)
+                }
             }
         }
         fun releaseInitialAckIfPending() {
             val request = pending ?: return
+            if (disconnected) return
             if (released.compareAndSet(false, true)) acknowledge(request)
         }
         private fun acknowledge(request: JSONObject) {
             token = tokenFor(request.getLong("seq") + 1)
-            replies.append(JSONObject().put("type", "ack").put("seq", request.getLong("seq"))
+            val ack = JSONObject().put("type", "ack").put("seq", request.getLong("seq"))
                 .put("token", token).put("left", 0).put("right", 0).put("stopped", true)
-                .put("parkingEnabled", false).put("parkingCurrent", 5))
+                .put("parkingEnabled", false).put("parkingCurrent", 5)
+            if (networkGrace) ack.put("recoveryRequired", false)
+            replies.append(ack)
         }
         override fun isConnected(): Boolean = connected && !disconnected
         override fun isClosed(): Boolean = disconnected
         override fun isEOF(): Boolean = disconnected
-        override fun disconnect() { disconnected = true }
+        override fun disconnect() { disconnected = true; writeReleased.countDown() }
         companion object { private fun tokenFor(value: Long) = value.toString(16).padStart(32, '0') }
     }
 

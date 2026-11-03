@@ -78,6 +78,67 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(ready["parkingSupported"])
         self.assertFalse(ready["parkingEnabled"])
         self.assertEqual(ready["parkingCurrent"], 5)
+        self.assertEqual(ready["watchdogMs"], 600)
+        self.assertEqual(ready["networkGraceMs"], 5000)
+
+    def test_network_pause_preserves_settings_and_ir_until_neutral(self):
+        for neutral in ("stop", "drive"):
+            with self.subTest(neutral=neutral):
+                client = FakeClient()
+                motors = Motors(client)
+                session = ProtocolSession(motors, port="fake", dry_run=False)
+                session.ready()
+                session.accept(parking_request(session, current=6))
+                motors.drive(30, -30)
+                motors.ir_latched_directions.add("forward")
+                client.calls.clear()
+                session.pause_for_network()
+                self.assertEqual(client.calls, [("left", 0), ("right", 0),
+                    ("left", "stop", 1), ("right", "stop", 1)])
+                self.assertTrue(motors.parking_enabled)
+                self.assertEqual(motors.parking_current, 6)
+                self.assertEqual(set(client.registers.values()), {6})
+                self.assertEqual(motors.ir_latched_directions, {"forward"})
+                self.assertEqual(motors.requested_target, (30, -30))
+                client.calls.clear()
+                for _ in range(3):
+                    ack, closing = session.accept({"seq": session.next_seq, "token": session.token,
+                        "cmd": "drive", "left": 50, "right": -50})
+                    self.assertFalse(closing)
+                    self.assertTrue(ack["recoveryRequired"])
+                    self.assertTrue(ack["stopped"])
+                    self.assertEqual((ack["left"], ack["right"]), (0, 0))
+                self.assertEqual(client.calls, [])
+                self.assertEqual(motors.ir_latched_directions, {"forward"})
+                ack, _ = session.accept({"seq": session.next_seq, "token": session.token,
+                    "cmd": neutral, "left": 0, "right": 0})
+                self.assertTrue(ack["recoveryRequired"])
+                self.assertFalse(session.recovery_required)
+                self.assertEqual(motors.requested_target, (0, 0))
+                self.assertEqual(motors.ir_latched_directions, set())
+                self.assertEqual(client.calls, [("left", 0), ("right", 0),
+                    ("left", "stop", 0), ("right", "stop", 0)])
+                self.assertTrue(motors.parking_enabled)
+                self.assertEqual(motors.parking_current, 6)
+                self.assertEqual(set(client.registers.values()), {6})
+                client.calls.clear()
+                ack, _ = session.accept({"seq": session.next_seq, "token": session.token,
+                    "cmd": "drive", "left": 20, "right": -20})
+                self.assertFalse(ack["recoveryRequired"])
+                self.assertFalse(ack["stopped"])
+                self.assertEqual(client.calls, [("left", 20), ("right", -20)])
+
+    def test_recovery_still_validates_sequence_and_token_before_neutral(self):
+        session = ProtocolSession(Motors(), port="fake", dry_run=True)
+        session.ready()
+        session.pause_for_network()
+        for changes in ({"seq": 2}, {"token": "0" * 32}, {"left": True}):
+            with self.subTest(changes=changes):
+                request = {"seq": 1, "token": session.token, "cmd": "stop", "left": 0, "right": 0}
+                with self.assertRaises(SessionError):
+                    session.accept(dict(request, **changes))
+                self.assertTrue(session.recovery_required)
+                self.assertEqual(session.next_seq, 1)
 
     def test_parking_engages_normal_stop_and_release_keeps_parking(self):
         client = FakeClient()
@@ -386,11 +447,44 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(ack["type"], "ack")
         self.assertFalse(ack["stopped"])
         started = time.monotonic()
+        time.sleep(0.8)
+        self.assertIsNone(process.poll(), "motion lease expiry must retain the stopped session")
         error = json.loads(process.stdout.readline())
-        self.assertIn("watchdog", error["error"])
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIn("network grace expired", error["error"])
+        self.assertGreaterEqual(time.monotonic() - started, 4.5)
+        self.assertLess(time.monotonic() - started, 6.5)
         self.finish(process)
         self.assertNotEqual(process.returncode, 0)
+        rows = [json.loads(line) for path in Path(os.environ["APP_DRIVE_DIAGNOSTIC_TEST_DIR"]).glob("*.jsonl")
+                for line in path.read_text(encoding="utf-8").splitlines()]
+        rows = [row for row in rows if row["runId"] == ready["runId"]]
+        pause = [row for row in rows if row["event"] == "drive.network_paused"]
+        self.assertEqual(len(pause), 1)
+        self.assertAlmostEqual(pause[0]["sessionDeadlineMonotonicMs"] -
+                               pause[0]["leaseExpiredMonotonicMs"], 4400, delta=1)
+        self.assertLess(pause[0]["stoppedMonotonicMs"] - pause[0]["leaseExpiredMonotonicMs"], 500)
+        self.assertEqual(pause[0]["lastValidRequest"]["seq"], 1)
+        failure = next(row for row in rows if row["event"] == "drive.failure")
+        self.assertEqual(failure["stopSource"], "network_grace_expired")
+        self.assertNotIn(ready["token"], json.dumps(rows))
+        self.assertNotIn(ack["token"], json.dumps(rows))
+
+    def test_dry_run_network_pause_suppresses_held_target_then_recovers(self):
+        process, ready = self.start()
+        reply = self.exchange(process, ready)
+        time.sleep(0.8)
+        self.assertIsNone(process.poll())
+        suppressed = self.exchange(process, reply, seq=2)
+        self.assertTrue(suppressed["recoveryRequired"])
+        self.assertTrue(suppressed["stopped"])
+        neutral = self.exchange(process, suppressed, seq=3, cmd="stop", left=0, right=0)
+        self.assertTrue(neutral["recoveryRequired"])
+        moving = self.exchange(process, neutral, seq=4)
+        self.assertFalse(moving["recoveryRequired"])
+        self.assertFalse(moving["stopped"])
+        self.exchange(process, moving, seq=5, cmd="close", left=0, right=0)
+        self.finish(process)
+        self.assertEqual(process.returncode, 0)
 
     def test_eof_is_terminal(self):
         process, ready = self.start()
@@ -509,6 +603,189 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "error"])
         self.assertIn("Parking transaction exceeded timeout", messages[-1]["error"])
+
+    def run_scripted_grace(self, actions, *, fail_ack=None, parking_seconds=0, fail_soft_stop=False):
+        """Drive the real session with fake serial, a virtual clock and scripted input."""
+        clock = [0.0]
+        messages, deadlines, events = [], [], []
+        client = FakeClient()
+        remaining = iter(actions)
+
+        class TimedMotors(Motors):
+            polls = 0
+
+            def set_parking(self, enabled, current):
+                super().set_parking(enabled, current)
+                clock[0] += parking_seconds
+
+            def check_infrared(self):
+                self.polls += 1
+                return super().check_infrared()
+
+        motors = TimedMotors(client)
+
+        class Diagnostic:
+            def event(self, name, **fields):
+                events.append(dict(event=name, clock=clock[0], **fields))
+
+            def failure(self, name, error, **fields):
+                self.event(name, error=str(error), **fields)
+
+            def close(self, **_kwargs):
+                pass
+
+        class Output:
+            def __init__(self, _fd):
+                pass
+
+            def send(self, message):
+                if fail_ack is not None and message.get("seq") == fail_ack:
+                    raise BlockingIOError("SSH output blocked")
+                messages.append(message)
+
+        class Input:
+            def __init__(self, _fd):
+                self.seq = 0
+
+            def line(self, deadline, _stopped):
+                deadlines.append(deadline)
+                action = next(remaining)
+                if action == "deadline":
+                    clock[0] = deadline
+                    self.poll()
+                    if fail_soft_stop:
+                        client.fail_left = True
+                    raise bridge.MotionLeaseExpired("Control watchdog expired")
+                clock[0], command, *targets = action
+                self.poll()
+                if isinstance(command, Exception):
+                    raise command
+                if command == "malformed":
+                    return b"not-json"
+                self.seq += 1
+                left, right = targets or ((30, -30) if command == "drive" else (0, 0))
+                request = {"seq": self.seq, "token": messages[-1]["token"],
+                           "cmd": command, "left": left, "right": right}
+                if command == "parking":
+                    request.update(parkingEnabled=True, parkingCurrent=6)
+                return json.dumps(request).encode()
+
+        with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input), \
+                patch.object(bridge.time, "monotonic", lambda: clock[0]):
+            result = bridge.run_session(motors, "fake", True, threading.Event(), diagnostic=Diagnostic())
+        return result, messages, deadlines, events, clock[0], motors, client
+
+    def test_suppressed_held_targets_do_not_extend_grace_or_repeat_motor_writes(self):
+        result, messages, deadlines, events, elapsed, motors, client = self.run_scripted_grace([
+            (0.1, "drive"), "deadline", (1.2, "drive"), (4.9, "drive"), "deadline"])
+        self.assertEqual(result, 1)
+        self.assertEqual(deadlines, [0.6, 0.7, 5.1, 5.1, 5.1])
+        self.assertEqual(elapsed, 5.1)
+        acks = [message for message in messages if message["type"] == "ack"]
+        self.assertEqual([ack["recoveryRequired"] for ack in acks], [False, True, True])
+        self.assertEqual([ack["stopped"] for ack in acks], [False, True, True])
+        # Initial/terminal cleanup are unchanged; between them there is only the
+        # original movement and one emergency stop, despite repeated held targets.
+        self.assertEqual(client.calls[8:-8], [("left", 30), ("right", -30),
+            ("left", 0), ("right", 0), ("left", "stop", 1), ("right", "stop", 1)])
+        paused = [row for row in events if row["event"] == "drive.network_paused"]
+        self.assertEqual(len(paused), 1)
+        self.assertEqual(paused[0]["clock"], 0.7)
+        self.assertEqual(paused[0]["lastAckSeq"], 1)
+        recovery = [row for row in events if row["event"] == "drive.network_recovery_ack"]
+        self.assertEqual([row["neutralAccepted"] for row in recovery], [False, False])
+        self.assertTrue(all(row["sessionDeadlineMonotonicMs"] == 5100 for row in recovery))
+        self.assertEqual(next(row for row in events if row["event"] == "drive.failure")["stopSource"],
+                         "network_grace_expired")
+        self.assertGreaterEqual(motors.polls, 5, "IR polling remains active during grace")
+
+    def test_parking_during_recovery_does_not_release_latch_or_extend_grace(self):
+        result, messages, deadlines, events, elapsed, _motors, _client = self.run_scripted_grace([
+            (0.1, "drive"), "deadline", (2.0, "parking"), "deadline"], parking_seconds=0.8)
+        self.assertEqual(result, 1)
+        self.assertEqual(deadlines, [0.6, 0.7, 5.1, 5.1])
+        self.assertEqual(elapsed, 5.1)
+        self.assertTrue(messages[2]["recoveryRequired"])
+        self.assertTrue(messages[2]["parkingEnabled"])
+        recovery = next(row for row in events if row["event"] == "drive.network_recovery_ack")
+        self.assertFalse(recovery["neutralAccepted"])
+
+    def test_recovery_parking_completion_cannot_outlive_fixed_grace(self):
+        result, messages, _deadlines, events, _elapsed, _motors, _client = self.run_scripted_grace([
+            (0.1, "drive"), "deadline", (4.9, "parking")], parking_seconds=0.3)
+        self.assertEqual(result, 1)
+        self.assertEqual([message["type"] for message in messages], ["ready", "ack", "error"])
+        self.assertIn("network grace expired", messages[-1]["error"])
+        self.assertFalse(any(row["event"] == "drive.network_recovery_ack" for row in events))
+
+    def test_neutral_recovers_but_its_ack_still_marks_stale_input(self):
+        for neutral in ("stop", "drive"):
+            with self.subTest(neutral=neutral):
+                result, messages, deadlines, events, elapsed, _motors, _client = self.run_scripted_grace([
+                    (0.1, "drive"), "deadline", (1.2, neutral, 0, 0),
+                    (1.3, "drive"), "deadline", "deadline"])
+                self.assertEqual(result, 1)
+                for actual, expected in zip(deadlines, [0.6, 0.7, 5.1, 1.8, 1.9, 6.3]):
+                    self.assertAlmostEqual(actual, expected)
+                self.assertEqual(len(deadlines), 6)
+                self.assertAlmostEqual(elapsed, 6.3)
+                self.assertEqual([message["recoveryRequired"] for message in messages if message["type"] == "ack"],
+                                 [False, True, False])
+                recovery = next(row for row in events if row["event"] == "drive.network_recovery_ack")
+                self.assertTrue(recovery["neutralAccepted"])
+                self.assertTrue(recovery["stopped"])
+                self.assertEqual(recovery["request"]["cmd"], neutral)
+                self.assertEqual(len([row for row in events if row["event"] == "drive.network_paused"]), 2)
+
+    def test_eof_and_protocol_errors_remain_terminal_during_grace(self):
+        for cause, expected in [(SessionError("Control input closed"), "closed"), ("malformed", "Malformed")]:
+            with self.subTest(cause=cause):
+                result, messages, _deadlines, _events, elapsed, _motors, _client = self.run_scripted_grace([
+                    (0.1, "drive"), "deadline", (1.0, cause)])
+                self.assertEqual(result, 1)
+                self.assertEqual(elapsed, 1.0)
+                self.assertIn(expected, messages[-1]["error"])
+
+    def test_output_failure_remains_terminal_and_never_claims_recovery_ack_sent(self):
+        result, messages, _deadlines, events, elapsed, _motors, client = self.run_scripted_grace([
+            (0.1, "drive"), "deadline", (1.0, "stop")], fail_ack=2)
+        self.assertEqual(result, 1)
+        self.assertEqual(elapsed, 1.0)
+        self.assertIn("output blocked", messages[-1]["error"])
+        self.assertFalse(any(row["event"] == "drive.network_recovery_ack" for row in events))
+        self.assertEqual(client.calls[-4:], parking_calls(0))
+
+    def test_soft_stop_serial_failure_does_not_enter_waiting_grace(self):
+        result, messages, deadlines, events, elapsed, _motors, _client = self.run_scripted_grace([
+            (0.1, "drive"), "deadline"], fail_soft_stop=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(deadlines, [0.6, 0.7])
+        self.assertEqual(elapsed, 0.7)
+        self.assertIn("Stop was not confirmed", messages[-1]["error"])
+        self.assertFalse(any(row["event"] == "drive.network_paused" for row in events))
+
+    def test_dribbling_partial_input_never_renews_motion_or_network_deadline(self):
+        # Exercise the real bounded InputPump across both deadlines without real time or IO.
+        with patch.object(bridge.threading, "Thread"):
+            pump = bridge.InputPump(-1)
+        now, polls = [0.0], []
+        pump.poll = lambda: polls.append(now[0])
+
+        def drip(*, timeout):
+            now[0] += timeout
+            return b" "
+
+        with patch.object(bridge.time, "monotonic", lambda: now[0]), \
+                patch.object(pump.chunks, "get", side_effect=drip):
+            with self.assertRaises(bridge.MotionLeaseExpired):
+                pump.line(0.6, threading.Event())
+            self.assertAlmostEqual(now[0], 0.6)
+            with self.assertRaises(bridge.MotionLeaseExpired):
+                pump.line(5.0, threading.Event())
+            self.assertAlmostEqual(now[0], 5.0)
+        self.assertGreater(len(polls), 200)
+        self.assertNotIn(b"\n", pump.buffer)
+        self.assertLess(len(pump.buffer), bridge.MAX_LINE_BYTES)
 
 
 if __name__ == "__main__":

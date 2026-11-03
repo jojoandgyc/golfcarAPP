@@ -46,8 +46,9 @@ class DriveHeartbeatDryRunTest {
                     if (wait > 0) delay(wait)
                 }
                 assertTrue(active.exchange(0, 0).stopped)
-                delay(1200)
-                assertFalse("The unchanged 600 ms watchdog must close even a stopped simulation", active.isOpen)
+                val hardExpiryMs = (active.ready.networkGraceMs ?: active.ready.watchdogMs).toLong()
+                delay(hardExpiryMs + 500L)
+                assertFalse("The negotiated hard deadline must close even a stopped simulation", active.isOpen)
                 assertTrue(runCatching { active.exchange(20, -20) }.isFailure)
                 val replacement = client.openDriveChannel(dryRun = true).also { channel = it }
                 assertTrue(replacement.ready.dryRun)
@@ -56,6 +57,7 @@ class DriveHeartbeatDryRunTest {
             }
             val report = JSONObject().put("dryRun", true).put("hardwareTouched", false)
                 .put("ackSamplesMs", samples).put("watchdogMs", 600)
+                .put("networkGraceMs", channel?.ready?.networkGraceMs ?: JSONObject.NULL)
             File(app.getExternalFilesDir(null), "drive-heartbeat-dry-run.json").writeText(report.toString())
         } finally {
             channel?.close("dry_run_test_finished")

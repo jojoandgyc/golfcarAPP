@@ -16,7 +16,6 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -28,11 +27,13 @@ data class DriveReady(
     val port: String, val dryRun: Boolean, val watchdogMs: Int, val maxRpm: Int,
     val parkingSupported: Boolean = false, val parking: ParkingSettings? = null,
     val infraredSupported: Boolean = false,
+    val networkGraceMs: Int? = null,
 )
 data class DriveAck(
     val left: Int, val right: Int, val stopped: Boolean,
     val parking: ParkingSettings? = null,
     val interlock: DriveInterlock? = null,
+    val recoveryRequired: Boolean = false,
 )
 
 /**
@@ -49,7 +50,7 @@ class BoardDriveChannel private constructor(
 ) {
     @Volatile var diagnosticContext: DiagnosticContext = diagnosticContext
         private set
-    private val transaction = Mutex()
+    private val transaction = DriveTransactionGate()
     private val closed = AtomicBoolean(false)
     private val blockingIo = AtomicBoolean(false)
     private var token = ""
@@ -71,6 +72,18 @@ class BoardDriveChannel private constructor(
 
     val isOpen: Boolean
         get() = !closed.get() && channel.isConnected && !channel.isClosed
+
+    val hasPendingTransaction: Boolean get() = transaction.isPending()
+
+    /** Network grace never delays an intentional stop. Idle channels may still send close/estop. */
+    fun interruptForActiveStop(source: ControlStopSource): Boolean {
+        if (!::ready.isInitialized || ready.networkGraceMs == null) return false
+        val pending = transaction.requestStop(source.name)
+        Diagnostics.event("drive.active_stop_gate", diagnosticContext, source = source.name,
+            fields = diagnosticFields() + mapOf("interruptedTransaction" to pending), critical = true)
+        if (pending) close("active_stop_${source.name.lowercase()}")
+        return pending
+    }
 
     suspend fun exchange(left: Int, right: Int, emergency: Boolean = false): DriveAck {
         require(left in -ready.maxRpm..ready.maxRpm && right in -ready.maxRpm..ready.maxRpm) {
@@ -122,7 +135,7 @@ class BoardDriveChannel private constructor(
     ): DriveAck =
         withContext(Dispatchers.IO) {
             // Refuse concurrency instead of keeping stale movement requests in a queue.
-            check(transaction.tryLock()) { "上一个摇杆指令尚未收到回执" }
+            transaction.begin(terminal = command == "estop" || command == "close")
             val started = System.nanoTime()
             val transition = command != currentCommand
             val important = parking != null || command == "estop" || command == "close" || transition
@@ -132,7 +145,7 @@ class BoardDriveChannel private constructor(
             try {
                 check(isOpen) { "摇杆控制通道已关闭，请重新启用" }
                 val closing = command == "estop" || command == "close"
-                withTimeout(if (parking != null || closing) PARKING_ACK_TIMEOUT_MS else ACK_TIMEOUT_MS) {
+                withTimeout(if (parking != null || closing) PARKING_ACK_TIMEOUT_MS else driveAckTimeoutMillis(ready.networkGraceMs)) {
                     sequence += 1
                     val sentSequence = sequence
                     val previousToken = token
@@ -173,7 +186,16 @@ class BoardDriveChannel private constructor(
                     val actualLeft = (rawLeft as Number).toInt()
                     val actualRight = (rawRight as Number).toInt()
                     val stopped = rawStopped as Boolean
-                    val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight, stopped)
+                    val rawRecovery = reply.opt("recoveryRequired")
+                    requireMessage(!reply.has("recoveryRequired") || rawRecovery is Boolean, "开发板网络恢复回执格式无效")
+                    val recoveryRequired = try {
+                        validatedDriveRecovery(ready.networkGraceMs != null, rawRecovery as? Boolean,
+                            actualLeft, actualRight, stopped)
+                    } catch (failure: IllegalArgumentException) {
+                        requireMessage(false, failure.message ?: "开发板网络恢复回执无效")
+                        false
+                    }
+                    val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight, stopped, recoveryRequired)
                     val actualParking = if (ready.parkingSupported) readParking(reply) else null
                     if (ready.parkingSupported) {
                         val expectedParking = if (closing) confirmedParking?.copy(enabled = false)
@@ -185,6 +207,10 @@ class BoardDriveChannel private constructor(
                     lastAckSequence = sentSequence
                     lastAckNanos = System.nanoTime()
                     val rtt = elapsedMillis(started)
+                    if (recoveryRequired || rtt >= 900L) Diagnostics.event("drive.network_recovery", diagnosticContext,
+                        fields = mapOf("seq" to sentSequence, "elapsedMs" to rtt,
+                            "recoveryRequired" to recoveryRequired, "stopped" to stopped,
+                            "networkGraceMs" to ready.networkGraceMs), critical = true)
                     lastAckRttMs = rtt
                     summaryCount += 1
                     summaryRttTotal += rtt
@@ -203,10 +229,11 @@ class BoardDriveChannel private constructor(
                         summaryRttMax = 0
                     }
                     phase = "idle"
-                    DriveAck(actualLeft, actualRight, stopped, actualParking, interlock)
+                    DriveAck(actualLeft, actualRight, stopped, actualParking, interlock, recoveryRequired)
                 }
             } catch (timeout: TimeoutCancellationException) {
-                val failure = SocketTimeoutException("摇杆控制回执超时，已关闭控制通道；请重新启用摇杆")
+                transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }
+                val failure = SocketTimeoutException("控制回执等待超时，连接已关闭；请先重新连接再启用手动控制")
                 Diagnostics.failure(diagnosticContext, "drive.ack_timeout", failure,
                     diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started),
                         "leftRpm" to left, "rightRpm" to right))
@@ -214,6 +241,7 @@ class BoardDriveChannel private constructor(
                 close("ack_timeout", invalidateTransport = true)
                 throw failure
             } catch (failure: Exception) {
+                transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }
                 val safeFailure = protocolDiagnosticFailure(failure)
                 if (failure is CancellationException) {
                     Diagnostics.event("drive.transaction_cancelled", diagnosticContext,
@@ -227,9 +255,16 @@ class BoardDriveChannel private constructor(
                 close(if (failure is CancellationException) "transaction_cancelled" else "transaction_failed")
                 throw safeFailure
             } finally {
-                transaction.unlock()
+                transaction.finish()
             }
         }
+
+    private fun activeStopCancellation(source: String): CancellationException {
+        Diagnostics.event("drive.transaction_cancelled", diagnosticContext, source = source,
+            fields = diagnosticFields() + mapOf("intentionalStop" to true), critical = true)
+        close("active_stop_cancelled")
+        return DriveStopRequestedException(source)
+    }
 
     private suspend fun readMessage(): JSONObject {
         val bytes = ByteArrayOutputStream()
@@ -308,6 +343,9 @@ class BoardDriveChannel private constructor(
         "lastAckAgeMs" to if (lastAckNanos == 0L) null else elapsedMillis(lastAckNanos),
         "channelConnected" to channel.isConnected, "channelClosed" to channel.isClosed,
         "channelEof" to channel.isEOF, "blockingIo" to blockingIo.get(),
+        "transactionPending" to hasPendingTransaction,
+        "activeStopSource" to transaction.requestedStopSource(),
+        "ackTimeoutMs" to if (::ready.isInitialized) driveAckTimeoutMillis(ready.networkGraceMs) else null,
     )
 
     private fun requireMessage(condition: Boolean, message: String) {
@@ -331,7 +369,7 @@ class BoardDriveChannel private constructor(
     }
 
     private fun readInterlock(reply: JSONObject, command: String, requestedLeft: Int, requestedRight: Int,
-        actualLeft: Int, actualRight: Int, stopped: Boolean): DriveInterlock? {
+        actualLeft: Int, actualRight: Int, stopped: Boolean, recoveryRequired: Boolean): DriveInterlock? {
         var blocked: Boolean? = null
         var directions: List<String>? = null
         if (ready.infraredSupported || reply.has("infraredBlocked") || reply.has("infraredDirections")) {
@@ -348,7 +386,10 @@ class BoardDriveChannel private constructor(
             }
         }
         return try {
-            validatedDriveInterlock(ready.infraredSupported, command, requestedLeft, requestedRight,
+            // A negotiated network stop may suppress movement independently of infrared.
+            val suppressed = recoveryRequired && blocked != true
+            validatedDriveInterlock(ready.infraredSupported, command,
+                if (suppressed) 0 else requestedLeft, if (suppressed) 0 else requestedRight,
                 actualLeft, actualRight, stopped, blocked, directions)
         } catch (failure: IllegalArgumentException) {
             requireMessage(false, failure.message ?: "开发板红外保护回执无效")
@@ -357,7 +398,6 @@ class BoardDriveChannel private constructor(
     }
 
     internal companion object {
-        private const val ACK_TIMEOUT_MS = 900L
         // Configuration and terminal cleanup include register writes/readback after stopping.
         private const val PARKING_ACK_TIMEOUT_MS = 2_500L
         private const val START_TIMEOUT_MS = 5_000L
@@ -402,6 +442,10 @@ class BoardDriveChannel private constructor(
                         control.requireMessage(!reply.has("infraredSupported") || rawInfraredSupported is Boolean,
                             "开发板红外保护能力字段无效")
                         val rawRunId = reply.opt("runId")
+                        val rawGrace = reply.opt("networkGraceMs")
+                        control.requireMessage(!reply.has("networkGraceMs") ||
+                            rawGrace is Number && rawGrace.toDouble() == 5_000.0,
+                            "开发板网络恢复参数不匹配")
                         control.requireMessage(!reply.has("runId") ||
                             rawRunId is String && rawRunId.matches(Regex("[0-9a-f]{32}")),
                             "开发板控制会话编号无效")
@@ -410,6 +454,7 @@ class BoardDriveChannel private constructor(
                             watchdogMs = reply.getInt("watchdogMs"), maxRpm = reply.getInt("maxRpm"),
                             parkingSupported = parkingSupported, parking = parking,
                             infraredSupported = rawInfraredSupported == true,
+                            networkGraceMs = (rawGrace as? Number)?.toInt(),
                         )
                         control.requireMessage(ready.dryRun == dryRun, "开发板控制模式不匹配")
                         control.requireMessage(ready.maxRpm in 1..100 && ready.watchdogMs == 600, "开发板限速或超时参数不匹配")
@@ -421,6 +466,8 @@ class BoardDriveChannel private constructor(
                             "dryRun" to ready.dryRun, "port" to ready.port,
                             "parkingSupported" to ready.parkingSupported,
                             "infraredSupported" to ready.infraredSupported,
+                            "networkGraceMs" to ready.networkGraceMs,
+                            "ackTimeoutMs" to driveAckTimeoutMillis(ready.networkGraceMs),
                             "elapsedMs" to elapsedMillis(started)), critical = true)
                         control
                     }

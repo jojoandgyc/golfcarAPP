@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "recordedHostUtc": "2026-11-03T07:25:38.067738+00:00",
+  "versionCode": 15,
+  "versionName": "1.8.4-drive-grace",
+  "apkSha256": "5562daf702f7a477e6f64d6076e470e3db00b73b1f073211621b976187ae911f",
+  "manualControl": {
+    "motionLeaseMs": 600,
+    "sessionGraceMs": 5000,
+    "negotiatedAckWaitMs": 2500,
+    "legacyAckWaitMs": 900,
+    "delayedMovementSuppressed": true,
+    "heldGestureRequiresRelease": true,
+    "intentionalStopsBypassGrace": true,
+    "followControlUnchanged": true
+  },
+  "validation": {
+    "jvmPassed": 209,
+    "boardOfflinePassed": 73,
+    "emulatorMemoryProtocolAndStopPassed": 25,
+    "emulatorBoardDryRunPassed": 3,
+    "emulatorBoardScenarios": [
+      {
+        "dryRun": true,
+        "execute": false,
+        "cameraOpened": false,
+        "serialOpened": false,
+        "holdDirection": "BOTH",
+        "holdMs": 1200,
+        "runId": "d872a59efebbd9052f74f099fecd3669",
+        "watchdogMs": 600,
+        "networkGraceMs": 5000,
+        "delayedExchangeMs": 1217,
+        "delayedAckRecoveryRequired": true,
+        "sameSessionRecovered": true,
+        "lateMotionSuppressed": true,
+        "neutralRequired": true,
+        "passed": true
+      },
+      {
+        "dryRun": true,
+        "execute": false,
+        "cameraOpened": false,
+        "serialOpened": false,
+        "holdDirection": "RETURN_ONLY",
+        "holdMs": 1800,
+        "runId": "8b2545c1070c07aa7ea094f819b96855",
+        "watchdogMs": 600,
+        "networkGraceMs": 5000,
+        "delayedExchangeMs": 1805,
+        "delayedAckRecoveryRequired": false,
+        "sameSessionRecovered": true,
+        "lateMotionSuppressed": true,
+        "neutralRequired": true,
+        "passed": true
+      },
+      {
+        "dryRun": true,
+        "execute": false,
+        "cameraOpened": false,
+        "serialOpened": false,
+        "holdDirection": "BOTH",
+        "holdMs": 6500,
+        "runId": "a9cc9b113e53a4499c9d4762265d1fba",
+        "watchdogMs": 600,
+        "networkGraceMs": 5000,
+        "delayedExchangeMs": 2520,
+        "appSshInvalidated": true,
+        "boardGraceExpired": true,
+        "passed": true
+      }
+    ],
+    "pcBoardDryRunScenariosPassed": 2,
+    "realMotorTests": false,
+    "cameraTests": false
+  },
+  "deployment": {
+    "board": {
+      "deployedUtc": "20261103T072240391248Z",
+      "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+      "backup": "/home/topeet/lianzhan/scripts/.app_joystick_bridge.py.backup-20261103T072240391248Z-48328990cc71",
+      "oldSha256": "48328990cc71800b261c5a8123941cb6df466a719fc9f5f47fbfd5b3abfc4041",
+      "newSha256": "849061c8bc27d8771ff5075822b8b09d03f144a9da219c54ce52bd21f53bb5f0",
+      "uid": 1000,
+      "gid": 1000,
+      "mode": "0o755",
+      "controlIdleGuardHeld": true,
+      "servicesRestarted": false,
+      "devicesOpened": false
+    },
+    "phoneInstalled": false,
+    "phonePendingReason": "User took the phone away during development; install when reconnected.",
+    "emulatorInstalled": true,
+    "motorPersistentConfigurationChanged": false,
+    "networkConfigurationChanged": false,
+    "serverServicesChanged": false
+  },
+  "evidenceDirectory": "E:\\Temp\\golfcar-jitter-2026-11-03"
+}

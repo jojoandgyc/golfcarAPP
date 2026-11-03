@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 14
-        versionName = "1.8.3-network-status"
+        versionCode = 15
+        versionName = "1.8.4-drive-grace"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

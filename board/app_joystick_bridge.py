@@ -62,6 +62,7 @@ class BestEffortDiagnostic:
 
 MAX_RPM = 100
 WATCHDOG_SECONDS = 0.6
+NETWORK_GRACE_SECONDS = 5.0
 PARKING_TRANSACTION_SECONDS = 2.0
 MAX_PARKING_CURRENT = 60
 SERIAL_TIMEOUT = 0.15
@@ -73,6 +74,11 @@ PARKING_REQUEST_KEYS = REQUEST_KEYS | {"parkingEnabled", "parkingCurrent"}
 
 
 class SessionError(Exception):
+    pass
+
+
+class MotionLeaseExpired(SessionError):
+    """Only an input deadline can enter network grace; other errors remain terminal."""
     pass
 
 
@@ -289,6 +295,14 @@ class ProtocolSession:
         self.token = secrets.token_hex(16)
         self.next_seq = 1
         self.run_id = secrets.token_hex(16)
+        self.recovery_required = False
+
+    def pause_for_network(self) -> None:
+        # Do not use shutdown(): network grace must not write parking registers.
+        # Keep any IR latch until an explicit neutral request releases it. Neither
+        # IR polling nor a delayed held target is allowed to restart motion.
+        self.recovery_required = True
+        self.motors.stop(force=True, emergency=True, release_interlock=False)
 
     def ready(self) -> dict[str, Any]:
         # Match the keyboard launcher's initial parking OFF state, with readback.
@@ -296,6 +310,7 @@ class ProtocolSession:
         return {"type": "ready", "token": self.token, "dryRun": self.dry_run, "runId": self.run_id,
                 "port": self.port, "maxRpm": MAX_RPM,
                 "watchdogMs": int(WATCHDOG_SECONDS * 1000), "parkingSupported": True,
+                "networkGraceMs": int(NETWORK_GRACE_SECONDS * 1000),
                 "infraredSupported": self.motors.infrared is not None,
                 **self.motors.parking_state()}
 
@@ -317,10 +332,19 @@ class ProtocolSession:
         if command != "drive" and (left != 0 or right != 0):
             raise SessionError("Non-drive commands require zero motor targets")
         closing = command in ("estop", "close")
+        recovering = self.recovery_required
         if command == "parking":
             self.motors.set_parking(message["parkingEnabled"], message["parkingCurrent"])
         elif closing:
             self.motors.shutdown()
+        elif recovering:
+            # A delayed held joystick target must never restart motion after the lease expired.
+            if command == "stop" or (command == "drive" and (left, right) == (0, 0)):
+                # The network pause used emergency stop even when parking was enabled.
+                # Reapply its confirmed normal-stop mode without rewriting its registers.
+                self.motors.stop(force=True)
+                self.recovery_required = False
+            left, right = 0, 0
         elif command != "drive" or (left, right) == (0, 0):
             self.motors.stop()
             left, right = 0, 0
@@ -332,6 +356,9 @@ class ProtocolSession:
         self.token = secrets.token_hex(16)
         return {"type": "ack", "seq": seq, "token": self.token, "left": left,
                 "right": right, "stopped": (left, right) == (0, 0),
+                # Neutral clears the latch for subsequent requests, but its own ACK must
+                # still tell the App to discard the held target and require fresh input.
+                "recoveryRequired": recovering,
                 **self.motors.parking_state(), **infrared}, closing
 
 
@@ -363,7 +390,7 @@ class InputPump:
                 raise SessionError("Session terminated")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise SessionError("Control watchdog expired")
+                raise MotionLeaseExpired("Control watchdog expired")
             # Run on the motor-owning thread even when no new complete request
             # arrives. A partial line must not postpone IR protection.
             poll_started = time.monotonic()
@@ -376,7 +403,7 @@ class InputPump:
             # old remaining value or accept a buffered request after expiry.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise SessionError("Control watchdog expired")
+                raise MotionLeaseExpired("Control watchdog expired")
             if stopped.is_set():
                 raise SessionError("Session terminated")
             split = self.buffer.find(b"\n")
@@ -426,13 +453,16 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             diagnostic = NullDiagnosticLog()
     diagnostic = BestEffortDiagnostic(diagnostic)
     diagnostic.event("drive.session_started", critical=True, dryRun=dry_run, parentPid=os.getppid(),
-                     watchdogMs=int(WATCHDOG_SECONDS * 1000), infraredSupported=motors.infrared is not None)
+                     watchdogMs=int(WATCHDOG_SECONDS * 1000), networkGraceMs=int(NETWORK_GRACE_SECONDS * 1000),
+                     infraredSupported=motors.infrared is not None)
     failed = False
     error_message = None
     cleanup_confirmed = False
     phase = "ready"
     pump = None
     deadline = 0.0
+    session_deadline = 0.0
+    motion_expired = False
     last_received = None
     last_ack_at = None
     last_ack_seq = 0
@@ -450,15 +480,46 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
     try:
         output.send(session.ready())
         diagnostic.event("drive.ready_sent", critical=True)
-        deadline = time.monotonic() + WATCHDOG_SECONDS
+        ready_at = time.monotonic()
+        deadline = ready_at + WATCHDOG_SECONDS
+        session_deadline = ready_at + NETWORK_GRACE_SECONDS
         pump = InputPump(sys.stdin.fileno())
         pump.poll = motors.check_infrared
         while True:
             phase = "request_wait"
-            message = strict_message(pump.line(deadline, stopped))
+            try:
+                line = pump.line(session_deadline if motion_expired else deadline, stopped)
+            except MotionLeaseExpired:
+                if not motion_expired:
+                    phase = "network_soft_stop"
+                    session.pause_for_network()
+                    motion_expired = True
+                    diagnostic.event("drive.network_paused", critical=True, recoveryRequired=True,
+                        lastAckSeq=last_ack_seq, leaseExpiredMonotonicMs=deadline * 1000,
+                        stoppedMonotonicMs=time.monotonic() * 1000,
+                        sessionDeadlineMonotonicMs=session_deadline * 1000,
+                        lastValidRequest=last_request)
+                if time.monotonic() >= session_deadline:
+                    raise SessionError("Control watchdog network grace expired")
+                continue
+            message = strict_message(line)
             received = time.monotonic()
-            if received >= deadline or stopped.is_set():
-                raise SessionError("Control watchdog expired or session terminated")
+            if stopped.is_set():
+                raise SessionError("Session terminated")
+            if received >= session_deadline:
+                raise SessionError("Control watchdog network grace expired")
+            if received >= deadline and not motion_expired:
+                # Also cover expiry between InputPump returning and request dispatch.
+                phase = "network_soft_stop"
+                session.pause_for_network()
+                motion_expired = True
+                diagnostic.event("drive.network_paused", critical=True, recoveryRequired=True,
+                    lastAckSeq=last_ack_seq, leaseExpiredMonotonicMs=deadline * 1000,
+                    stoppedMonotonicMs=time.monotonic() * 1000,
+                    sessionDeadlineMonotonicMs=session_deadline * 1000,
+                    lastValidRequest=last_request)
+                if time.monotonic() >= session_deadline:
+                    raise SessionError("Control watchdog network grace expired")
             # Only bounded primitive metadata is retained. No request object or token
             # can leak into this session's diagnostic timeline.
             request = {key: message[key] if type(message[key]) is int and
@@ -481,6 +542,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             if not closing and completed >= received + limit:
                 raise SessionError("Parking transaction exceeded timeout" if parking else
                                    "Motor transaction exceeded control watchdog")
+            if not closing and session.recovery_required and completed >= session_deadline:
+                raise SessionError("Control watchdog network grace expired")
             if stopped.is_set():
                 raise SessionError("Session terminated")
             phase = "ack_write"
@@ -490,6 +553,11 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             last_ack_seq = response["seq"]
             last_request = request
             last_received = received
+            if response["recoveryRequired"]:
+                diagnostic.event("drive.network_recovery_ack", critical=True, request=request,
+                    recoveryRequired=True, neutralAccepted=not session.recovery_required,
+                    stopped=response["stopped"], ackMonotonicMs=ack_at * 1000,
+                    sessionDeadlineMonotonicMs=session_deadline * 1000)
             sample_count += 1
             max_processing_ms = max(max_processing_ms, processed_ms)
             max_request_gap_ms = max(max_request_gap_ms, request_gap_ms or 0.0)
@@ -508,12 +576,18 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             prior_ir, previous_command = blocked, message["cmd"]
             if closing:
                 break
-            deadline = (completed if parking else received) + WATCHDOG_SECONDS
+            # Suppressed held commands and parking during recovery cannot renew
+            # either deadline. Only a validated neutral request releases the latch.
+            if not session.recovery_required:
+                deadline = (completed if parking else received) + WATCHDOG_SECONDS
+                session_deadline = (completed if parking else received) + NETWORK_GRACE_SECONDS
+                motion_expired = False
     except Exception as error:
         failed = True
         error_message = f"{type(error).__name__}: {error}"
         now = time.monotonic()
         source = ("signal" if stopped.is_set() else
+                  "network_grace_expired" if "network grace expired" in str(error) else
                   "motor_transaction_timeout" if phase == "motor_transaction" and "watchdog" in str(error) else
                   "parking_transaction_timeout" if phase == "motor_transaction" and "Parking transaction exceeded" in str(error) else
                   "heartbeat_timeout" if "watchdog" in str(error)
@@ -524,6 +598,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             lastRequestAgeMs=None if last_received is None else (now - last_received) * 1000,
             lastAckAgeMs=None if last_ack_at is None else (now - last_ack_at) * 1000,
             leaseRemainingMs=(deadline - now) * 1000,
+            networkGraceRemainingMs=(session_deadline - now) * 1000,
+            recoveryRequired=session.recovery_required,
             lastIrPollMs=getattr(pump, "last_poll_seconds", 0) * 1000,
             maxIrPollMs=getattr(pump, "max_poll_seconds", 0) * 1000,
             infrared=motors.infrared_state())
