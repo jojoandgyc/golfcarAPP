@@ -160,6 +160,10 @@ class BoardPagesTest {
         assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
         compose.onNodeWithTag("parkingSwitch").assertIsDisplayed()
         compose.onNodeWithTag("parkingCurrent").assertIsDisplayed()
+        compose.onNodeWithTag("parkingLeftCurrent").assertIsDisplayed().assertTextEquals("左：— A")
+        compose.onNodeWithTag("parkingRightCurrent").assertIsDisplayed().assertTextEquals("右：— A")
+        compose.onNodeWithTag("parkingIncrease").assertDoesNotExist()
+        compose.onNodeWithTag("parkingDecrease").assertDoesNotExist()
         compose.onNodeWithTag("drivingCameraPanel").assertDoesNotExist()
         compose.onNodeWithTag("enableDrive").assertIsDisplayed()
 

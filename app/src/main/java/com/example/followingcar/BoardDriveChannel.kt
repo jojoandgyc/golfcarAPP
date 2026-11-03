@@ -28,12 +28,19 @@ data class DriveReady(
     val parkingSupported: Boolean = false, val parking: ParkingSettings? = null,
     val infraredSupported: Boolean = false,
     val networkGraceMs: Int? = null,
+    val safetyVersion: Int = 0,
+    val parkingCurrentReadOnly: Boolean = false,
+    val feedback: DriveFeedback? = null,
 )
 data class DriveAck(
     val left: Int, val right: Int, val stopped: Boolean,
     val parking: ParkingSettings? = null,
     val interlock: DriveInterlock? = null,
     val recoveryRequired: Boolean = false,
+    val targetStopped: Boolean = left == 0 && right == 0,
+    val feedback: DriveFeedback? = null,
+    val feedbackReceivedNanos: Long = 0L,
+    val feedbackAgeAtReceiptMs: Long = Long.MAX_VALUE,
 )
 
 /**
@@ -99,10 +106,10 @@ class BoardDriveChannel private constructor(
         return result
     }
 
-    suspend fun stopAndClose() {
+    suspend fun stopAndClose(): DriveAck {
         try {
             check(isOpen) { "摇杆通道已关闭，未收到本次停车回执" }
-            transact("close", 0, 0)
+            return transact("close", 0, 0)
         } finally {
             close("stop_and_close")
         }
@@ -111,6 +118,11 @@ class BoardDriveChannel private constructor(
     /** Serialized by the same caller as the heartbeat; the board also requires a stopped target. */
     suspend fun configureParking(settings: ParkingSettings): DriveAck {
         check(ready.parkingSupported) { "开发板脚本不支持驻车设置，请更新 app_joystick_bridge.py" }
+        check(ready.parkingCurrentReadOnly && confirmedParking != null &&
+            settings.copy(enabled = confirmedParking!!.enabled) == confirmedParking) {
+            "手动控制期间驻车电流只读，请停用手动控制后到电机配置页修改"
+        }
+        check(!settings.enabled || settings.canEnable) { "驻车电流配置不具备开启条件，请检查电机配置" }
         return transact("parking", 0, 0, settings)
     }
 
@@ -134,6 +146,9 @@ class BoardDriveChannel private constructor(
         command: String, left: Int, right: Int, parking: ParkingSettings? = null,
     ): DriveAck =
         withContext(Dispatchers.IO) {
+            check(ready.safetyVersion == REQUIRED_DRIVE_SAFETY_VERSION && ready.parkingCurrentReadOnly) {
+                "开发板安全控制协议尚未确认，拒绝发送控制指令"
+            }
             // Refuse concurrency instead of keeping stale movement requests in a queue.
             transaction.begin(terminal = command == "estop" || command == "close")
             val started = System.nanoTime()
@@ -153,7 +168,6 @@ class BoardDriveChannel private constructor(
                         .put("cmd", command).put("left", left).put("right", right)
                     if (parking != null) {
                         request.put("parkingEnabled", parking.enabled)
-                            .put("parkingCurrent", parking.currentAmps)
                     }
                     phase = "write"
                     val sendingNanos = System.nanoTime()
@@ -164,7 +178,7 @@ class BoardDriveChannel private constructor(
                         fields = mapOf("commandType" to command, "seq" to sentSequence,
                             "sendGapMs" to sendGapMs, "lastAckRttMs" to lastAckRttMs,
                             "leftRpm" to left, "rightRpm" to right,
-                            "parkingEnabled" to parking?.enabled, "parkingAmps" to parking?.currentAmps),
+                            "parkingEnabled" to parking?.enabled, "parkingCurrentReadOnly" to true),
                         critical = important)
                     blockingCall {
                         output.write((request.toString() + "\n").toByteArray(Charsets.UTF_8))
@@ -185,17 +199,21 @@ class BoardDriveChannel private constructor(
                         rawRight.toDouble() == rawRight.toInt().toDouble(), "开发板速度或停车回执格式无效")
                     val actualLeft = (rawLeft as Number).toInt()
                     val actualRight = (rawRight as Number).toInt()
-                    val stopped = rawStopped as Boolean
+                    val measured = readFeedback(reply, ready.dryRun, actualLeft, actualRight)
+                    val stopped = measured.stopped
+                    requireMessage(!(closing || parking != null) || stopped,
+                        "开发板终止或驻车操作缺少实测停车确认")
                     val rawRecovery = reply.opt("recoveryRequired")
                     requireMessage(!reply.has("recoveryRequired") || rawRecovery is Boolean, "开发板网络恢复回执格式无效")
                     val recoveryRequired = try {
                         validatedDriveRecovery(ready.networkGraceMs != null, rawRecovery as? Boolean,
-                            actualLeft, actualRight, stopped)
+                            actualLeft, actualRight, measured.targetStopped)
                     } catch (failure: IllegalArgumentException) {
                         requireMessage(false, failure.message ?: "开发板网络恢复回执无效")
                         false
                     }
-                    val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight, stopped, recoveryRequired)
+                    val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight,
+                        measured.targetStopped, recoveryRequired)
                     val actualParking = if (ready.parkingSupported) readParking(reply) else null
                     if (ready.parkingSupported) {
                         val expectedParking = if (closing) confirmedParking?.copy(enabled = false)
@@ -221,7 +239,13 @@ class BoardDriveChannel private constructor(
                             "sendGapMs" to sendGapMs, "lastAckRttMs" to lastAckRttMs,
                             "sampleCount" to summaryCount, "maxRttMs" to summaryRttMax,
                             "meanRttMs" to summaryRttTotal / summaryCount,
-                            "leftRpm" to actualLeft, "rightRpm" to actualRight, "stopped" to stopped),
+                            "leftRpm" to actualLeft, "rightRpm" to actualRight, "targetStopped" to measured.targetStopped,
+                            "stopped" to stopped, "feedbackLeftRpm" to measured.feedback.leftRpm,
+                            "feedbackRightRpm" to measured.feedback.rightRpm,
+                            "feedbackLeftError" to measured.feedback.leftError,
+                            "feedbackRightError" to measured.feedback.rightError,
+                            "feedbackAgeMs" to measured.feedback.ageMs, "feedbackSamples" to measured.feedback.samples,
+                            "feedbackSource" to measured.feedback.source),
                             critical = important)
                         summaryAt = System.nanoTime()
                         summaryCount = 0
@@ -229,7 +253,8 @@ class BoardDriveChannel private constructor(
                         summaryRttMax = 0
                     }
                     phase = "idle"
-                    DriveAck(actualLeft, actualRight, stopped, actualParking, interlock, recoveryRequired)
+                    DriveAck(actualLeft, actualRight, stopped, actualParking, interlock, recoveryRequired,
+                        measured.targetStopped, measured.feedback, lastAckNanos, measured.feedback.ageMs + rtt)
                 }
             } catch (timeout: TimeoutCancellationException) {
                 transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }
@@ -358,14 +383,20 @@ class BoardDriveChannel private constructor(
     }
 
     private fun readParking(message: JSONObject): ParkingSettings {
-        val enabled = message.opt("parkingEnabled")
-        val current = message.opt("parkingCurrent")
-        requireMessage(enabled is Boolean && current is Number &&
-            current.toDouble() in 0.0..60.0 && current.toDouble() == current.toInt().toDouble(),
-            "开发板驻车参数无效")
-        val amps = (current as Number).toInt()
-        requireMessage(enabled == false || amps > 0, "开发板驻车开关与电流不一致")
-        return ParkingSettings(enabled as Boolean, amps)
+        return readSafety { validatedParkingSettings(listOf("parkingEnabled", "parkingLeftCurrentAmps",
+            "parkingRightCurrentAmps", "parkingMaxCurrentAmps").associateWith(message::opt)) }
+    }
+
+    private fun readFeedback(message: JSONObject, dryRun: Boolean, left: Int, right: Int): ValidatedDriveFeedback =
+        readSafety { validatedDriveFeedback(listOf("targetStopped", "stopped", "feedbackLeftRpm", "feedbackRightRpm",
+            "feedbackLeftError", "feedbackRightError", "feedbackAgeMs", "feedbackSamples", "feedbackSource")
+            .associateWith(message::opt), dryRun, left, right) }
+
+    private fun <T> readSafety(block: () -> T): T = try {
+        block()
+    } catch (failure: IllegalArgumentException) {
+        requireMessage(false, failure.message ?: "开发板安全反馈格式无效")
+        throw IOException("开发板安全反馈格式无效")
     }
 
     private fun readInterlock(reply: JSONObject, command: String, requestedLeft: Int, requestedRight: Int,
@@ -398,7 +429,7 @@ class BoardDriveChannel private constructor(
     }
 
     internal companion object {
-        // Configuration and terminal cleanup include register writes/readback after stopping.
+        // Parking mode changes and terminal cleanup wait for measured zero-speed feedback.
         private const val PARKING_ACK_TIMEOUT_MS = 2_500L
         private const val START_TIMEOUT_MS = 5_000L
         private const val MAX_LINE_BYTES = 4096
@@ -417,7 +448,7 @@ class BoardDriveChannel private constructor(
                     fields = mapOf("dryRun" to dryRun, "timeoutMs" to START_TIMEOUT_MS), critical = true)
                 try {
                     val channel = (session.openChannel("exec") as ChannelExec).apply {
-                        setCommand("python3 -u /home/topeet/lianzhan/scripts/app_joystick_bridge.py" + if (dryRun) " --dry-run" else "")
+                        setCommand(driveBridgeCommand(dryRun))
                         setPty(false)
                         setAgentForwarding(false)
                         setInputStream(null)
@@ -435,9 +466,19 @@ class BoardDriveChannel private constructor(
                         val reply = control.readMessage()
                         control.phase = "ready_validate"
                         control.requireMessage(reply.getString("type") == "ready", "开发板未就绪")
+                        control.readSafety { validateDriveSafetyVersion(reply.opt("safetyVersion"),
+                            reply.opt("parkingCurrentReadOnly")) }
                         control.token = control.readToken(reply)
-                        val parkingSupported = reply.optBoolean("parkingSupported", false)
-                        val parking = if (parkingSupported) control.readParking(reply) else null
+                        control.requireMessage(reply.opt("parkingSupported") == true, "开发板安全驻车能力未确认")
+                        val parkingSupported = true
+                        val parking = control.readParking(reply)
+                        control.requireMessage(!parking.enabled, "开发板初始驻车模式无效")
+                        control.requireMessage(listOf("left", "right").all { key ->
+                            val value = reply.opt(key)
+                            value is Number && value.toDouble() == 0.0
+                        }, "开发板初始目标未归零")
+                        val initialFeedback = control.readFeedback(reply, dryRun, 0, 0)
+                        control.requireMessage(initialFeedback.stopped, "开发板初始实测停车未确认")
                         val rawInfraredSupported = reply.opt("infraredSupported")
                         control.requireMessage(!reply.has("infraredSupported") || rawInfraredSupported is Boolean,
                             "开发板红外保护能力字段无效")
@@ -455,6 +496,8 @@ class BoardDriveChannel private constructor(
                             parkingSupported = parkingSupported, parking = parking,
                             infraredSupported = rawInfraredSupported == true,
                             networkGraceMs = (rawGrace as? Number)?.toInt(),
+                            safetyVersion = REQUIRED_DRIVE_SAFETY_VERSION, parkingCurrentReadOnly = true,
+                            feedback = initialFeedback.feedback,
                         )
                         control.requireMessage(ready.dryRun == dryRun, "开发板控制模式不匹配")
                         control.requireMessage(ready.maxRpm in 1..100 && ready.watchdogMs == 600, "开发板限速或超时参数不匹配")
@@ -464,6 +507,12 @@ class BoardDriveChannel private constructor(
                         control.phase = "idle"
                         Diagnostics.event("drive.ready", control.diagnosticContext, fields = mapOf(
                             "dryRun" to ready.dryRun, "port" to ready.port,
+                            "safetyVersion" to ready.safetyVersion,
+                            "parkingCurrentReadOnly" to ready.parkingCurrentReadOnly,
+                            "feedbackSource" to initialFeedback.feedback.source,
+                            "feedbackSamples" to initialFeedback.feedback.samples,
+                            "feedbackLeftRpm" to initialFeedback.feedback.leftRpm,
+                            "feedbackRightRpm" to initialFeedback.feedback.rightRpm,
                             "parkingSupported" to ready.parkingSupported,
                             "infraredSupported" to ready.infraredSupported,
                             "networkGraceMs" to ready.networkGraceMs,

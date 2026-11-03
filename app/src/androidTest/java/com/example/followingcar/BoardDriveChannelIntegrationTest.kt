@@ -17,7 +17,7 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class BoardDriveChannelIntegrationTest {
     @Test
-    fun parkingSettingsAreAcknowledgedAndEmergencyClearsParkingInDryRun() = runBlocking {
+    fun parkingModeChangesPreserveReadOnlyCurrentAndEmergencyReleasesModeInDryRun() = runBlocking {
         val client = connectedClient()
         var drive: BoardDriveChannel? = null
         try {
@@ -25,11 +25,14 @@ class BoardDriveChannelIntegrationTest {
                 val control = client.openDriveChannel(dryRun = true).also { drive = it }
                 assertTrue(control.ready.dryRun)
                 assertTrue("Update the board bridge before running parking tests", control.ready.parkingSupported)
-                assertEquals(ParkingSettings(), control.ready.parking)
-                val parked = ParkingSettings(enabled = true, currentAmps = 6)
+                assertEquals(2, control.ready.safetyVersion)
+                assertTrue(control.ready.parkingCurrentReadOnly)
+                assertEquals(ParkingSettings(false, 5.0, 5.0, 60.0), control.ready.parking)
+                val parked = requireNotNull(control.ready.parking).copy(enabled = true)
+                assertTrue(runCatching { client.configureParking(control, parked.copy(leftCurrentAmps = 6.0)) }.isFailure)
                 assertEquals(parked, client.configureParking(control, parked).parking)
                 assertFalse(control.exchange(30, -30).stopped)
-                val stopped = control.exchange(0, 0)
+                val stopped = awaitSimulatedDriveStop(control)
                 assertTrue(stopped.stopped)
                 assertEquals(parked, stopped.parking)
                 assertEquals(parked.copy(enabled = false), control.exchange(0, 0, emergency = true).parking)
@@ -56,10 +59,11 @@ class BoardDriveChannelIntegrationTest {
                     val ack = control.exchange(left, right)
                     assertEquals(left, ack.left)
                     assertEquals(right, ack.right)
-                    assertEquals(left == 0 && right == 0, ack.stopped)
+                    assertEquals(left == 0 && right == 0, ack.targetStopped)
+                    assertTrue(ack.feedback != null)
                     delay(100)
                 }
-                control.stopAndClose()
+                assertTrue(control.stopAndClose().stopped)
                 assertFalse(control.isOpen)
                 assertTrue(client.isConnected)
                 assertEquals("control-closed", client.execute("printf 'control-closed'").stdout)

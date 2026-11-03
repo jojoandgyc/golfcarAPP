@@ -152,7 +152,8 @@ class DriveNetworkGraceDryRunTest {
 
     private fun assertRecoveryStop(ack: DriveAck) {
         assertTrue(ack.recoveryRequired)
-        assertTrue(ack.stopped)
+        assertTrue(ack.targetStopped)
+        assertTrue(ack.feedback != null)
         assertEquals(0, ack.left)
         assertEquals(0, ack.right)
     }

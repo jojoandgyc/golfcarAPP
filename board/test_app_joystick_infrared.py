@@ -14,12 +14,19 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from test_app_joystick_bridge import FakeClient, ROOT, SCRIPT, bridge
+from test_app_joystick_bridge import FakeClient, FakeClock, ROOT, SCRIPT, bridge
+
+REAL_SLEEP = time.sleep
 
 
 @unittest.skipUnless(os.name == "posix", "IIO sysfs names require POSIX; run this suite under Linux/WSL")
 class AppInfraredTests(unittest.TestCase):
     def setUp(self):
+        self.clock = FakeClock()
+        for replacement in (patch.object(bridge.time, "monotonic", self.clock.monotonic),
+                            patch.object(bridge.time, "sleep", self.clock.sleep)):
+            replacement.start()
+            self.addCleanup(replacement.stop)
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -39,7 +46,10 @@ class AppInfraredTests(unittest.TestCase):
 
     def motors(self):
         client = FakeClient()
-        return bridge.Motors(client, infrared=self.infrared), client
+        motors = bridge.Motors(client, infrared=self.infrared)
+        motors.initialize()
+        client.calls.clear()
+        return motors, client
 
     def emergency_calls(self):
         return [("left", 0), ("right", 0), ("left", "stop", 1), ("right", "stop", 1)]
@@ -101,7 +111,8 @@ class AppInfraredTests(unittest.TestCase):
                 session.accept(self.request(session, 50, -50))
                 request = self.request(session, 0, 0, command)
                 if command == "parking":
-                    request.update(parkingEnabled=True, parkingCurrent=6)
+                    motors.await_standstill()
+                    request.update(parkingEnabled=True)
                 ack, _ = session.accept(request)
                 self.assertFalse(ack["infraredBlocked"])
                 self.assertEqual(ack["infraredDirections"], [])
@@ -185,13 +196,18 @@ class AppInfraredTests(unittest.TestCase):
         for target, blocking_devices in targets:
             for device in (3, 4, 5):
                 with self.subTest(target=target, device=device):
+                    for other in (3, 4, 5):
+                        self.write(other, 1)
                     motors, client = self.motors()
                     self.write(device, 0)
                     accepted = motors.drive(*target)
                     if device in blocking_devices:
                         self.assertEqual(accepted, (0, 0))
                         self.assertEqual(motors.last_target, (0, 0))
-                        self.assertEqual(client.calls, self.emergency_calls())
+                        # Initialization has already emergency-stopped and measured
+                        # both wheels; a blocked request must not write motion.
+                        self.assertEqual(client.calls, [])
+                        self.assertTrue(motors.stopped_confirmed)
                     else:
                         self.assertEqual(accepted, target)
                         self.assertEqual(client.calls, [("left", target[0]), ("right", target[1])])
@@ -298,18 +314,20 @@ class AppInfraredTests(unittest.TestCase):
         self.assertEqual(client.calls, self.emergency_calls())
         self.assertTrue(motors.parking_enabled)
 
-    def test_parking_enable_and_current_adjustment_preserve_ir_latch(self):
+    def test_parking_mode_changes_preserve_ir_latch_and_current_configuration(self):
         for parking_already_enabled in (False, True):
             with self.subTest(parking_already_enabled=parking_already_enabled):
                 motors, client = self.motors()
                 motors.stop()
                 if parking_already_enabled:
-                    motors.set_parking(True, 5)
+                    motors.set_parking(True)
                 motors.drive(50, -50)
                 self.write(3, 0)
                 motors.check_infrared()
                 self.write(3, 1)
-                motors.set_parking(True, 6)
+                motors.await_standstill()
+                motors.set_parking(True)
+                self.assertFalse(any(call[0] == "write" for call in client.calls))
                 client.calls.clear()
                 self.assertEqual(motors.drive(50, -50), (0, 0))
                 self.assertEqual(client.calls, [])
@@ -324,7 +342,7 @@ class AppInfraredTests(unittest.TestCase):
         self.write(3, 0)
         with self.assertRaisesRegex(bridge.SessionError, "not confirmed"):
             motors.check_infrared()
-        self.assertEqual(client.calls, self.emergency_calls())
+        self.assertEqual(client.calls, self.emergency_calls() * 2)
         self.assertIsNone(motors.last_target)
 
     def test_blocked_drive_ack_reports_actual_zero_and_rotates_token(self):
@@ -489,7 +507,7 @@ class AppInfraredTests(unittest.TestCase):
             yield bridge.Motors(infrared=infrared), "fake"
 
         with patch.dict(os.environ, {}, clear=True), \
-                patch.object(sys, "argv", [str(SCRIPT)]), \
+                patch.object(sys, "argv", [str(SCRIPT), "--require-safety-version", "2"]), \
                 patch.object(bridge.signal, "signal"), \
                 patch.object(bridge, "open_hardware", fake_hardware), \
                 patch.object(bridge, "run_session", return_value=0) as session:
@@ -555,14 +573,16 @@ class AppInfraredTests(unittest.TestCase):
 
         self.assertFalse(exchange(40, -40)["stopped"])
         self.write(3, 0)
-        time.sleep(0.08)
+        REAL_SLEEP(0.08)
         self.write(3, 1)
         stopped = exchange(40, -40)
-        self.assertTrue(stopped["stopped"])
+        self.assertTrue(stopped["targetStopped"])
         self.assertEqual((stopped["left"], stopped["right"]), (0, 0))
-        self.assertFalse(exchange(-40, 40)["stopped"])
+        REAL_SLEEP(0.12)
         self.assertTrue(exchange(40, -40)["stopped"])
-        self.assertTrue(exchange(0, 0)["stopped"])
+        self.assertFalse(exchange(-40, 40)["stopped"])
+        self.assertTrue(exchange(40, -40)["targetStopped"])
+        self.assertTrue(exchange(0, 0)["targetStopped"])
         self.assertFalse(exchange(40, -40)["stopped"])
         self.assertTrue(exchange(0, 0, "close")["stopped"])
         process.wait(timeout=3)

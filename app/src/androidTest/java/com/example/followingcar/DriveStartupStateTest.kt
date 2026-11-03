@@ -323,14 +323,14 @@ class DriveStartupStateTest {
         val heldRequest = CompletableDeferred<JSONObject>()
         val isDisconnected: Boolean get() = disconnected
         override fun setCommand(command: String) {
-            check(command == "python3 -u /home/topeet/lianzhan/scripts/app_joystick_bridge.py --dry-run")
+            check(command == driveBridgeCommand(dryRun = true))
         }
         override fun connect(timeout: Int) {
             check(timeout == 5_000)
             connected = true
             val ready = JSONObject().put("type", "ready").put("token", token)
                 .put("dryRun", true).put("port", "synthetic-only").put("watchdogMs", 600).put("maxRpm", 60)
-                .put("parkingSupported", true).put("parkingEnabled", false).put("parkingCurrent", 5)
+                .withDriveSafetyFixture()
             if (networkGrace) ready.put("networkGraceMs", 5_000)
             replies.append(ready)
         }
@@ -367,7 +367,7 @@ class DriveStartupStateTest {
             token = tokenFor(request.getLong("seq") + 1)
             val ack = JSONObject().put("type", "ack").put("seq", request.getLong("seq"))
                 .put("token", token).put("left", 0).put("right", 0).put("stopped", true)
-                .put("parkingEnabled", false).put("parkingCurrent", 5)
+                .withDriveSafetyFixture()
             if (networkGrace) ack.put("recoveryRequired", false)
             replies.append(ack)
         }

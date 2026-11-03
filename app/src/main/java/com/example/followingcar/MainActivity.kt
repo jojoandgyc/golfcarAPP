@@ -49,6 +49,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -69,6 +70,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.followingcar.ui.theme.FollowingCarTheme
+import java.util.Locale
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private lateinit var boardViewModel: BoardViewModel
@@ -594,7 +597,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                 overflow = TextOverflow.Ellipsis)
             if (manualSection == ManualSection.PARKING) {
                 Box(Modifier.fillMaxWidth().weight(1f)) {
-                    ParkingControls(state, viewModel::setParkingEnabled, viewModel::changeParkingCurrent)
+                    ParkingControls(state = state, onEnabledChange = viewModel::setParkingEnabled)
                 }
             } else {
                 Column(Modifier.fillMaxWidth().weight(1f),
@@ -690,42 +693,83 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
 @Composable
 internal fun ParkingControls(
     state: BoardUiState,
+    // Optional monotonic time keeps offline expiry tests deterministic; production uses its clock.
+    nowNanos: Long? = null,
     onEnabledChange: (Boolean) -> Unit,
-    onCurrentChange: (Int) -> Unit,
 ) {
+    var clockTick by remember { mutableLongStateOf(System.nanoTime()) }
+    LaunchedEffect(state.driveEnabled, nowNanos) {
+        if (state.driveEnabled && nowNanos == null) while (true) {
+            clockTick = System.nanoTime()
+            delay(100L)
+        }
+    }
+    // Include the current clock on every ACK recomposition; a new sample must not be
+    // compared against the previous tick and briefly become an apparent clock reversal.
+    val observedNow = nowNanos ?: maxOf(clockTick, System.nanoTime())
     val settings = state.parkingSettings
     val enabled = settings?.enabled == true
-    val current = settings?.currentAmps ?: 5
-    val canConfigure = state.canConfigureParking
+    val canSwitch = state.canEditParkingAt(observedNow) && (enabled || settings?.canEnable == true)
+    val feedbackKnown = state.driveFeedbackVerified && state.driveFeedbackLeftRpm != null &&
+        state.driveFeedbackRightRpm != null
+    val feedbackFresh = state.hasFreshDriveFeedback(observedNow)
+    val feedbackStopped = feedbackKnown && state.driveFeedbackLeftRpm == 0 &&
+        state.driveFeedbackRightRpm == 0
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text("驻车开关", style = MaterialTheme.typography.titleMedium)
+            Text("电子驻车", style = MaterialTheme.typography.titleMedium)
             Switch(
                 checked = enabled,
-                onCheckedChange = onEnabledChange,
-                enabled = canConfigure && (enabled || current > 0),
+                onCheckedChange = { next ->
+                    // Recheck at the click as well as the display tick; expired evidence
+                    // must not dispatch a toggle even in the final frame before disabling.
+                    if (state.canEditParkingAt(nowNanos ?: System.nanoTime()) &&
+                        (enabled || settings?.canEnable == true)) onEnabledChange(next)
+                },
+                enabled = canSwitch,
                 modifier = Modifier.testTag("parkingSwitch").semantics { contentDescription = "驻车开关" }
             )
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(
-                onClick = { onCurrentChange(current - 1) },
-                enabled = canConfigure && current > 0,
-                modifier = Modifier.testTag("parkingDecrease").semantics { contentDescription = "驻车电流减少 1 A" }
-            ) { Text("−") }
-            Text(
-                "驻车电流：${if (settings == null) "—" else current} A",
-                fontWeight = FontWeight.Bold, modifier = Modifier.testTag("parkingCurrent")
-            )
-            OutlinedButton(
-                onClick = { onCurrentChange(current + 1) },
-                enabled = canConfigure && current < 60,
-                modifier = Modifier.testTag("parkingIncrease").semantics { contentDescription = "驻车电流增加 1 A" }
-            ) { Text("＋") }
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("已读取的驻车电流上限", style = MaterialTheme.typography.bodySmall)
+            Row(Modifier.fillMaxWidth().testTag("parkingCurrent"), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("左：${parkingAmps(settings?.leftCurrentAmps)} A", fontWeight = FontWeight.Bold,
+                    modifier = Modifier.testTag("parkingLeftCurrent"))
+                Text("右：${parkingAmps(settings?.rightCurrentAmps)} A", fontWeight = FontWeight.Bold,
+                    modifier = Modifier.testTag("parkingRightCurrent"))
+            }
+            Text("最大输出电流：${parkingAmps(settings?.maxCurrentAmps)} A",
+                style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingMaxCurrent"))
         }
-        Text("范围 0–60 A，每次调整 1 A；设为 0 A 会关闭驻车。", style = MaterialTheme.typography.bodySmall)
-        Text("开启后松手停车时按设定电流锁定车轮，使用摇杆或方向键仍可行驶。停车确认后可修改设置。", style = MaterialTheme.typography.bodySmall)
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(if (state.driveLeft == 0 && state.driveRight == 0 && !feedbackFresh)
+                "目标已回零 · 等待新鲜停车反馈"
+                else "目标转速：左 ${state.driveLeft} / 右 ${state.driveRight} RPM",
+                style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingTargetSpeeds"))
+            Text(when {
+                !feedbackKnown -> "最近轮速反馈：尚无可信读数"
+                !feedbackFresh -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 已过期"
+                !feedbackStopped -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 尚未停稳"
+                !state.driveConfirmedStopped -> "最近轮速反馈已回零，正在复核停车"
+                else -> "最近轮速反馈：左 0 / 右 0 RPM · 已确认停车"
+            }, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingFeedback"))
+        }
+        Text(when {
+            !state.driveEnabled -> "启用手动控制后读取驻车状态。"
+            !state.parkingSupported -> "板端驻车安全接口不可用，暂不能切换。"
+            settings == null -> "尚未读取电机驻车配置，暂不能切换。"
+            !settings.canEnable -> "左右驻车电流须大于 0 且不超过最大输出电流。先停用手动控制，再到电机页读取并调整。"
+            state.parkingUpdating -> "正在确认驻车切换，请稍候；需要停止时可使用下方急停。"
+            !state.canEditParkingAt(observedNow) -> "请松手停车，等待新鲜的实测停车确认及当前操作结束。"
+            else -> "沿用当前电机配置，开关不修改电流参数。调整电流请先停用手动控制，再到电机页操作。"
+        }, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingHint"))
         Text(state.parkingStatus, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("parkingStatus"))
         if (state.parkingUpdating) LinearProgressIndicator(Modifier.fillMaxWidth())
     }
+}
+
+private fun parkingAmps(value: Double?): String = when {
+    value == null -> "—"
+    !value.isFinite() || value !in 0.0..60.0 -> "无效"
+    else -> String.format(Locale.ROOT, "%.2f", value).trimEnd('0').trimEnd('.')
 }

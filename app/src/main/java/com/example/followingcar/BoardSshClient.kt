@@ -285,7 +285,8 @@ class BoardSshClient {
     ): DriveAck {
         check(isConnected) { "尚未连接开发板，请先连接" }
         Diagnostics.event("parking.request", diagnostic,
-            fields = mapOf("enabled" to settings.enabled, "currentAmps" to settings.currentAmps), critical = true)
+            fields = mapOf("enabled" to settings.enabled, "leftCurrentAmps" to settings.leftCurrentAmps,
+                "rightCurrentAmps" to settings.rightCurrentAmps, "parkingCurrentReadOnly" to true), critical = true)
         return channel.configureParking(settings)
     }
 

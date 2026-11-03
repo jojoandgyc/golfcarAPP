@@ -34,7 +34,7 @@ class DriveHeartbeatDryRunTest {
                 val active = client.openDriveChannel(dryRun = true).also { channel = it }
                 assertTrue(active.ready.dryRun)
                 assertEquals(600, active.ready.watchdogMs)
-                assertTrue(active.exchange(0, 0).stopped)
+                assertTrue(awaitSimulatedDriveStop(active).stopped)
                 repeat(40) { index ->
                     val began = System.nanoTime()
                     val targets = if (index % 4 == 0) 0 to 0 else 20 to -20
@@ -45,7 +45,7 @@ class DriveHeartbeatDryRunTest {
                     val wait = driveHeartbeatWaitMs(began)
                     if (wait > 0) delay(wait)
                 }
-                assertTrue(active.exchange(0, 0).stopped)
+                assertTrue(awaitSimulatedDriveStop(active).stopped)
                 val hardExpiryMs = (active.ready.networkGraceMs ?: active.ready.watchdogMs).toLong()
                 delay(hardExpiryMs + 500L)
                 assertFalse("The negotiated hard deadline must close even a stopped simulation", active.isOpen)

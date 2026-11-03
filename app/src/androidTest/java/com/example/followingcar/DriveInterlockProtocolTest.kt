@@ -62,7 +62,7 @@ class DriveInterlockProtocolTest {
         assertTrue(engine.snapshot().failures.isEmpty())
     }
 
-    @Test fun legacyReadyAndAckRemainSupportedWithExactTargets() = runBlocking {
+    @Test fun versionTwoWithoutInfraredKeepsExactTargetValidation() = runBlocking {
         val control = open(ready(capability = null), ack(left = 40, right = -40,
             blocked = null, directions = null))
         assertFalse(control.ready.infraredSupported)
@@ -71,7 +71,7 @@ class DriveInterlockProtocolTest {
         assertTrue(control.isOpen)
     }
 
-    @Test fun legacyBoardCannotAuthorizeAChangedTargetWithInfraredFields() = runBlocking {
+    @Test fun unnegotiatedInfraredCannotAuthorizeAChangedTarget() = runBlocking {
         val control = open(ready(capability = null), ack())
         assertTrue(runCatching { control.exchange(40, -40) }.exceptionOrNull() is IOException)
         assertFalse(control.isOpen)
@@ -170,7 +170,7 @@ class DriveInterlockProtocolTest {
         .put("maxRpm", 100).put("watchdogMs", 600).put("parkingSupported", false).apply {
             if (capability != null) put("infraredSupported", capability)
             if (runId != null) put("runId", runId)
-        }
+        }.withDriveSafetyFixture()
 
     private fun ack(seq: Int = 1, left: Int = 0, right: Int = 0, blocked: Any? = true,
         directions: Any? = JSONArray().put("forward")) = JSONObject().put("type", "ack")
@@ -178,7 +178,7 @@ class DriveInterlockProtocolTest {
         .put("right", right).put("stopped", left == 0 && right == 0).apply {
             if (blocked != null) put("infraredBlocked", blocked)
             if (directions != null) put("infraredDirections", directions)
-        }
+        }.withDriveSafetyFixture()
 
     private class MemoryChannel(response: String) : ChannelExec() {
         private val input = ByteArrayInputStream(response.toByteArray())

@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 import threading
+from collections import deque
 from tempfile import TemporaryDirectory
 
 import app_joystick_bridge as bridge
@@ -18,13 +19,31 @@ SCRIPT = Path(__file__).with_name("app_joystick_bridge.py")
 ROOT = SCRIPT.parent.parent
 
 
+class FakeClock:
+    def __init__(self, now=10.0):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        if seconds < 0:
+            raise AssertionError("negative simulated sleep")
+        self.now += seconds
+
+
 class FakeClient:
     def __init__(self, fail_left=False):
         self.calls = []
         self.fail_left = fail_left
-        self.registers = {"right_parking_current": 9, "left_parking_current": 9}
+        self.registers = {"right_parking_current": 5.0, "left_parking_current": 5.0,
+                          "max_output_current": 60.0}
         self.fail_writes = set()
         self.readback = {}
+        self.feedback = (0, 0, 0, 0)  # left RPM, right RPM, left error, right error
+        self.feedback_samples = deque()
+        self.feedback_reads = []
+        self.feedback_failure = None
 
     def set_left_speed(self, rpm):
         self.calls.append(("left", rpm))
@@ -47,68 +66,101 @@ class FakeClient:
 
     def read_register(self, register):
         self.calls.append(("read", register))
-        return self.readback.get(register, self.registers[register])
+        value = self.readback.get(register, self.registers[register])
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def read_holding_registers(self, address, count):
+        self.feedback_reads.append((address, count, time.monotonic()))
+        if (address, count) != (0x0009, 13):
+            raise AssertionError("Feedback must read both signed speeds and both errors together")
+        if self.feedback_failure:
+            raise self.feedback_failure
+        value = self.feedback_samples.popleft() if self.feedback_samples else self.feedback
+        if isinstance(value, Exception):
+            raise value
+        if isinstance(value, list):
+            return value  # Explicit malformed frame fixture.
+        left, right, left_error, right_error = value
+        words = [0] * 13
+        words[0:2] = [(right >> 16) & 65535, right & 65535]
+        words[2] = right_error
+        words[10:12] = [(left >> 16) & 65535, left & 65535]
+        words[12] = left_error
+        return words
 
 
-def parking_calls(current):
-    return [("write", "right_parking_current", current, True),
-            ("write", "left_parking_current", current, True),
-            ("read", "right_parking_current"), ("read", "left_parking_current")]
-
-
-def parking_request(session, enabled=True, current=5, **extra):
+def parking_request(session, enabled=True, **extra):
     return {"seq": session.next_seq, "token": session.token, "cmd": "parking",
-            "left": 0, "right": 0, "parkingEnabled": enabled,
-            "parkingCurrent": current, **extra}
+            "left": 0, "right": 0, "parkingEnabled": enabled, **extra}
 
 
 class BridgeTests(unittest.TestCase):
     def setUp(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        environment = patch.dict(os.environ, {"APP_DRIVE_DIAGNOSTIC_TEST_DIR": temporary.name})
-        environment.start()
-        self.addCleanup(environment.stop)
+        for replacement in (
+            patch.dict(os.environ, {"APP_DRIVE_DIAGNOSTIC_TEST_DIR": temporary.name}),
+        ):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+        self.clock = FakeClock()
+        for replacement in (patch.object(bridge.time, "monotonic", self.clock.monotonic),
+                            patch.object(bridge.time, "sleep", self.clock.sleep)):
+            replacement.start()
+            self.addCleanup(replacement.stop)
 
-    def test_ready_clears_existing_currents_and_reports_default_setting(self):
+    def hardware_session(self):
         client = FakeClient()
         session = ProtocolSession(Motors(client), port="fake", dry_run=False)
         ready = session.ready()
-        self.assertEqual(client.calls[-4:], parking_calls(0))
+        return client, session, ready
+
+    def assert_no_configuration_writes(self, client):
+        self.assertFalse(any(call[0] == "write" for call in client.calls))
+        self.assertEqual(client.registers, {"right_parking_current": 5.0,
+            "left_parking_current": 5.0, "max_output_current": 60.0})
+
+    def test_ready_preserves_existing_currents_and_reports_measured_stop(self):
+        client, _session, ready = self.hardware_session()
         self.assertTrue(ready["parkingSupported"])
         self.assertFalse(ready["parkingEnabled"])
-        self.assertEqual(ready["parkingCurrent"], 5)
+        self.assertTrue(ready["parkingCurrentReadOnly"])
+        self.assertEqual(ready["parkingLeftCurrentAmps"], 5.0)
+        self.assertEqual(ready["parkingRightCurrentAmps"], 5.0)
         self.assertEqual(ready["watchdogMs"], 600)
         self.assertEqual(ready["networkGraceMs"], 5000)
+        self.assertEqual(ready["safetyVersion"], 2)
+        self.assertTrue(ready["stopped"])
+        self.assert_no_configuration_writes(client)
 
     def test_network_pause_preserves_settings_and_ir_until_neutral(self):
         for neutral in ("stop", "drive"):
             with self.subTest(neutral=neutral):
-                client = FakeClient()
-                motors = Motors(client)
-                session = ProtocolSession(motors, port="fake", dry_run=False)
-                session.ready()
-                session.accept(parking_request(session, current=6))
+                client, session, _ = self.hardware_session()
+                motors = session.motors
+                session.accept(parking_request(session))
                 motors.drive(30, -30)
                 motors.ir_latched_directions.add("forward")
                 client.calls.clear()
                 session.pause_for_network()
-                self.assertEqual(client.calls, [("left", 0), ("right", 0),
-                    ("left", "stop", 1), ("right", "stop", 1)])
+                self.assertIn(("left", "stop", 1), client.calls)
+                self.assertIn(("right", "stop", 1), client.calls)
                 self.assertTrue(motors.parking_enabled)
-                self.assertEqual(motors.parking_current, 6)
-                self.assertEqual(set(client.registers.values()), {6})
                 self.assertEqual(motors.ir_latched_directions, {"forward"})
                 self.assertEqual(motors.requested_target, (30, -30))
                 client.calls.clear()
                 for _ in range(3):
+                    self.clock.sleep(.11)
                     ack, closing = session.accept({"seq": session.next_seq, "token": session.token,
                         "cmd": "drive", "left": 50, "right": -50})
                     self.assertFalse(closing)
                     self.assertTrue(ack["recoveryRequired"])
-                    self.assertTrue(ack["stopped"])
+                    self.assertTrue(ack["targetStopped"])
                     self.assertEqual((ack["left"], ack["right"]), (0, 0))
-                self.assertEqual(client.calls, [])
+                self.assertNotIn(("left", 50), client.calls)
+                self.assertNotIn(("right", -50), client.calls)
                 self.assertEqual(motors.ir_latched_directions, {"forward"})
                 ack, _ = session.accept({"seq": session.next_seq, "token": session.token,
                     "cmd": neutral, "left": 0, "right": 0})
@@ -116,17 +168,17 @@ class BridgeTests(unittest.TestCase):
                 self.assertFalse(session.recovery_required)
                 self.assertEqual(motors.requested_target, (0, 0))
                 self.assertEqual(motors.ir_latched_directions, set())
-                self.assertEqual(client.calls, [("left", 0), ("right", 0),
-                    ("left", "stop", 0), ("right", "stop", 0)])
-                self.assertTrue(motors.parking_enabled)
-                self.assertEqual(motors.parking_current, 6)
-                self.assertEqual(set(client.registers.values()), {6})
+                self.assertIn(("left", "stop", 0), client.calls)
+                self.assertIn(("right", "stop", 0), client.calls)
+                self.assert_no_configuration_writes(client)
                 client.calls.clear()
                 ack, _ = session.accept({"seq": session.next_seq, "token": session.token,
                     "cmd": "drive", "left": 20, "right": -20})
                 self.assertFalse(ack["recoveryRequired"])
+                self.assertFalse(ack["targetStopped"])
                 self.assertFalse(ack["stopped"])
-                self.assertEqual(client.calls, [("left", 20), ("right", -20)])
+                self.assertIn(("left", 20), client.calls)
+                self.assertIn(("right", -20), client.calls)
 
     def test_recovery_still_validates_sequence_and_token_before_neutral(self):
         session = ProtocolSession(Motors(), port="fake", dry_run=True)
@@ -140,235 +192,174 @@ class BridgeTests(unittest.TestCase):
                 self.assertTrue(session.recovery_required)
                 self.assertEqual(session.next_seq, 1)
 
-    def test_parking_engages_normal_stop_and_release_keeps_parking(self):
-        client = FakeClient()
-        session = ProtocolSession(Motors(client), port="fake", dry_run=False)
-        session.ready()
+    def test_parking_engages_normal_stop_and_neutral_keeps_saved_configuration(self):
+        client, session, _ = self.hardware_session()
         client.calls.clear()
-        ack, closing = session.accept(parking_request(session, current=6))
+        ack, closing = session.accept(parking_request(session))
         self.assertTrue(ack["parkingEnabled"])
-        self.assertEqual(ack["parkingCurrent"], 6)
         self.assertFalse(closing)
-        self.assertEqual(client.calls[:4], parking_calls(6))
-        self.assertEqual(client.calls[-2:], [("left", "stop", 0), ("right", "stop", 0)])
+        self.assertIn(("left", "stop", 0), client.calls)
+        self.assertIn(("right", "stop", 0), client.calls)
         session.accept({"seq": 2, "token": ack["token"], "cmd": "drive", "left": 30, "right": -30})
         ack, _ = session.accept({"seq": 3, "token": session.token, "cmd": "stop", "left": 0, "right": 0})
         self.assertTrue(ack["parkingEnabled"])
-        self.assertEqual(client.calls[-2:], [("left", "stop", 0), ("right", "stop", 0)])
+        self.assertTrue(ack["targetStopped"])
+        self.assert_no_configuration_writes(client)
 
-    def test_parking_off_adjustment_and_repeated_heartbeats_do_not_write_settings(self):
-        client = FakeClient()
-        motors = Motors(client)
-        session = ProtocolSession(motors, port="fake", dry_run=False)
-        session.ready()
+    def test_parking_off_reissues_emergency_instead_of_only_changing_a_cache(self):
+        client, session, _ = self.hardware_session()
+        session.accept(parking_request(session))
         client.calls.clear()
-        session.accept(parking_request(session, enabled=False, current=60))
-        self.assertEqual(client.calls, [])
-        session.accept(parking_request(session, current=60))
-        client.calls.clear()
-        session.accept(parking_request(session, current=60))
-        session.accept({"seq": session.next_seq, "token": session.token, "cmd": "stop", "left": 0, "right": 0})
-        self.assertEqual(client.calls, [])
-        ack, _ = session.accept(parking_request(session, enabled=False, current=0))
-        self.assertEqual(client.calls, parking_calls(0))
+        ack, _ = session.accept(parking_request(session, enabled=False))
         self.assertFalse(ack["parkingEnabled"])
-        motors.drive(10, -10)
-        motors.stop()
-        self.assertEqual(client.calls[-2:], [("left", "stop", 1), ("right", "stop", 1)])
+        self.assertTrue(ack["stopped"])
+        self.assertIn(("left", "stop", 1), client.calls)
+        self.assertIn(("right", "stop", 1), client.calls)
+        self.assert_no_configuration_writes(client)
 
-    def test_parking_rejects_motion_and_invalid_parameters_without_writes(self):
-        client = FakeClient()
-        session = ProtocolSession(Motors(client), port="fake", dry_run=False)
-        session.ready()
+    def test_parking_rejects_motion_and_invalid_boolean_without_parameter_writes(self):
+        client, session, _ = self.hardware_session()
         client.calls.clear()
-        for enabled, current in [(1, 5), ("true", 5), (True, 0), (False, -1),
-                                 (True, 61), (True, True), (True, 1.5), (True, "5")]:
-            with self.subTest(enabled=enabled, current=current), self.assertRaises(SessionError):
-                session.accept(parking_request(session, enabled, current))
+        for enabled in (1, "true", None, 0):
+            with self.subTest(enabled=enabled), self.assertRaises(SessionError):
+                session.accept(parking_request(session, enabled))
         with self.assertRaisesRegex(SessionError, "zero"):
             session.accept(parking_request(session, left=1))
         self.assertEqual(client.calls, [])
         session.motors.drive(10, -10)
         client.calls.clear()
-        with self.assertRaisesRegex(SessionError, "stopped"):
+        with self.assertRaises(SessionError):
             session.accept(parking_request(session))
         self.assertEqual(client.calls, [])
 
-    def test_parking_json_requires_exact_command_specific_fields(self):
+    def test_parking_json_rejects_legacy_current_mutation_and_duplicate_fields(self):
         session = ProtocolSession(Motors(), port="fake", dry_run=True)
         request = parking_request(session)
         self.assertEqual(strict_message(json.dumps(request).encode()), request)
-        invalid = [dict(request, extra=1), {key: value for key, value in request.items() if key != "parkingCurrent"},
+        invalid = [dict(request, extra=1), dict(request, parkingCurrent=5),
+                   {key: value for key, value in request.items() if key != "parkingEnabled"},
                    dict(request, cmd="stop"), dict(request, cmd="drive")]
         for payload in invalid:
             with self.subTest(payload=payload), self.assertRaises(SessionError):
                 strict_message(json.dumps(payload).encode())
         with self.assertRaises(SessionError):
             strict_message(b'{"seq":1,"token":"x","cmd":"parking","left":0,"right":0,'
-                           b'"parkingEnabled":true,"parkingEnabled":false,"parkingCurrent":5}')
+                           b'"parkingEnabled":true,"parkingEnabled":false}')
 
-    def test_parking_write_failure_attempts_both_sides_without_confirming(self):
-        client = FakeClient()
-        session = ProtocolSession(Motors(client), port="fake", dry_run=False)
-        session.ready()
+    def test_parking_stop_write_failure_attempts_both_sides_without_success_ack(self):
+        client, session, _ = self.hardware_session()
         client.calls.clear()
-        client.fail_writes.add("right_parking_current")
-        with self.assertRaisesRegex(SessionError, "not confirmed"):
+        client.fail_left = True
+        with self.assertRaises(SessionError):
             session.accept(parking_request(session))
-        self.assertEqual(client.calls, parking_calls(5))
-        self.assertFalse(session.motors.parking_enabled)
+        self.assertIn(("right", "stop", 0), client.calls)
+        self.assertIn(("right", "stop", 1), client.calls)
+        self.assertFalse(session.motors.stopped_confirmed)
         self.assertEqual(session.next_seq, 1)
+        self.assert_no_configuration_writes(client)
 
-    def test_parking_readback_mismatch_and_nonfinite_values_are_not_confirmed(self):
-        for actual in (4, float("nan"), float("inf")):
-            with self.subTest(actual=actual):
-                client = FakeClient()
-                session = ProtocolSession(Motors(client), port="fake", dry_run=False)
-                session.ready()
-                client.calls.clear()
-                client.readback["right_parking_current"] = actual
-                with self.assertRaisesRegex(SessionError, "readback mismatch"):
-                    session.accept(parking_request(session))
-                self.assertEqual(client.calls, parking_calls(5))
-                self.assertFalse(session.motors.parking_enabled)
-
-    def test_terminal_commands_emergency_stop_and_clear_parking_before_ack(self):
+    def test_terminal_commands_emergency_stop_and_preserve_configuration_before_ack(self):
         for command in ("estop", "close"):
             with self.subTest(command=command):
-                client = FakeClient()
-                session = ProtocolSession(Motors(client), port="fake", dry_run=False)
-                session.ready()
+                client, session, _ = self.hardware_session()
                 session.accept(parking_request(session))
                 client.calls.clear()
                 ack, closing = session.accept({"seq": session.next_seq, "token": session.token,
                                                "cmd": command, "left": 0, "right": 0})
-                self.assertEqual(client.calls[:4], [("left", 0), ("right", 0),
-                                                    ("left", "stop", 1), ("right", "stop", 1)])
-                self.assertEqual(client.calls[-4:], parking_calls(0))
+                self.assertIn(("left", "stop", 1), client.calls)
+                self.assertIn(("right", "stop", 1), client.calls)
                 self.assertFalse(ack["parkingEnabled"])
-                self.assertEqual(ack["parkingCurrent"], 5)
+                self.assertTrue(ack["stopped"])
                 self.assertTrue(closing)
+                self.assert_no_configuration_writes(client)
 
-    def test_terminal_session_clears_once_even_when_ack_output_fails(self):
+    def test_terminal_session_stops_once_even_when_ack_output_fails(self):
         for command in ("estop", "close"):
             for fail_output in (False, True):
                 with self.subTest(command=command, fail_output=fail_output):
-                    client = FakeClient()
-                    messages = []
-
+                    client, messages = FakeClient(), []
                     class Output:
-                        def __init__(self, _fd):
-                            pass
-
+                        def __init__(self, _fd): pass
                         def send(self, message):
                             messages.append(message)
-                            if message["type"] == "ready":
-                                client.calls.clear()  # Count only terminal cleanup.
+                            if message["type"] == "ready": client.calls.clear()
                             elif message["type"] == "ack" and fail_output:
                                 raise BlockingIOError("SSH reader stalled")
-
                     class Input:
-                        def __init__(self, _fd):
-                            pass
-
+                        def __init__(self, _fd): pass
                         def line(self, _deadline, _stopped):
                             return json.dumps({"seq": 1, "token": messages[0]["token"],
                                                "cmd": command, "left": 0, "right": 0}).encode()
-
                     with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input):
                         result = bridge.run_session(Motors(client), "fake", False, threading.Event())
                     self.assertEqual(result, int(fail_output))
-                    self.assertEqual(client.calls, [("left", 0), ("right", 0),
-                                                    ("left", "stop", 1), ("right", "stop", 1)] + parking_calls(0))
+                    self.assertEqual(client.calls.count(("left", "stop", 1)), 1)
+                    self.assertEqual(client.calls.count(("right", "stop", 1)), 1)
+                    self.assert_no_configuration_writes(client)
 
-    def test_shutdown_attempts_stop_and_clear_despite_both_failures(self):
+    def test_shutdown_attempts_both_stops_despite_left_failure_without_writing_settings(self):
         client = FakeClient(fail_left=True)
-        client.fail_writes.add("right_parking_current")
-        with self.assertRaises(SessionError):
-            Motors(client).shutdown()
-        self.assertEqual(client.calls[:4], [("left", 0), ("right", 0),
-                                            ("left", "stop", 1), ("right", "stop", 1)])
-        self.assertEqual(client.calls[-4:], parking_calls(0))
+        with self.assertRaises(SessionError): Motors(client).shutdown()
+        self.assertIn(("left", "stop", 1), client.calls)
+        self.assertIn(("right", "stop", 1), client.calls)
+        self.assert_no_configuration_writes(client)
 
-    def test_session_readback_failure_never_acks_and_still_stops_and_clears(self):
-        client = FakeClient()
-        messages = []
-
+    def test_feedback_failure_during_parking_never_acks_and_cleanup_preserves_settings(self):
+        client, messages = FakeClient(), []
         class Output:
-            def __init__(self, _fd):
-                pass
-
-            def send(self, message):
-                messages.append(message)
-
+            def __init__(self, _fd): pass
+            def send(self, message): messages.append(message)
         class Input:
-            def __init__(self, _fd):
-                pass
-
+            def __init__(self, _fd): pass
             def line(self, _deadline, _stopped):
-                client.readback["right_parking_current"] = 4
+                client.feedback_failure = TimeoutError("feedback unavailable")
                 return json.dumps({"seq": 1, "token": messages[0]["token"], "cmd": "parking",
-                                   "left": 0, "right": 0, "parkingEnabled": True,
-                                   "parkingCurrent": 5}).encode()
-
+                                   "left": 0, "right": 0, "parkingEnabled": True}).encode()
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input):
             self.assertEqual(bridge.run_session(Motors(client), "fake", False, threading.Event()), 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "error"])
-        self.assertIn("readback mismatch", messages[-1]["error"])
-        self.assertEqual(client.calls[-8:-4], [("left", 0), ("right", 0),
-                                             ("left", "stop", 1), ("right", "stop", 1)])
-        self.assertEqual(client.calls[-4:], parking_calls(0))
+        self.assertIn(("left", "stop", 1), client.calls)
+        self.assertIn(("right", "stop", 1), client.calls)
+        self.assert_no_configuration_writes(client)
 
-    def test_eof_after_parking_enable_emergency_stops_and_clears(self):
-        client = FakeClient()
+    def test_eof_after_parking_emergency_stops_without_clearing_saved_currents(self):
+        client, messages = FakeClient(), []
         motors = Motors(client)
-        messages = []
-
         class Output:
-            def __init__(self, _fd):
-                pass
-
-            def send(self, message):
-                messages.append(message)
-
+            def __init__(self, _fd): pass
+            def send(self, message): messages.append(message)
         class Input:
-            def __init__(self, _fd):
-                self.requested = False
-
+            def __init__(self, _fd): self.requested = False
             def line(self, _deadline, _stopped):
-                if self.requested:
-                    raise SessionError("Control input closed")
+                if self.requested: raise SessionError("Control input closed")
                 self.requested = True
                 return json.dumps({"seq": 1, "token": messages[0]["token"], "cmd": "parking",
-                                   "left": 0, "right": 0, "parkingEnabled": True,
-                                   "parkingCurrent": 5}).encode()
-
+                                   "left": 0, "right": 0, "parkingEnabled": True}).encode()
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input):
             self.assertEqual(bridge.run_session(motors, "fake", False, threading.Event()), 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "ack", "error"])
         self.assertTrue(messages[1]["parkingEnabled"])
         self.assertFalse(motors.parking_enabled)
-        self.assertEqual(client.calls[-8:-4], [("left", 0), ("right", 0),
-                                             ("left", "stop", 1), ("right", "stop", 1)])
-        self.assertEqual(client.calls[-4:], parking_calls(0))
+        self.assertIn(("left", "stop", 1), client.calls)
+        self.assertIn(("right", "stop", 1), client.calls)
+        self.assert_no_configuration_writes(client)
 
     def test_stop_attempts_zero_and_emergency_on_both_sides_after_failure(self):
         client = FakeClient(fail_left=True)
-        with self.assertRaises(SessionError):
-            Motors(client).stop(force=True)
-        self.assertEqual(client.calls, [("left", 0), ("right", 0), ("left", "stop", 1), ("right", "stop", 1)])
+        with self.assertRaises(SessionError): Motors(client).stop(force=True)
+        for call in (("left", 0), ("right", 0), ("left", "stop", 1), ("right", "stop", 1)):
+            self.assertIn(call, client.calls)
 
-    def test_repeated_targets_do_not_repeat_serial_transactions(self):
-        client = FakeClient()
-        motors = Motors(client)
-        motors.stop(force=True)
-        motors.stop()
-        self.assertEqual(len(client.calls), 4)
+    def test_repeated_movement_targets_do_not_repeat_motor_writes(self):
+        client, session, _ = self.hardware_session()
+        motors = session.motors
+        client.calls.clear()
         motors.drive(50, -50)
         motors.drive(50, -50)
-        self.assertEqual(len(client.calls), 6)
+        self.assertEqual(client.calls, [("left", 50), ("right", -50)])
         motors.stop()
-        self.assertEqual(len(client.calls), 10)
+        self.assertEqual(client.calls[-4:], [("left", 0), ("right", 0),
+                                            ("left", "stop", 1), ("right", "stop", 1)])
 
     def test_nonce_rotation_rejects_a_queued_or_replayed_command(self):
         session = ProtocolSession(Motors(), port="fake", dry_run=True)
@@ -378,52 +369,55 @@ class BridgeTests(unittest.TestCase):
         self.assertNotEqual(ack["token"], ready["token"])
         self.assertFalse(closing)
         request["seq"] = 2
-        with self.assertRaisesRegex(SessionError, "token"):
-            session.accept(request)
+        with self.assertRaisesRegex(SessionError, "token"): session.accept(request)
 
     def test_json_rejects_duplicate_fields_boolean_rpm_and_overspeed(self):
         with self.assertRaises(SessionError):
             strict_message(b'{"seq":1,"seq":1,"token":"x","cmd":"stop","left":0,"right":0}')
-        with self.assertRaises(SessionError):
-            strict_message(b'x' * 513)
+        with self.assertRaises(SessionError): strict_message(b'x' * 513)
         for left in (True, 101, -101, 1.5, "10"):
             session = ProtocolSession(Motors(), port="fake", dry_run=True)
             with self.assertRaises(SessionError):
                 session.accept({"seq": 1, "token": session.token, "cmd": "drive", "left": left, "right": 0})
 
     def test_output_failure_after_motion_still_attempts_both_stops(self):
-        client = FakeClient()
-        messages = []
-
+        client, messages = FakeClient(), []
         class Output:
-            def __init__(self, _fd):
-                pass
-
+            def __init__(self, _fd): pass
             def send(self, value):
                 messages.append(value)
-                if value["type"] == "ack":
-                    raise BlockingIOError("SSH reader stalled")
-
+                if value["type"] == "ack": raise BlockingIOError("SSH reader stalled")
         class Input:
-            def __init__(self, _fd):
-                pass
-
+            def __init__(self, _fd): pass
             def line(self, _deadline, _stopped):
                 return json.dumps({"seq": 1, "token": messages[0]["token"],
                                    "cmd": "drive", "left": 50, "right": -50}).encode()
-
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input):
             self.assertEqual(bridge.run_session(Motors(client), "fake", True, threading.Event()), 1)
-        self.assertEqual(client.calls[-8:-4], [("left", 0), ("right", 0),
-                                            ("left", "stop", 1), ("right", "stop", 1)])
-        self.assertEqual(client.calls[-4:], parking_calls(0))
-        self.assertIn(("left", 50), client.calls)
-        self.assertIn(("right", -50), client.calls)
+        for call in (("left", 50), ("right", -50), ("left", "stop", 1), ("right", "stop", 1)):
+            self.assertIn(call, client.calls)
+        self.assert_no_configuration_writes(client)
+
+
+class BridgeProtocolTests(unittest.TestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        environment = patch.dict(os.environ, {"APP_DRIVE_DIAGNOSTIC_TEST_DIR": temporary.name})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def start(self):
         process = subprocess.Popen([sys.executable, str(SCRIPT), "--dry-run"], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.addCleanup(lambda: process.poll() is None and process.kill())
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if not stream.closed:
+                    stream.close()
+        self.addCleanup(cleanup)
         ready = json.loads(process.stdout.readline())
         self.assertEqual(ready["type"], "ready")
         self.assertTrue(ready["dryRun"])
@@ -503,11 +497,12 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(error["type"], "error")
         self.finish(process)
 
-    def test_stop_ack_and_close_are_confirmed(self):
+    def test_stop_target_ack_does_not_forge_standstill_and_close_waits_for_it(self):
         process, ready = self.start()
         drive = self.exchange(process, ready)
         stop = self.exchange(process, drive, seq=2, cmd="stop", left=0, right=0)
-        self.assertTrue(stop["stopped"])
+        self.assertTrue(stop["targetStopped"])
+        self.assertFalse(stop["stopped"])
         close = self.exchange(process, stop, seq=3, cmd="close", left=0, right=0)
         self.assertTrue(close["stopped"])
         self.finish(process)
@@ -528,23 +523,23 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("watchdog", error["error"])
         self.finish(process)
 
-    def test_dry_run_parking_roundtrip_and_terminal_clear(self):
+    def test_dry_run_parking_roundtrip_and_terminal_preserves_configuration(self):
         process, ready = self.start()
         self.assertTrue(ready["parkingSupported"])
-        self.assertEqual(ready["parkingCurrent"], 5)
+        self.assertEqual(ready["parkingLeftCurrentAmps"], 5.0)
         self.assertFalse(ready["parkingEnabled"])
         parking = self.exchange(process, ready, cmd="parking", left=0, right=0,
-                                parkingEnabled=True, parkingCurrent=6)
+                                parkingEnabled=True)
         self.assertEqual(parking["type"], "ack")
         self.assertTrue(parking["parkingEnabled"])
-        self.assertEqual(parking["parkingCurrent"], 6)
+        self.assertEqual(parking["parkingLeftCurrentAmps"], 5.0)
         drive = self.exchange(process, parking, seq=2)
         self.assertTrue(drive["parkingEnabled"])
         stop = self.exchange(process, drive, seq=3, cmd="stop", left=0, right=0)
         self.assertTrue(stop["parkingEnabled"])
         close = self.exchange(process, stop, seq=4, cmd="close", left=0, right=0)
         self.assertFalse(close["parkingEnabled"])
-        self.assertEqual(close["parkingCurrent"], 6)
+        self.assertEqual(close["parkingLeftCurrentAmps"], 5.0)
         self.finish(process)
         self.assertEqual(process.returncode, 0)
 
@@ -553,8 +548,8 @@ class BridgeTests(unittest.TestCase):
         messages, deadlines = [], []
 
         class TimedMotors(Motors):
-            def set_parking(self, enabled, current):
-                super().set_parking(enabled, current)
+            def set_parking(self, enabled):
+                super().set_parking(enabled)
                 clock[0] += duration
 
             def drive(self, left, right):
@@ -580,7 +575,7 @@ class BridgeTests(unittest.TestCase):
                 request = {"seq": self.seq, "token": messages[-1]["token"], "cmd": cmd,
                            "left": 10 if cmd == "drive" else 0, "right": 0}
                 if cmd == "parking":
-                    request.update(parkingEnabled=True, parkingCurrent=5)
+                    request.update(parkingEnabled=True)
                 return json.dumps(request).encode()
 
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input), \
@@ -608,14 +603,15 @@ class BridgeTests(unittest.TestCase):
         """Drive the real session with fake serial, a virtual clock and scripted input."""
         clock = [0.0]
         messages, deadlines, events = [], [], []
+        epoch = [0.0]
         client = FakeClient()
         remaining = iter(actions)
 
         class TimedMotors(Motors):
             polls = 0
 
-            def set_parking(self, enabled, current):
-                super().set_parking(enabled, current)
+            def set_parking(self, enabled):
+                super().set_parking(enabled)
                 clock[0] += parking_seconds
 
             def check_infrared(self):
@@ -626,7 +622,10 @@ class BridgeTests(unittest.TestCase):
 
         class Diagnostic:
             def event(self, name, **fields):
-                events.append(dict(event=name, clock=clock[0], **fields))
+                normalized = {key: value - epoch[0] * 1000
+                              if key.endswith("MonotonicMs") and isinstance(value, (int, float)) else value
+                              for key, value in fields.items()}
+                events.append(dict(event=name, clock=clock[0] - epoch[0], **normalized))
 
             def failure(self, name, error, **fields):
                 self.event(name, error=str(error), **fields)
@@ -641,6 +640,8 @@ class BridgeTests(unittest.TestCase):
             def send(self, message):
                 if fail_ack is not None and message.get("seq") == fail_ack:
                     raise BlockingIOError("SSH output blocked")
+                if message.get("type") == "ready":
+                    epoch[0] = clock[0]
                 messages.append(message)
 
         class Input:
@@ -648,16 +649,22 @@ class BridgeTests(unittest.TestCase):
                 self.seq = 0
 
             def line(self, deadline, _stopped):
-                deadlines.append(deadline)
+                deadlines.append(deadline - epoch[0])
                 action = next(remaining)
-                if action == "deadline":
-                    clock[0] = deadline
+                destination = deadline if action == "deadline" else epoch[0] + action[0]
+                # The production InputPump polls safety every 20 ms while idle.
+                # Advance that same cadence so two physical feedback samples can
+                # confirm standstill during network grace, without real sleeps.
+                while clock[0] + .02 < destination:
+                    clock[0] += .02
                     self.poll()
+                clock[0] = destination
+                self.poll()
+                if action == "deadline":
                     if fail_soft_stop:
                         client.fail_left = True
                     raise bridge.MotionLeaseExpired("Control watchdog expired")
-                clock[0], command, *targets = action
-                self.poll()
+                elapsed, command, *targets = action
                 if isinstance(command, Exception):
                     raise command
                 if command == "malformed":
@@ -667,34 +674,43 @@ class BridgeTests(unittest.TestCase):
                 request = {"seq": self.seq, "token": messages[-1]["token"],
                            "cmd": command, "left": left, "right": right}
                 if command == "parking":
-                    request.update(parkingEnabled=True, parkingCurrent=6)
+                    request.update(parkingEnabled=True)
                 return json.dumps(request).encode()
 
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input), \
-                patch.object(bridge.time, "monotonic", lambda: clock[0]):
+                patch.object(bridge.time, "monotonic", lambda: clock[0]), \
+                patch.object(bridge.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
             result = bridge.run_session(motors, "fake", True, threading.Event(), diagnostic=Diagnostic())
-        return result, messages, deadlines, events, clock[0], motors, client
+        terminal = next((event["clock"] for event in events if event["event"] == "drive.failure"),
+                        clock[0] - epoch[0])
+        return result, messages, deadlines, events, terminal, motors, client
+
+    def assert_deadlines(self, actual, expected):
+        self.assertEqual(len(actual), len(expected))
+        for left, right in zip(actual, expected):
+            self.assertAlmostEqual(left, right)
 
     def test_suppressed_held_targets_do_not_extend_grace_or_repeat_motor_writes(self):
         result, messages, deadlines, events, elapsed, motors, client = self.run_scripted_grace([
             (0.1, "drive"), "deadline", (1.2, "drive"), (4.9, "drive"), "deadline"])
         self.assertEqual(result, 1)
-        self.assertEqual(deadlines, [0.6, 0.7, 5.1, 5.1, 5.1])
-        self.assertEqual(elapsed, 5.1)
+        self.assert_deadlines(deadlines, [0.6, 0.7, 5.1, 5.1, 5.1])
+        self.assertAlmostEqual(elapsed, 5.1)
         acks = [message for message in messages if message["type"] == "ack"]
         self.assertEqual([ack["recoveryRequired"] for ack in acks], [False, True, True])
         self.assertEqual([ack["stopped"] for ack in acks], [False, True, True])
-        # Initial/terminal cleanup are unchanged; between them there is only the
-        # original movement and one emergency stop, despite repeated held targets.
-        self.assertEqual(client.calls[8:-8], [("left", 30), ("right", -30),
-            ("left", 0), ("right", 0), ("left", "stop", 1), ("right", "stop", 1)])
+        # Stop refreshes may repeat; the suppressed held targets must never reach a motor.
+        self.assertEqual(client.calls.count(("left", 30)), 1)
+        self.assertEqual(client.calls.count(("right", -30)), 1)
+        self.assertFalse(any(call[0] == "write" for call in client.calls))
         paused = [row for row in events if row["event"] == "drive.network_paused"]
         self.assertEqual(len(paused), 1)
-        self.assertEqual(paused[0]["clock"], 0.7)
+        self.assertAlmostEqual(paused[0]["clock"], 0.7)
         self.assertEqual(paused[0]["lastAckSeq"], 1)
         recovery = [row for row in events if row["event"] == "drive.network_recovery_ack"]
         self.assertEqual([row["neutralAccepted"] for row in recovery], [False, False])
-        self.assertTrue(all(row["sessionDeadlineMonotonicMs"] == 5100 for row in recovery))
+        for row in recovery:
+            self.assertAlmostEqual(row["sessionDeadlineMonotonicMs"], 5100)
         self.assertEqual(next(row for row in events if row["event"] == "drive.failure")["stopSource"],
                          "network_grace_expired")
         self.assertGreaterEqual(motors.polls, 5, "IR polling remains active during grace")
@@ -703,8 +719,8 @@ class BridgeTests(unittest.TestCase):
         result, messages, deadlines, events, elapsed, _motors, _client = self.run_scripted_grace([
             (0.1, "drive"), "deadline", (2.0, "parking"), "deadline"], parking_seconds=0.8)
         self.assertEqual(result, 1)
-        self.assertEqual(deadlines, [0.6, 0.7, 5.1, 5.1])
-        self.assertEqual(elapsed, 5.1)
+        self.assert_deadlines(deadlines, [0.6, 0.7, 5.1, 5.1])
+        self.assertAlmostEqual(elapsed, 5.1)
         self.assertTrue(messages[2]["recoveryRequired"])
         self.assertTrue(messages[2]["parkingEnabled"])
         recovery = next(row for row in events if row["event"] == "drive.network_recovery_ack")
@@ -753,15 +769,15 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(elapsed, 1.0)
         self.assertIn("output blocked", messages[-1]["error"])
         self.assertFalse(any(row["event"] == "drive.network_recovery_ack" for row in events))
-        self.assertEqual(client.calls[-4:], parking_calls(0))
+        self.assertFalse(any(call[0] == "write" for call in client.calls))
 
     def test_soft_stop_serial_failure_does_not_enter_waiting_grace(self):
         result, messages, deadlines, events, elapsed, _motors, _client = self.run_scripted_grace([
             (0.1, "drive"), "deadline"], fail_soft_stop=True)
         self.assertEqual(result, 1)
-        self.assertEqual(deadlines, [0.6, 0.7])
-        self.assertEqual(elapsed, 0.7)
-        self.assertIn("Stop was not confirmed", messages[-1]["error"])
+        self.assert_deadlines(deadlines, [0.6, 0.7])
+        self.assertAlmostEqual(elapsed, 0.7)
+        self.assertIn("Stop write was not confirmed", messages[-1]["error"])
         self.assertFalse(any(row["event"] == "drive.network_paused" for row in events))
 
     def test_dribbling_partial_input_never_renews_motion_or_network_deadline(self):

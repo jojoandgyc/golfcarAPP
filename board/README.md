@@ -28,6 +28,53 @@ publisher observes runtime events directly, without tailing buffered JSONL logs.
 If the runtime's `ContinuousRuntime`, hardware adapters, or telemetry schema
 changes, recheck the adapter and its tests before using real execution.
 
+## Manual safety protocol v2
+
+Android 1.8.8 starts the joystick bridge with `--require-safety-version 2`.
+Hardware mode rejects an absent/wrong version before opening a serial device;
+older bridges reject the new argument before their old initialization runs.
+`--dry-run --require-safety-version 2` uses simulated feedback and never opens hardware.
+
+READY and ACK separate accepted `left/right` targets (`targetStopped`) from
+measured `stopped`. Feedback contains signed `feedbackLeftRpm/feedbackRightRpm`,
+both error codes, sample age/count and a hardware/simulated source. A single FC03
+read of 13 registers starting at 0x0009 observes both speeds and fault codes.
+Standstill requires two zero/error-free observations at least 100 ms apart,
+with both observations no older than 250 ms. Zero targets alone are not evidence.
+The App also budgets board sample age + request RTT + local elapsed time within
+500 ms before authorizing a parking change. Delayed ACKs can keep the session
+alive without authorizing configuration from stale feedback.
+
+The `parking` request contains only the usual seq/token/cmd/left/right and
+`parkingEnabled`; the old `parkingCurrent` request is rejected. READY/ACK report
+`parkingLeftCurrentAmps`, `parkingRightCurrentAmps`, `parkingMaxCurrentAmps`, and
+`parkingCurrentReadOnly=true`. Startup reads the driver's existing configuration.
+ON requires both saved currents above zero and within the configured limit;
+OFF and session cleanup request emergency stop mode. None of these paths write
+configuration registers, clear saved currents or restore guessed defaults.
+Any explicit current edit belongs to the separate guarded motor configuration UI.
+
+Safety polling samples idle feedback at 100 ms intervals and refreshes hardware
+zero/stop at 200 ms intervals, including while waiting for input. Before a queued
+neutral refresh can erase unexpected-motion evidence, feedback is checked again.
+Once standstill was confirmed, any observed nonzero speed immediately latches a
+fault and requests emergency stop on both sides; read failures and motor errors
+also fail closed. Network/IR emergency hold is not silently changed to normal
+parking by periodic polling. Moving-to-stopped transitions allow up to 1.5 s
+for measured standstill; parking pre/post checks share a 2 s transaction budget.
+Serial I/O is still bounded at 150 ms per transaction; these polling intervals
+are scheduling targets, not hard real-time guarantees on failed serial I/O.
+Emergency writes are attempted on both sides even if one fails or a deadline
+expires. A feedback-confirmed zero speed is not proof of a mechanical brake.
+
+The existing 600 ms soft-stop/5 s network grace and explicit-release recovery
+remain. Hardware feedback faults terminate the session and cannot be cleared by
+ordinary heartbeat traffic. Logs now include read-only current configuration,
+measured RPM/error/sample metadata, parking mode changes and the initiating
+hardware fault, without raw frames or control tokens. Only deploy while all
+control owners are idle, with an exact previous-file backup; do not start a
+hardware session as part of deployment verification.
+
 ## Follow sessions
 
 The bridge sends a `ready` JSON line before starting any worker. Requests contain

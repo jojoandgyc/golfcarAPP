@@ -1,9 +1,19 @@
 package com.example.followingcar
 
-/** Matches the keyboard controller's parking-current setting, in whole amperes. */
-data class ParkingSettings(val enabled: Boolean = false, val currentAmps: Int = 5) {
+/** Existing driver configuration is read-only during a drive session; enabled is a stop mode. */
+data class ParkingSettings(
+    val enabled: Boolean = false,
+    val leftCurrentAmps: Double = 0.0,
+    val rightCurrentAmps: Double = 0.0,
+    val maxCurrentAmps: Double = 0.0,
+) {
     init {
-        require(currentAmps in 0..60) { "驻车电流必须在 0–60 A 之间" }
-        require(!enabled || currentAmps > 0) { "驻车电流为 0 A 时不能开启驻车" }
+        require(listOf(leftCurrentAmps, rightCurrentAmps, maxCurrentAmps).all { it.isFinite() && it >= 0.0 }) {
+            "驻车电流读数必须为有限非负数"
+        }
     }
+
+    val canEnable: Boolean get() = maxCurrentAmps > 0.0 && maxCurrentAmps <= 60.0 &&
+        leftCurrentAmps > 0.0 && rightCurrentAmps > 0.0 &&
+        leftCurrentAmps <= minOf(maxCurrentAmps, 60.0) && rightCurrentAmps <= minOf(maxCurrentAmps, 60.0)
 }

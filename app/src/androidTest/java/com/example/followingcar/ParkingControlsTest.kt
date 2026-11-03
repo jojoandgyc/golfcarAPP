@@ -6,6 +6,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -16,85 +17,177 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
-/** Offline UI checks: callbacks only, with no SSH or motor access. */
+/** Offline UI checks: callbacks only, with no SSH, register writes or motor access. */
 @RunWith(AndroidJUnit4::class)
 class ParkingControlsTest {
     @get:Rule val compose = createComposeRule()
 
-    private fun ready(settings: ParkingSettings = ParkingSettings()) = BoardUiState(
+    private fun currents(enabled: Boolean = false) = ParkingSettings(enabled = enabled,
+        leftCurrentAmps = 4.25, rightCurrentAmps = 5.5, maxCurrentAmps = 20.0)
+
+    private fun ready(settings: ParkingSettings = currents()) = BoardUiState(
         connected = true, driveEnabled = true, driveConfirmedStopped = true,
-        parkingSupported = true, parkingSettings = settings
+        driveFeedbackVerified = true, driveFeedbackLeftRpm = 0, driveFeedbackRightRpm = 0,
+        driveLastFeedbackNanos = TEST_NOW_NANOS, driveFeedbackAgeAtReceiptMs = 0L,
+        parkingSupported = true, parkingSettings = settings,
     )
 
-    @Test
-    fun unknownOrUnsupportedStateCannotChangeParking() {
+    @Test fun unknownOrUnsupportedStateCannotChangeParkingAndDoesNotInventCurrent() {
+        var changes = 0
         val state = mutableStateOf(BoardUiState())
-        compose.setContent { MaterialTheme { ParkingControls(state.value, {}, {}) } }
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { changes++ } } }
         assertControlsDisabled()
-        compose.onNodeWithTag("parkingCurrent").assertTextEquals("驻车电流：— A")
+        compose.onNodeWithTag("parkingSwitch").performClick()
+        compose.onNodeWithTag("parkingLeftCurrent").assertTextEquals("左：— A")
+        compose.onNodeWithTag("parkingRightCurrent").assertTextEquals("右：— A")
+        compose.onNodeWithTag("parkingMaxCurrent").assertTextEquals("最大输出电流：— A")
+        compose.onNodeWithTag("parkingFeedback").assertTextEquals("最近轮速反馈：尚无可信读数")
 
         compose.runOnIdle { state.value = ready().copy(parkingSupported = false) }
         assertControlsDisabled()
-    }
-
-    @Test
-    fun changesRequestOneAmpStepsAndWaitForConfirmedState() {
-        var requestedEnabled: Boolean? = null
-        var requestedCurrent: Int? = null
-        val state = mutableStateOf(ready())
-        compose.setContent {
-            MaterialTheme {
-                ParkingControls(state.value, { requestedEnabled = it }, { requestedCurrent = it })
-            }
-        }
         compose.onNodeWithTag("parkingSwitch").performClick()
-        compose.runOnIdle { assertEquals(true, requestedEnabled) }
-        compose.onNodeWithTag("parkingSwitch").assertIsOff()
-        compose.onNodeWithTag("parkingIncrease").performClick()
-        compose.runOnIdle { assertEquals(6, requestedCurrent) }
-        compose.onNodeWithTag("parkingCurrent").assertTextEquals("驻车电流：5 A")
-        compose.onNodeWithTag("parkingDecrease").performClick()
-        compose.runOnIdle { assertEquals(4, requestedCurrent) }
-
-        compose.runOnIdle { state.value = ready(ParkingSettings(enabled = true, currentAmps = 6)) }
-        compose.onNodeWithTag("parkingSwitch").assertIsOn()
-        compose.onNodeWithTag("parkingCurrent").assertTextEquals("驻车电流：6 A")
+        compose.runOnIdle { assertEquals(0, changes) }
     }
 
-    @Test
-    fun movementUnconfirmedStopAndPendingConfigurationDisableChanges() {
+    @Test fun toggleWaitsForAcknowledgementAndPreservesDistinctReadOnlyCurrents() {
+        val requests = mutableListOf<Boolean>()
+        val initial = currents()
+        val state = mutableStateOf(ready(initial))
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { requests += it } } }
+        assertNoCurrentEditors()
+        compose.onNodeWithTag("parkingLeftCurrent").assertTextEquals("左：4.25 A")
+        compose.onNodeWithTag("parkingRightCurrent").assertTextEquals("右：5.5 A")
+        compose.onNodeWithTag("parkingMaxCurrent").assertTextEquals("最大输出电流：20 A")
+        compose.onNodeWithTag("parkingSwitch").assertIsEnabled().performClick()
+        compose.onNodeWithTag("parkingSwitch").assertIsOff()
+        compose.runOnIdle {
+            assertEquals(listOf(true), requests)
+            assertEquals(initial, state.value.parkingSettings)
+            state.value = ready(initial.copy(enabled = true))
+        }
+        compose.onNodeWithTag("parkingSwitch").assertIsOn().performClick()
+        compose.onNodeWithTag("parkingSwitch").assertIsOn()
+        compose.runOnIdle {
+            assertEquals(listOf(true, false), requests)
+            assertEquals(initial.copy(enabled = true), state.value.parkingSettings)
+        }
+    }
+
+    @Test fun motionUnverifiedFeedbackPendingAndControlLocksDisableChanges() {
+        var changes = 0
         val state = mutableStateOf(ready())
-        compose.setContent { MaterialTheme { ParkingControls(state.value, {}, {}) } }
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { changes++ } } }
         compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
-        compose.runOnIdle { state.value = ready().copy(driveLeft = 10, driveRight = -10) }
+        val blockedStates = listOf(
+            ready().copy(driveLeft = 10, driveRight = -10),
+            ready().copy(driveConfirmedStopped = false),
+            ready().copy(driveFeedbackVerified = false),
+            ready().copy(driveFeedbackLeftRpm = null),
+            ready().copy(driveFeedbackRightRpm = -2),
+            ready().copy(parkingUpdating = true),
+            ready().copy(driveStopping = true),
+            ready().copy(busy = true),
+            ready().copy(followUncertain = true),
+        )
+        for (blocked in blockedStates) {
+            compose.runOnIdle { state.value = blocked }
+            assertControlsDisabled()
+            compose.onNodeWithTag("parkingSwitch").performClick()
+        }
+        compose.runOnIdle { assertEquals(0, changes) }
+    }
+
+    @Test fun zeroOrInvalidLimitsPreventEnablingAndPointToExplicitMotorConfiguration() {
+        var changes = 0
+        val state = mutableStateOf(ready(ParkingSettings()))
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { changes++ } } }
+        val invalid = listOf(
+            ParkingSettings(),
+            currents().copy(leftCurrentAmps = 0.0),
+            currents().copy(rightCurrentAmps = 0.0),
+            currents().copy(maxCurrentAmps = 0.0),
+            currents().copy(leftCurrentAmps = 20.01),
+            currents().copy(rightCurrentAmps = 60.01, maxCurrentAmps = 70.0),
+        )
+        for (settings in invalid) {
+            compose.runOnIdle { state.value = ready(settings) }
+            compose.onNodeWithTag("parkingSwitch").assertIsOff().assertIsNotEnabled().performClick()
+            compose.onNodeWithTag("parkingHint").assertTextContains("到电机页读取并调整", substring = true)
+            assertNoCurrentEditors()
+        }
+        compose.runOnIdle {
+            assertEquals(0, changes)
+            state.value = ready(ParkingSettings(leftCurrentAmps = 0.01,
+                rightCurrentAmps = 60.0, maxCurrentAmps = 60.0))
+        }
+        compose.onNodeWithTag("parkingLeftCurrent").assertTextEquals("左：0.01 A")
+        compose.onNodeWithTag("parkingRightCurrent").assertTextEquals("右：60 A")
+        compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
+    }
+
+    @Test fun alreadyEnabledParkingCanBeDisabledEvenIfCurrentsNoLongerPermitEnabling() {
+        val requests = mutableListOf<Boolean>()
+        val initial = currents(enabled = true).copy(leftCurrentAmps = 0.0)
+        compose.setContent { MaterialTheme { ParkingControls(ready(initial), TEST_NOW_NANOS) { requests += it } } }
+        compose.onNodeWithTag("parkingSwitch").assertIsOn().assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(listOf(false), requests) }
+        assertNoCurrentEditors()
+    }
+
+    @Test fun zeroTargetDoesNotClaimPhysicalStopWithoutVerifiedRepeatedZeroFeedback() {
+        val state = mutableStateOf(ready().copy(driveConfirmedStopped = false,
+            driveFeedbackVerified = false, driveFeedbackLeftRpm = null, driveFeedbackRightRpm = null))
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) {} } }
+        compose.onNodeWithTag("parkingTargetSpeeds").assertTextEquals("目标已回零 · 等待新鲜停车反馈")
+        compose.onNodeWithTag("parkingFeedback").assertTextEquals("最近轮速反馈：尚无可信读数")
+        assertControlsDisabled()
+        compose.runOnIdle {
+            state.value = ready().copy(driveConfirmedStopped = false, driveFeedbackLeftRpm = 12)
+        }
+        compose.onNodeWithTag("parkingFeedback")
+            .assertTextEquals("最近轮速反馈：左 12 / 右 0 RPM · 尚未停稳")
         assertControlsDisabled()
         compose.runOnIdle { state.value = ready().copy(driveConfirmedStopped = false) }
+        compose.onNodeWithTag("parkingFeedback").assertTextEquals("最近轮速反馈已回零，正在复核停车")
         assertControlsDisabled()
-        compose.runOnIdle { state.value = ready().copy(parkingUpdating = true) }
-        assertControlsDisabled()
-        compose.onNodeWithTag("parkingCurrent").assertTextEquals("驻车电流：5 A")
-        compose.runOnIdle { state.value = ready().copy(driveStopping = true) }
-        assertControlsDisabled()
-        compose.runOnIdle { state.value = ready().copy(busy = true) }
-        assertControlsDisabled()
+        compose.runOnIdle { state.value = ready() }
+        compose.onNodeWithTag("parkingFeedback").assertTextEquals("最近轮速反馈：左 0 / 右 0 RPM · 已确认停车")
+        compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
     }
 
-    @Test
-    fun zeroCurrentDisablesParkingAndLimitsRespectZeroAndSixtyAmps() {
-        val state = mutableStateOf(ready(ParkingSettings(currentAmps = 0)))
-        compose.setContent { MaterialTheme { ParkingControls(state.value, {}, {}) } }
-        compose.onNodeWithTag("parkingSwitch").assertIsOff().assertIsNotEnabled()
-        compose.onNodeWithTag("parkingDecrease").assertIsNotEnabled()
-        compose.onNodeWithTag("parkingIncrease").assertIsEnabled()
-        compose.runOnIdle { state.value = ready(ParkingSettings(currentAmps = 60)) }
-        compose.onNodeWithTag("parkingIncrease").assertIsNotEnabled()
-        compose.onNodeWithTag("parkingDecrease").assertIsEnabled()
+    @Test fun expiredFeedbackAndAckTransitAgeDisableSwitchWithoutClaimingFreshStop() {
+        var changes = 0
+        val now = mutableStateOf(TEST_NOW_NANOS)
+        val state = mutableStateOf(ready())
+        compose.setContent { MaterialTheme { ParkingControls(state.value, now.value) { changes++ } } }
         compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
+        compose.runOnIdle { now.value += 501_000_000L }
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.onNodeWithTag("parkingFeedback").assertTextContains("已过期", substring = true)
+        compose.onNodeWithTag("parkingTargetSpeeds").assertTextEquals("目标已回零 · 等待新鲜停车反馈")
+        compose.runOnIdle {
+            now.value = TEST_NOW_NANOS + 60_000_000L
+            state.value = ready().copy(driveFeedbackAgeAtReceiptMs = 450L)
+        }
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.runOnIdle {
+            assertEquals(0, changes)
+            state.value = ready().copy(driveLastFeedbackNanos = now.value)
+        }
+        compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
+    }
+
+    private fun assertNoCurrentEditors() {
+        compose.onNodeWithTag("parkingDecrease").assertDoesNotExist()
+        compose.onNodeWithTag("parkingIncrease").assertDoesNotExist()
     }
 
     private fun assertControlsDisabled() {
-        listOf("parkingSwitch", "parkingDecrease", "parkingIncrease").forEach {
-            compose.onNodeWithTag(it).assertIsNotEnabled()
-        }
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled()
+        assertNoCurrentEditors()
+    }
+
+    private companion object {
+        const val TEST_NOW_NANOS = 10_000_000_000L
     }
 }

@@ -260,7 +260,7 @@ class BoardTransportDiagnosticsTest {
             val output = ByteArrayOutputStream()
             val response = JSONObject().put("type", "ack").put("seq", 1)
                 .put("token", "2".repeat(32)).put("left", 0).put("right", 0)
-                .put("stopped", true).toString() + "\n"
+                .put("stopped", true).withDriveSafetyFixture().toString() + "\n"
             val constructor = BoardDriveChannel::class.java.declaredConstructors.single { it.parameterCount == 6 }
                 .apply { isAccessible = true }
             val aborts = AtomicInteger()
@@ -270,7 +270,12 @@ class BoardTransportDiagnosticsTest {
             BoardDriveChannel::class.java.getDeclaredField("token").apply { isAccessible = true }
                 .set(channel, "1".repeat(32))
             BoardDriveChannel::class.java.getDeclaredField("ready").apply { isAccessible = true }
-                .set(channel, DriveReady("synthetic-test", true, 600, 60))
+                .set(channel, DriveReady("synthetic-test", true, 600, 60,
+                    parkingSupported = true, parking = ParkingSettings(false, 5.0, 5.0, 60.0),
+                    safetyVersion = 2, parkingCurrentReadOnly = true,
+                    feedback = DriveFeedback(0, 0, 0, 0, 0, 2, "simulated")))
+            BoardDriveChannel::class.java.getDeclaredField("confirmedParking").apply { isAccessible = true }
+                .set(channel, ParkingSettings(false, 5.0, 5.0, 60.0))
             try {
                 val started = System.nanoTime()
                 // This is the production terminal ACK deadline, not an extended test allowance.
@@ -552,7 +557,7 @@ class BoardTransportDiagnosticsTest {
 
     private fun driveReady(): String = JSONObject().put("type", "ready").put("token", "1".repeat(32))
         .put("dryRun", true).put("port", "synthetic-test").put("watchdogMs", 600).put("maxRpm", 60)
-        .toString() + "\n"
+        .withDriveSafetyFixture().toString() + "\n"
 
     private fun events(context: DiagnosticContext): List<JSONObject> = testEngine.snapshot().events
         .map(::JSONObject).filter { it.optString("operationId") == context.operationId }

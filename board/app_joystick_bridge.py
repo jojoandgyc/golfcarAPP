@@ -65,12 +65,17 @@ WATCHDOG_SECONDS = 0.6
 NETWORK_GRACE_SECONDS = 5.0
 PARKING_TRANSACTION_SECONDS = 2.0
 MAX_PARKING_CURRENT = 60
+SAFETY_VERSION = 2
+FEEDBACK_INTERVAL_SECONDS = 0.1
+FEEDBACK_MAX_AGE_SECONDS = 0.25
+STOP_REFRESH_SECONDS = 0.2
+STANDSTILL_TIMEOUT_SECONDS = 1.5
 SERIAL_TIMEOUT = 0.15
 IR_POLL_SECONDS = 0.02
 MAX_LINE_BYTES = 512
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUEST_KEYS = {"seq", "token", "cmd", "left", "right"}
-PARKING_REQUEST_KEYS = REQUEST_KEYS | {"parkingEnabled", "parkingCurrent"}
+PARKING_REQUEST_KEYS = REQUEST_KEYS | {"parkingEnabled"}
 
 
 class SessionError(Exception):
@@ -109,32 +114,225 @@ class InfraredInterlock:
 
 
 class Motors:
-    """Control motion and the launcher's verified electronic parking-current setting."""
+    """Session control, with read-only parking configuration and measured standstill.
+
+    No path in this class writes configuration registers. A parking switch selects
+    NORMAL/EMERGENCY stop mode; it never invents a current or clears saved settings.
+    """
 
     def __init__(self, client: Any = None, *, infrared: InfraredInterlock | None = None) -> None:
-        self.client = client
-        self.infrared = infrared
+        self.client, self.infrared = client, infrared
         self.last_target: tuple[int, int] | None = None
         self.requested_target = (0, 0)
         self.ir_latched_directions: set[str] = set()
         self.parking_enabled = False
-        self.parking_current = 5
+        self.emergency_hold = True
+        self.parking_left_current = self.parking_right_current = 5.0 if client is None else 0.0
+        self.parking_max_current = 60.0 if client is None else 0.0
+        self.feedback = (0, 0, 0, 0)  # left/right RPM, left/right fault code
+        self.feedback_at: float | None = None
+        self.zero_observations: list[float] = []
+        self.zero_samples = 0
+        self.last_zero_at: float | None = None
+        self.last_stop_at: float | None = None
+        self.stop_requested_at: float | None = None
+        self.standstill_seen = False
+        self.fault_reason: str | None = None
+        self.diagnostic = BestEffortDiagnostic(NullDiagnosticLog())
+
+    def _require_healthy(self) -> None:
+        if self.fault_reason:
+            raise SessionError(self.fault_reason)
+
+    def _write_stop(self, *, emergency: bool) -> None:
+        """Attempt every zero/stop even if one side fails; never read or write settings."""
+        previous = self.last_target
+        if emergency:
+            self.emergency_hold = True
+        mode = 0 if self.parking_enabled and not emergency else 1
+        errors = []
+        if self.client is not None:
+            for name, operation in (
+                ("left zero", lambda: self.client.set_left_speed(0)),
+                ("right zero", lambda: self.client.set_right_speed(0)),
+                ("left stop", lambda: self.client.stop("left", mode)),
+                ("right stop", lambda: self.client.stop("right", mode)),
+            ):
+                try:
+                    operation()
+                except Exception as error:
+                    errors.append(f"{name}: {type(error).__name__}: {error}")
+        now = time.monotonic()
+        self.last_stop_at = now
+        self.last_target = None if errors else (0, 0)
+        if previous != (0, 0) or self.stop_requested_at is None:
+            self.stop_requested_at = now
+            self.zero_samples = 0
+            self.last_zero_at = None
+        if errors:
+            raise SessionError("Stop write was not confirmed: " + "; ".join(errors))
+
+    def _trip(self, reason: str) -> None:
+        # Keep the initiating feedback evidence; cleanup must not replace it.
+        if self.fault_reason is None:
+            self.fault_reason = reason
+            self.diagnostic.event("drive.hardware_fault", critical=True, reason=reason,
+                                  target=self.last_target, **self.feedback_state())
+        self.parking_enabled = False
+        self.zero_samples = 0
+        try:
+            self._write_stop(emergency=True)
+        except Exception as error:
+            self.diagnostic.event("drive.fault_stop_failed", critical=True,
+                                  errorClass=type(error).__name__)
+        raise SessionError(self.fault_reason)
+
+    @staticmethod
+    def _signed32(high: int, low: int) -> int:
+        value = (high << 16) | low
+        return value - 2**32 if value >= 2**31 else value
+
+    def _sample_feedback(self, *, force: bool = False, cleanup: bool = False) -> None:
+        now = time.monotonic()
+        if not force and self.feedback_at is not None and now - self.feedback_at < FEEDBACK_INTERVAL_SECONDS:
+            return
+        try:
+            if self.client is None:
+                left, right = self.last_target or (0, 0)
+                values = (left, right, 0, 0)
+            else:
+                # One contiguous FC03 gives both signed speeds and fault codes.
+                words = self.client.read_holding_registers(0x0009, 13)
+                if not isinstance(words, (list, tuple)) or len(words) != 13 or any(
+                    type(word) is not int or not 0 <= word <= 65535 for word in words
+                ):
+                    raise SessionError("Invalid motor feedback registers")
+                values = (self._signed32(words[10], words[11]), self._signed32(words[0], words[1]),
+                          words[12], words[2])
+        except Exception as error:
+            self.feedback_at = None
+            self.zero_samples = 0
+            if cleanup:
+                raise SessionError("Cleanup feedback unavailable") from error
+            self._trip(f"Motor feedback unavailable: {type(error).__name__}: {error}")
+        observed_at = time.monotonic()
+        if self.last_zero_at is not None and observed_at - self.last_zero_at > FEEDBACK_MAX_AGE_SECONDS:
+            # A single new zero reading must not revive an old pair of samples.
+            self.zero_samples, self.last_zero_at = 0, None
+        self.feedback, self.feedback_at = values, observed_at
+        left, right, left_error, right_error = values
+        if left_error or right_error:
+            self.zero_samples = 0
+            if cleanup:
+                raise SessionError(f"Motor fault remains during cleanup: {left_error}/{right_error}")
+            self._trip(f"Motor fault feedback: left={left_error}, right={right_error}")
+        if self.last_target != (0, 0):
+            self.zero_samples, self.last_zero_at = 0, None
+            return
+        if left != 0 or right != 0:
+            self.zero_samples, self.last_zero_at = 0, None
+            if not cleanup and self.standstill_seen:
+                self._trip(f"Unexpected motion after standstill: left={left}, right={right} RPM")
+            if not cleanup and self.stop_requested_at is not None and (
+                self.feedback_at - self.stop_requested_at >= STANDSTILL_TIMEOUT_SECONDS
+            ):
+                self._trip(f"Standstill timeout: left={left}, right={right} RPM")
+            return
+        # Distinct hardware observations are separated in time, not duplicate cached reads.
+        if self.last_zero_at is None or self.client is None or (
+            self.feedback_at - self.last_zero_at >= FEEDBACK_INTERVAL_SECONDS
+        ):
+            self.zero_observations.append(self.feedback_at)
+            self.zero_observations = self.zero_observations[-2:]
+            self.last_zero_at = self.feedback_at
+        if self.zero_samples >= 2:
+            self.standstill_seen = True
+
+    @property
+    def zero_samples(self) -> int:
+        now = time.monotonic()
+        return sum(0 <= now - observed <= FEEDBACK_MAX_AGE_SECONDS for observed in self.zero_observations)
+
+    @zero_samples.setter
+    def zero_samples(self, value: int) -> None:
+        if value != 0:
+            raise ValueError("Zero samples must come from distinct feedback observations")
+        self.zero_observations = []
+
+    @property
+    def stopped_confirmed(self) -> bool:
+        return (self.fault_reason is None and self.last_target == (0, 0) and self.zero_samples >= 2
+                and self.feedback == (0, 0, 0, 0) and self.feedback_at is not None
+                and time.monotonic() - self.feedback_at <= FEEDBACK_MAX_AGE_SECONDS)
+
+    def feedback_state(self) -> dict[str, Any]:
+        age = None if self.feedback_at is None else max(0, int((time.monotonic() - self.feedback_at) * 1000))
+        return {"feedbackLeftRpm": self.feedback[0], "feedbackRightRpm": self.feedback[1],
+                "feedbackLeftError": self.feedback[2], "feedbackRightError": self.feedback[3],
+                "feedbackAgeMs": age, "feedbackSamples": self.zero_samples,
+                "feedbackSource": "simulated" if self.client is None else "hardware"}
+
+    def await_standstill(self, *, cleanup: bool = False, deadline: float | None = None) -> None:
+        deadline = min(time.monotonic() + STANDSTILL_TIMEOUT_SECONDS,
+                       deadline if deadline is not None else float("inf"))
+        while True:
+            if time.monotonic() >= deadline:
+                if cleanup:
+                    raise SessionError("Cleanup standstill not confirmed")
+                self._trip("Standstill confirmation timed out")
+            self._sample_feedback(force=True, cleanup=cleanup)
+            measured = self.last_target == (0, 0) and self.zero_samples >= 2 and self.feedback == (0, 0, 0, 0)
+            if time.monotonic() >= deadline:
+                if cleanup:
+                    raise SessionError("Cleanup standstill not confirmed")
+                self._trip("Standstill confirmation timed out")
+            if measured:
+                return
+            if self.last_stop_at is None or time.monotonic() - self.last_stop_at >= STOP_REFRESH_SECONDS:
+                self._write_stop(emergency=cleanup or not self.parking_enabled)
+            if self.client is not None:
+                time.sleep(FEEDBACK_INTERVAL_SECONDS)
+
+    def initialize(self) -> None:
+        self.parking_enabled = False
+        self._write_stop(emergency=True)
+        self.await_standstill()
+        if self.client is not None:
+            try:
+                values = [self.client.read_register(name) for name in
+                          ("left_parking_current", "right_parking_current", "max_output_current")]
+                if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 60
+                       for value in values) or values[2] <= 0:
+                    raise SessionError("Invalid saved parking/current-limit configuration")
+                self.parking_left_current, self.parking_right_current, self.parking_max_current = map(float, values)
+            except Exception as error:
+                self._trip(f"Parking configuration read failed: {type(error).__name__}: {error}")
+        # Config reads may consume a few transactions; READY still needs fresh feedback.
+        self.await_standstill()
+        self.diagnostic.event("parking.configuration_read", critical=True,
+                              **self.parking_state(), **self.feedback_state())
 
     def drive(self, left: int, right: int) -> tuple[int, int]:
+        self._require_healthy()
         if (left, right) == (0, 0):
             self.stop()
             return (0, 0)
+        self.poll_safety()
         self.requested_target = (left, right)
-        # Recheck before deduplicating repeated joystick/heartbeat targets.
         if self.check_infrared():
             return (0, 0)
         if self.last_target == (left, right):
             return self.last_target
-        if self.client is not None:
-            self.client.set_left_speed(left)
-            self.client.set_right_speed(right)
-        self.last_target = (left, right)
-        # Also cover a trigger that arrives during the serial transactions.
+        self.zero_samples, self.last_zero_at = 0, None
+        self.standstill_seen = False
+        self.stop_requested_at = None
+        try:
+            if self.client is not None:
+                self.client.set_left_speed(left)
+                self.client.set_right_speed(right)
+            self.last_target = (left, right)
+        except Exception as error:
+            self._trip(f"Motor target write failed: {type(error).__name__}: {error}")
         self.check_infrared()
         return self.last_target
 
@@ -170,89 +368,73 @@ class Motors:
         return {"infraredBlocked": blocked, "infraredDirections": directions if blocked else []}
 
     def stop(self, *, force: bool = False, emergency: bool = False, release_interlock: bool = True) -> None:
+        refresh = (force or emergency or self.last_target != (0, 0) or self.last_stop_at is None
+                   or time.monotonic() - self.last_stop_at >= STOP_REFRESH_SECONDS)
+        if not emergency:
+            self._require_healthy()
+            if refresh and self.last_target == (0, 0):
+                # A queued neutral heartbeat can bypass InputPump.poll. Inspect the
+                # motor before a refresh could erase unexpected-motion evidence.
+                self._sample_feedback(force=True)
         if release_interlock:
-            # An explicit stop/neutral joystick releases the blocked request.
             self.requested_target = (0, 0)
             self.ir_latched_directions.clear()
-        if self.last_target == (0, 0) and not force and not emergency:
-            return
-        # Electronic parking locks the phase only after NORMAL stop (0).
-        mode = 0 if self.parking_enabled and not emergency else 1
-        errors = []
-        if self.client is not None:
-            # A timeout on one transaction MUST NOT skip either motor's other stops.
-            operations = (
-                ("left zero", lambda: self.client.set_left_speed(0)),
-                ("right zero", lambda: self.client.set_right_speed(0)),
-                ("left stop", lambda: self.client.stop("left", mode)),
-                ("right stop", lambda: self.client.stop("right", mode)),
-            )
-            for name, operation in operations:
-                try:
-                    operation()
-                except Exception as error:
-                    errors.append(f"{name}: {type(error).__name__}: {error}")
-        self.last_target = None if errors else (0, 0)
-        if errors:
-            raise SessionError("Stop was not confirmed: " + "; ".join(errors))
+            self.emergency_hold = emergency
+        if refresh:
+            try:
+                self._write_stop(emergency=emergency or self.emergency_hold)
+            except Exception as error:
+                self._trip(f"Stop transaction failed: {error}")
 
-    def set_parking(self, enabled: bool, current: int) -> None:
-        if type(enabled) is not bool or type(current) is not int or not 0 <= current <= MAX_PARKING_CURRENT:
-            raise SessionError("Parking requires a boolean switch and integer current in [0, 60] A")
-        if enabled and current == 0:
-            raise SessionError("Enabled parking requires current above 0 A")
+    def poll_safety(self) -> None:
+        self._require_healthy()
+        self.check_infrared()
+        # Check feedback BEFORE refreshing stop, so an unexpected movement is not
+        # erased from evidence by a successful corrective write.
+        self._sample_feedback()
+        if self.last_target == (0, 0):
+            self.stop(release_interlock=False)
+
+    def set_parking(self, enabled: bool) -> None:
+        self._require_healthy()
+        transaction_deadline = time.monotonic() + PARKING_TRANSACTION_SECONDS
+        if type(enabled) is not bool:
+            raise SessionError("Parking requires a boolean switch; current configuration is read-only")
         if self.last_target != (0, 0):
-            raise SessionError("Parking settings require confirmed stopped motors")
-        changed = enabled != self.parking_enabled or (enabled and current != self.parking_current)
-        if changed:
-            self._write_parking_current(current if enabled else 0)
+            raise SessionError("Parking requires zero targets and measured standstill")
+        self.await_standstill(deadline=transaction_deadline)
+        if not self.stopped_confirmed:
+            raise SessionError("Parking requires fresh measured standstill")
+        if enabled and (not 0 < self.parking_left_current <= self.parking_max_current
+                        or not 0 < self.parking_right_current <= self.parking_max_current):
+            raise SessionError("Parking current must be configured for both motors within the output-current limit")
+        self.diagnostic.event("parking.mode_requested", critical=True, enabled=enabled,
+                              **self.parking_state(), **self.feedback_state())
         self.parking_enabled = enabled
-        self.parking_current = current
-        if changed and enabled:
-            # A prior emergency stop will not engage a newly configured parking current.
-            # Updating parking is not a neutral joystick input and must not
-            # release an IR latch for a still-held movement request.
-            self.stop(force=True, release_interlock=False)
-
-    def _write_parking_current(self, current: int) -> None:
-        if self.client is None:
-            return
-        errors = []
-        registers = ("right_parking_current", "left_parking_current")
-        for register in registers:
-            try:
-                # Match keyboard_drive.py: 0x10 persistence prevents old values returning
-                # after a driver reset. Only explicit changes/initialization/exit write it.
-                self.client.write_register(register, current, persist=True)
-            except Exception as error:
-                errors.append(f"{register} write: {type(error).__name__}: {error}")
-        for register in registers:
-            try:
-                actual = float(self.client.read_register(register))
-                if not math.isfinite(actual) or abs(actual - current) > 0.005:
-                    raise SessionError(f"readback mismatch: requested={current} A actual={actual} A")
-            except Exception as error:
-                errors.append(f"{register} read: {type(error).__name__}: {error}")
-        if errors:
-            raise SessionError("Parking current was not confirmed: " + "; ".join(errors))
+        self.emergency_hold = not enabled
+        # Both ON and OFF reissue zero speed and stop; never modify current parameters.
+        self.stop(force=True, emergency=not enabled, release_interlock=False)
+        # Require two NEW observations after the mode change, retaining the prior
+        # standstill latch: any nonzero feedback now is an immediate fault.
+        self.zero_samples, self.last_zero_at = 0, None
+        self.await_standstill(deadline=transaction_deadline)
+        self.diagnostic.event("parking.mode_confirmed", critical=True,
+                              **self.parking_state(), **self.feedback_state())
 
     def shutdown(self) -> None:
-        """Always attempt both emergency stops AND both parking-current clears."""
-        errors = []
-        try:
-            self.stop(force=True, emergency=True)
-        except Exception as error:
-            errors.append(str(error))
-        try:
-            self._write_parking_current(0)
-            self.parking_enabled = False
-        except Exception as error:
-            errors.append(str(error))
-        if errors:
-            raise SessionError("; ".join(errors))
+        """Emergency stop plus physical feedback, preserving every saved parameter."""
+        self.parking_enabled = False
+        self.requested_target = (0, 0)
+        self.ir_latched_directions.clear()
+        self._write_stop(emergency=True)
+        self.zero_samples, self.last_zero_at = 0, None
+        self.await_standstill(cleanup=True)
 
     def parking_state(self) -> dict[str, Any]:
-        return {"parkingEnabled": self.parking_enabled, "parkingCurrent": self.parking_current}
+        return {"parkingEnabled": self.parking_enabled,
+                "parkingLeftCurrentAmps": self.parking_left_current,
+                "parkingRightCurrentAmps": self.parking_right_current,
+                "parkingMaxCurrentAmps": self.parking_max_current, "parkingCurrentReadOnly": True}
 
 
 def validate_request_keys(message: Any) -> None:
@@ -305,11 +487,13 @@ class ProtocolSession:
         self.motors.stop(force=True, emergency=True, release_interlock=False)
 
     def ready(self) -> dict[str, Any]:
-        # Match the keyboard launcher's initial parking OFF state, with readback.
-        self.motors.shutdown()
+        self.motors.initialize()
         return {"type": "ready", "token": self.token, "dryRun": self.dry_run, "runId": self.run_id,
                 "port": self.port, "maxRpm": MAX_RPM,
                 "watchdogMs": int(WATCHDOG_SECONDS * 1000), "parkingSupported": True,
+                "safetyVersion": SAFETY_VERSION, "left": 0, "right": 0,
+                "targetStopped": True, "stopped": self.motors.stopped_confirmed,
+                **self.motors.feedback_state(),
                 "networkGraceMs": int(NETWORK_GRACE_SECONDS * 1000),
                 "infraredSupported": self.motors.infrared is not None,
                 **self.motors.parking_state()}
@@ -334,7 +518,7 @@ class ProtocolSession:
         closing = command in ("estop", "close")
         recovering = self.recovery_required
         if command == "parking":
-            self.motors.set_parking(message["parkingEnabled"], message["parkingCurrent"])
+            self.motors.set_parking(message["parkingEnabled"])
         elif closing:
             self.motors.shutdown()
         elif recovering:
@@ -350,12 +534,15 @@ class ProtocolSession:
             left, right = 0, 0
         else:
             left, right = self.motors.drive(left, right)
+        self.motors._sample_feedback(force=True)
         infrared = (self.motors.infrared_state() if command == "drive" else
                     {"infraredBlocked": False, "infraredDirections": []})
         self.next_seq += 1
         self.token = secrets.token_hex(16)
-        return {"type": "ack", "seq": seq, "token": self.token, "left": left,
-                "right": right, "stopped": (left, right) == (0, 0),
+        return {"type": "ack", "safetyVersion": SAFETY_VERSION, "seq": seq, "token": self.token, "left": left,
+                "right": right, "targetStopped": (left, right) == (0, 0),
+                "stopped": (left, right) == (0, 0) and self.motors.stopped_confirmed,
+                **self.motors.feedback_state(),
                 # Neutral clears the latch for subsequent requests, but its own ACK must
                 # still tell the App to discard the held target and require fresh input.
                 "recoveryRequired": recovering,
@@ -452,6 +639,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
         except Exception:
             diagnostic = NullDiagnosticLog()
     diagnostic = BestEffortDiagnostic(diagnostic)
+    motors.diagnostic = diagnostic
     diagnostic.event("drive.session_started", critical=True, dryRun=dry_run, parentPid=os.getppid(),
                      watchdogMs=int(WATCHDOG_SECONDS * 1000), networkGraceMs=int(NETWORK_GRACE_SECONDS * 1000),
                      infraredSupported=motors.infrared is not None)
@@ -484,7 +672,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
         deadline = ready_at + WATCHDOG_SECONDS
         session_deadline = ready_at + NETWORK_GRACE_SECONDS
         pump = InputPump(sys.stdin.fileno())
-        pump.poll = motors.check_infrared
+        pump.poll = motors.poll_safety
         while True:
             phase = "request_wait"
             try:
@@ -530,8 +718,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             request_gap_ms = None if last_received is None else (received - last_received) * 1000
             phase = "motor_transaction"
             response, closing = session.accept(message)
-            # Terminal acceptance already verified emergency stop and both current clears.
-            # Even if sending its ACK fails, repeating persistent writes adds no safety.
+            # Terminal acceptance already verified emergency stop and measured standstill.
+            # No configuration registers are changed, including on cleanup.
             cleanup_confirmed = closing
             completed = time.monotonic()
             processed_ms = (completed - received) * 1000
@@ -570,7 +758,9 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
                     sampleCount=sample_count, maxProcessingMs=max_processing_ms,
                     maxRequestGapMs=max_request_gap_ms,
                     maxIrPollMs=getattr(pump, "max_poll_seconds", 0) * 1000,
-                    infraredBlocked=blocked, infraredDirections=response["infraredDirections"])
+                    infraredBlocked=blocked, infraredDirections=response["infraredDirections"],
+                    targetStopped=response["targetStopped"], stopped=response["stopped"],
+                    **motors.feedback_state(), **motors.parking_state())
                 summary_at, sample_count = completed, 0
                 max_processing_ms = max_request_gap_ms = 0.0
             prior_ir, previous_command = blocked, message["cmd"]
@@ -708,6 +898,7 @@ def open_hardware(port_choice: str, *, infrared: InfraredInterlock | None = None
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--require-safety-version", type=int, choices=(SAFETY_VERSION,))
     parser.add_argument("--port", default="auto", choices=("auto", "/dev/ttyS0", "/dev/ttyS3"))
     parser.add_argument(
         "--ir-sysfs-root", type=Path, default=os.environ.get("LZ_IR_SYSFS_ROOT"),
@@ -718,6 +909,8 @@ def main() -> int:
         help="Digital IR trigger value. Default: 0 (active low).",
     )
     args = parser.parse_args()
+    if not args.dry_run and args.require_safety_version != SAFETY_VERSION:
+        parser.error("Hardware control requires --require-safety-version 2; update the Android app")
     stopped = threading.Event()
     for name in ("SIGTERM", "SIGINT", "SIGHUP"):
         value = getattr(signal, name, None)

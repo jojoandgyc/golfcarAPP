@@ -1,0 +1,78 @@
+{
+  "recordedAtUtc": "2026-11-03T14:40:13.862976+00:00",
+  "app": {
+    "versionCode": 19,
+    "versionName": "1.8.8-parking-feedback",
+    "apkSha256": "9f426e16eab9688a1b6bfe59416fecbb30d906c1c809eb3005b576d6df7348c3",
+    "previousApkSha256": "58d67c35070ac85d49f44a7e688be851b6f518c43eb3249181e439a533dd4da1",
+    "phoneInstallation": {
+      "status": "pending",
+      "reason": "Physical phone is not currently detected by adb; only emulator is connected."
+    }
+  },
+  "bridge": {
+    "alreadyDeployed": false,
+    "oldSha256": "849061c8bc27d8771ff5075822b8b09d03f144a9da219c54ce52bd21f53bb5f0",
+    "newSha256": "71db3daaae6c666120a02a9ec0377ba24170a68bf67ef149a9261bdebb43c021",
+    "backup": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py.bak.parking-safety-20261103T143844Z",
+    "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+    "controlIdle": true,
+    "serialIdle": true,
+    "hardwareCommandsSent": false
+  },
+  "sourceBaseCommit": "4cadf14",
+  "protocol": {
+    "requiredSafetyVersion": 2,
+    "legacyHardwareClientsRejectedBeforeSerialOpen": true,
+    "parkingCurrentWritesInManualControl": false
+  },
+  "validation": {
+    "jvm": {
+      "tests": 258,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorProtocolAndUi": {
+      "tests": 61,
+      "passed": 61
+    },
+    "boardPythonLinux": {
+      "tests": 97,
+      "passed": 97,
+      "skipped": 0
+    },
+    "emulatorToBoardSshDryRun": {
+      "tests": 3,
+      "passed": 3,
+      "hardwareSerialOpened": false,
+      "coverage": [
+        "read-only parking configuration and mode transitions",
+        "simulated driving/close preserves SSH",
+        "network hard deadline rejects stale control"
+      ]
+    },
+    "postDryRunReadOnlyCheck": {
+      "bridgeSha256": "71db3daaae6c666120a02a9ec0377ba24170a68bf67ef149a9261bdebb43c021",
+      "activeManualBridges": [],
+      "serialIdle": true
+    }
+  },
+  "safetyBoundaries": {
+    "realMotorTestPerformed": false,
+    "motorConfigurationChangedByDeployment": false,
+    "wifiOrOtherServicesChanged": false,
+    "physicalSurgeCauseFullyEstablished": false,
+    "confirmedDefects": [
+      "Old bridge treated zero target as proof of standstill",
+      "Old parking and cleanup paths persisted current changes",
+      "Old cached neutral commands could skip hardware zero/stop refresh"
+    ],
+    "manualAcceptance": "Raise drive wheels securely, keep physical emergency stop available, inspect saved currents and fresh RPM, then test one toggle at a time. Do not restore a guessed 5 A."
+  },
+  "rollback": {
+    "bridgeBackupRequired": true,
+    "appAndBridgeMustRemainCompatible": true,
+    "warning": "Previous app/bridge contain known safety defects; do not resume real control using the backup."
+  }
+}
