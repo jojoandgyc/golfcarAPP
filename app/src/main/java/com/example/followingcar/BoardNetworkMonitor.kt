@@ -142,7 +142,8 @@ class BoardNetworkMonitor(context: Context) : AutoCloseable {
             internetValidated = default?.let { it.internet && it.validated } == true,
             transportLabel = default?.transport ?: usable.values.map { it.transport }.distinct()
                 .joinToString("／").ifBlank { "无默认网络" },
-            wifiAvailable = usable.values.any { it.wifi }, revision = state.value.revision + 1)
+            wifiAvailable = usable.values.any { it.wifi }, revision = state.value.revision + 1,
+            defaultNetworkHandle = defaultNetwork?.networkHandle)
         Diagnostics.event("network.phone_state", fields = mapOf(
             "revision" to state.value.revision, "available" to state.value.available,
             "internetValidated" to state.value.internetValidated, "wifiAvailable" to state.value.wifiAvailable,

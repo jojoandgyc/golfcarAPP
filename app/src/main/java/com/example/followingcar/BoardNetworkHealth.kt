@@ -8,6 +8,8 @@ data class PhoneNetworkState(
     val transportLabel: String = "未知",
     val wifiAvailable: Boolean = false,
     val revision: Long = 0,
+    // Opaque OS identity, not an address. Capability-only changes must not restart video.
+    val defaultNetworkHandle: Long? = null,
 ) {
     fun statusLabel(): String = when {
         !observed -> "手机网络状态待确认"

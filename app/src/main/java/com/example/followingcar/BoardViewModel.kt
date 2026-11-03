@@ -49,6 +49,8 @@ data class BoardUiState(
     val videoServiceMessage: String = "连接开发板后可开启视频",
     val videoServiceError: String? = null,
     val videoPreviewRevision: Int = 0,
+    // Local receive-only intent survives unexpected SSH loss, never an explicit stop.
+    val videoPreviewWanted: Boolean = false,
     val driveStarting: Boolean = false,
     val driveEnabled: Boolean = false,
     val driveStopping: Boolean = false,
@@ -534,7 +536,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             wifiDirect.mutationPending || (!remote &&
             (wifiDirect.state.value.busy || wifiDirect.state.value.confirmationRequired))) return
         preferences.edit().putBoolean("remote_mode", remote).apply()
-        mutableState.update { it.copy(remoteMode = remote, error = null, result = null) }
+        mutableState.update { it.copy(remoteMode = remote, error = null, result = null, videoPreviewWanted = false) }
         Diagnostics.event("connection.mode_changed", ownerDiagnostic,
             fields = mapOf("mode" to if (remote) "REMOTE" else "LOCAL"), critical = true)
     }
@@ -550,7 +552,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importRemoteConfiguration(uri: Uri) {
         if (!state.value.canSelectRemoteMode || wifiDirect.mutationPending) return
-        mutableState.update { it.copy(busy = true, remoteProfileLoading = true, remoteProfileError = null) }
+        mutableState.update { it.copy(busy = true, remoteProfileLoading = true, remoteProfileError = null,
+            videoPreviewWanted = false) }
         operation = viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
@@ -623,7 +626,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         !state.value.followActive && !state.value.videoServiceBusy
 
     private fun editConnection(edit: BoardUiState.() -> BoardUiState) {
-        if (canEditConnection()) mutableState.update { it.edit().copy(error = null) }
+        if (canEditConnection()) mutableState.update { it.edit().copy(error = null, videoPreviewWanted = false) }
     }
 
     fun permissionDenied() {
@@ -1004,6 +1007,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             val videoState = client.readVideoServiceState(diagnostic)
             Diagnostics.event("video.inspected", diagnostic, fields = mapOf("videoState" to videoState.name))
             mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
+                videoPreviewWanted = when (videoState) {
+                    VideoServiceState.RUNNING -> !disconnecting && !it.followBlocksControl
+                    VideoServiceState.STOPPED -> false
+                    VideoServiceState.UNKNOWN -> it.videoPreviewWanted
+                },
                 videoServiceMessage = when (videoState) {
                     VideoServiceState.RUNNING -> "视频服务已开启"
                     VideoServiceState.STOPPED -> "视频服务已关闭"
@@ -1024,12 +1032,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     ) = videoServiceMutex.withLock {
         Diagnostics.event("video.change_started", diagnostic, fields = mapOf("enabled" to enabled))
         mutableState.update { it.copy(videoServiceBusy = true, videoServiceError = null,
+            videoPreviewWanted = false,
             videoServiceMessage = if (enabled) "正在开启视频…" else "正在关闭视频…") }
         try {
             check(client.isConnected) { "SSH 已断开，无法确认视频服务状态，请重连后关闭视频。" }
             val videoState = client.setVideoServiceEnabled(enabled, diagnostic)
             Diagnostics.event("video.change_confirmed", diagnostic, fields = mapOf("videoState" to videoState.name))
             mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
+                videoPreviewWanted = enabled && videoState == VideoServiceState.RUNNING &&
+                    !disconnecting && !it.followBlocksControl,
                 videoServiceMessage = if (enabled) "视频服务已开启" else "视频服务已关闭",
                 videoPreviewRevision = if (enabled) it.videoPreviewRevision + 1 else it.videoPreviewRevision) }
         } catch (failure: Exception) {
@@ -1058,7 +1069,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         disconnecting = true
         val previous = operation
         previous?.cancel()
-        mutableState.update { it.copy(busy = true, status = "正在断开…") }
+        mutableState.update { it.copy(busy = true, status = "正在断开…", videoPreviewWanted = false) }
         operation = viewModelScope.launch {
             var completed = false
             try {
@@ -1554,7 +1565,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         followStopRequested = false
         while (followWakeup.tryReceive().isSuccess) { /* Discard previous-session signals. */ }
         mutableState.update {
-            it.copy(followActive = true, followStopping = false, followStatus = null,
+            it.copy(followActive = true, followStopping = false, followStatus = null, videoPreviewWanted = false,
                 followTerminal = false, followLastReplyElapsedMs = null, followStartCancelled = false,
                 followError = null, followFirstFailure = null,
                 followMessage = if (dryRun) "正在关闭视频并释放摄像头…" else "正在校验本次启动配置…")

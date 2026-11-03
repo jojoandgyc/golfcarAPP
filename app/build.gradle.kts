@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 16
-        versionName = "1.8.5-presence-stability"
+        versionCode = 17
+        versionName = "1.8.6-video-handover"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -1,0 +1,142 @@
+{
+  "date": "2026-11-03",
+  "versionName": "1.8.6-video-handover",
+  "versionCode": 17,
+  "apkSha256": "995c5d82af80dedeaaf2c0ba48de4a0741293cdcc6f316e02aaca13a61827875",
+  "baseCommit": "47ce66e",
+  "changes": [
+    "Remote receive-only preview intent survives unexpected SSH loss; explicit disconnect, video stop, connection identity changes and follow start revoke it.",
+    "Default-network changes notify the existing player; transport-only page failures retry without bypassing TLS or authentication.",
+    "TURN 486 failures retain bounded quota cooldown across page reloads; a single failing candidate does not discard other viable candidates.",
+    "Playing requires a decoded frame; missing first frames time out. Fixed-code error history avoids coalesced title notifications losing diagnostics."
+  ],
+  "domesticDeployment": {
+    "host": "world-agents.com",
+    "root": "/data/golfcar",
+    "turn": {
+      "deployed": true,
+      "version": "4.6.2-r0",
+      "maxBytesPerSecondPerAllocation": 1250000,
+      "reservedCapacityBytesPerSecond": 40000000,
+      "totalQuota": 32,
+      "userQuota": 16,
+      "configSha256": "12811f32c9779645a9125e280d1f2bc35040c315a05c3d7c9a9549d624f32140",
+      "backupDirectory": "/data/golfcar/private/turn-quota-backups/20261103T094840461082Z",
+      "rollback": "sudo python3 /data/golfcar/private/turn-quota-backups/20261103T094840461082Z/restore.py",
+      "rollbackPrecondition": "Control and video idle; rollback script also refuses active TURN clients/allocations.",
+      "otherContainerStatesUnchanged": 17
+    },
+    "web": {
+      "deployed": true,
+      "files": {
+        "player.js": "05fe96686faa536a8f70583465b2855d13f111b92ed42a531846ec9ad8e303ea",
+        "whep.js": "d3365c22b2158f6923d597f2e2c4c1e458e13e75ae07d3b371c985207b0160b9"
+      },
+      "verification": "Host, directory bind mount and authenticated public HTTPS response hashes match; HTTP 200.",
+      "serviceRestarted": false,
+      "rollback": "sudo python3 /data/golfcar/private/web-asset-backups/20261103T100236943297Z/restore.py"
+    }
+  },
+  "validation": {
+    "jvmTestsPassed": 228,
+    "nodeTestsPassed": 22,
+    "relayConfigurationTestsPassed": 18,
+    "syntheticIsolationTestsPassed": 8,
+    "emulatorUiTestsPassed": 8,
+    "emulatorRealVideoRecoveryTestsPassed": 1,
+    "realVideoRecovery": [
+      {
+        "marker": "REMOTE_VIDEO_STEADY_STATE",
+        "time": "11-03 10:32:00.766",
+        "data": {
+          "sampleSeconds": 30.396797457,
+          "decodedFrameDelta": 602,
+          "decodedFps": 19.804717942789956,
+          "rttSamples": 11,
+          "rttP50Ms": 98,
+          "rttP95Ms": 109,
+          "rttValuesMs": [
+            95,
+            97,
+            97,
+            97,
+            97,
+            98,
+            98,
+            101,
+            102,
+            103,
+            109
+          ],
+          "protocols": "udp/udp/udp"
+        }
+      },
+      {
+        "marker": "REMOTE_VIDEO_SYNTHETIC_OK",
+        "time": "11-03 10:32:00.932",
+        "data": {
+          "state": "playing",
+          "failure": "",
+          "candidateType": "relay",
+          "title": "FollowingCarVideo:playing",
+          "messageEmpty": true,
+          "roundTripMs": 103,
+          "statsSequence": 13,
+          "localProtocol": "udp",
+          "relayProtocol": "udp",
+          "remoteProtocol": "udp",
+          "readerGeneration": 1,
+          "framesDecoded": 672,
+          "width": 1280,
+          "height": 480,
+          "readyState": 4
+        }
+      },
+      {
+        "marker": "REMOTE_VIDEO_INJECTED_NETWORK_NOTICE",
+        "time": "11-03 10:32:00.997",
+        "data": {
+          "actualPhoneTransport": "Wi-Fi",
+          "actualInternetValidated": false,
+          "injectedInternetValidated": true,
+          "changedActualNetwork": false
+        }
+      },
+      {
+        "marker": "REMOTE_VIDEO_RECOVERY_OK",
+        "time": "11-03 10:32:13.750",
+        "data": {
+          "stage": "receiver_only_simulated_network_notice",
+          "recoveryMs": 4502,
+          "stableSampleMs": 8250,
+          "readerGenerationBefore": 1,
+          "readerGenerationAfter": 3,
+          "decodedFrameDelta": 121,
+          "frameAdvanceSamples": 2,
+          "phoneTransport": "injected_network_notice",
+          "internetValidated": false,
+          "localProtocol": "udp",
+          "relayProtocol": "udp",
+          "roundTripMs": 97,
+          "controlConnected": false
+        }
+      }
+    ],
+    "controlOrVideoServiceCallbacks": 0,
+    "physicalCameraOpened": false,
+    "motorOpened": false,
+    "cleanup": {
+      "syntheticSourceStopped": true,
+      "port8554Closed": true,
+      "boardControlAvailable": true,
+      "originalVideoServices": "inactive",
+      "originalEmulatorIdentityMetadataUnchanged": true,
+      "temporaryTestIdentityAndImportFileRemoved": true
+    }
+  },
+  "pending": [
+    "Phone APK installation: phone was unplugged before installation.",
+    "Real Wi-Fi to cellular and back validation: opt-in test is implemented but not executed this round. Emulator recovery injects a network notice; it does not change the physical network."
+  ],
+  "scope": "Only domestic relay deployed. Overseas services, board Wi-Fi, motor configuration, control heartbeat and stop rules unchanged."
+}

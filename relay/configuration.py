@@ -20,6 +20,13 @@ FRP_SHA256 = {
 SERVICE_USER = "followingcar-relay"
 CONFIG_ROOT = "/etc/followingcar-relay"
 INSTALL_ROOT = "/opt/followingcar-relay"
+# Coturn reserves max-bps for each allocation before media starts. Keep the pool
+# consistent with total-quota so candidate gathering/network handover cannot run
+# out after only eight allocations. These are reservation limits, not link speed.
+TURN_MAX_BPS = 1_250_000
+TURN_TOTAL_QUOTA = 32
+TURN_USER_QUOTA = 16
+TURN_BPS_CAPACITY = TURN_MAX_BPS * TURN_TOTAL_QUOTA
 
 
 @dataclass(frozen=True)
@@ -250,10 +257,10 @@ no-multicast-peers
 # Both remote peers must allocate on this server; do not relay to arbitrary hosts.
 denied-peer-ip=0.0.0.0-255.255.255.255
 allowed-peer-ip={settings.public_ip}
-user-quota=4
-total-quota=32
-max-bps=1250000
-bps-capacity=10000000
+user-quota={TURN_USER_QUOTA}
+total-quota={TURN_TOTAL_QUOTA}
+max-bps={TURN_MAX_BPS}
+bps-capacity={TURN_BPS_CAPACITY}
 relay-threads=1
 stale-nonce=600
 log-file=stdout

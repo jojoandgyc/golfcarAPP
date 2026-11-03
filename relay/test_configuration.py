@@ -72,6 +72,20 @@ class RelayConfigurationTest(unittest.TestCase):
         self.assertNotIn("webrtcLocalUDPAddress", text)
         self.assertIn("24-hour", text)
 
+    def test_turn_reservation_pool_covers_bounded_allocation_quota(self):
+        values = dict(line.split("=", 1) for line in coturn_config(self.settings, "a" * 64).splitlines()
+                      if "=" in line and not line.startswith("#"))
+        per_allocation = int(values["max-bps"])
+        total = int(values["total-quota"])
+        per_user = int(values["user-quota"])
+        self.assertEqual(1_250_000, per_allocation)  # Keep the existing media rate bound.
+        self.assertEqual(32, total)
+        self.assertEqual(per_allocation * total, int(values["bps-capacity"]))
+        # Two peers, three TURN transports, and old/new ICE generations during handover.
+        self.assertGreaterEqual(per_user, 2 * 3 * 2)
+        self.assertLessEqual(per_user, total // 2)  # One identity cannot reserve the whole server.
+        self.assertLessEqual(total, self.settings.relay_max - self.settings.relay_min + 1)
+
     def test_input_injection_and_invalid_ranges_rejected(self):
         for settings in (RelaySettings(host='a"\ncommand'), RelaySettings(public_ip="127.1"),
                          RelaySettings(control_port=443), RelaySettings(video_port=2443),

@@ -30,6 +30,11 @@ class DomesticRenderTest(unittest.TestCase):
         self.assertIn(f"listening-ip={TURN_IP}", turn)
         self.assertIn(f"external-ip={PUBLIC_IP}/{TURN_IP}", turn)
         self.assertIn("min-port=62000\nmax-port=62099", turn)
+        limits = dict(line.split("=", 1) for line in turn.splitlines() if "=" in line and not line.startswith("#"))
+        self.assertEqual("1250000", limits["max-bps"])
+        self.assertEqual("32", limits["total-quota"])
+        self.assertEqual("16", limits["user-quota"])
+        self.assertEqual("40000000", limits["bps-capacity"])
 
     def test_compose_publishes_only_expected_ports(self):
         compose = (Path(__file__).parent / "compose.yaml").read_text()

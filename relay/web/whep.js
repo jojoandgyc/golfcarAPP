@@ -6,6 +6,8 @@
  */
 (function (root) {
   "use strict";
+  const QUOTA_STORAGE_KEY = "followingcar.turn-quota.v1";
+  const MAX_QUOTA_WAIT_MS = 300_000;
 
   function iceServersFromLink(link, expectedHost) {
     if (typeof link !== "string" || link.length > 16384) throw new Error("invalid_ice_config");
@@ -79,6 +81,7 @@
       "invalid_ice_config", "missing_turn_server", "invalid_offer", "invalid_candidate",
       "invalid_session_location", "invalid_answer", "candidate_overflow", "non_relay_candidate",
       "non_relay_transport", "media_disconnected", "media_timeout", "media_stalled",
+      "turn_quota_exceeded", "first_frame_timeout",
     ]).has(message)) return message;
     if (error?.name === "AbortError") return "request_timeout";
     if (error?.name === "TypeError") return "network_error";
@@ -96,7 +99,17 @@
       }
       this.fetch = options.fetch || root.fetch.bind(root);
       this.makePeer = options.makePeer || ((config) => new root.RTCPeerConnection(config));
+      this.now = options.now || (() => root.performance.now());
+      this.setTimer = options.setTimeout || root.setTimeout.bind(root);
+      this.clearTimer = options.clearTimeout || root.clearTimeout.bind(root);
+      this.wallNow = options.wallNow || Date.now;
+      try { this.quotaStorage = options.quotaStorage === undefined ? root.localStorage : options.quotaStorage; }
+      catch (_) { this.quotaStorage = null; }
+      this.quotaStamp = null;
       this.closed = false;
+      this.paused = false;
+      this.authenticationBlocked = false;
+      this.opening = false;
       this.generation = 0;
       this.requests = new Set();
       this.pc = null;
@@ -107,31 +120,139 @@
       this.retry = null;
       this.statsTimer = null;
       this.connectionTimer = null;
+      this.firstFrameTimer = null;
+      this.networkTimer = null;
+      this.statsPending = false;
+      this.playing = false;
+      this.quotaSeen = false;
+      this.quotaFailures = 0;
+      this.retryFailures = 0;
+      this.retryNotBefore = 0;
+      this.quotaNotBefore = 0;
       this.lastFrameCount = null;
       this.lastFrameAt = null;
+      this.loadQuotaCooldown();
     }
 
     state(value) { if (this.options.onState) this.options.onState(value); }
-    current(generation) { return !this.closed && this.generation === generation; }
+    current(generation) { return !this.closed && !this.paused && this.generation === generation; }
 
     async request(url, init, deadlineMs = 10000) {
       const abort = new AbortController();
       this.requests.add(abort);
-      const timer = setTimeout(() => abort.abort(), deadlineMs);
+      const timer = this.setTimer(() => abort.abort(), deadlineMs);
       try {
         return await this.fetch(url, { ...init, credentials: "same-origin", mode: "same-origin",
           redirect: "error", cache: "no-store", signal: abort.signal });
       } finally {
-        clearTimeout(timer);
+        this.clearTimer(timer);
         this.requests.delete(abort);
       }
     }
 
     start() {
-      if (this.closed || this.pc || this.retry !== null) return;
+      if (this.closed || this.paused || this.authenticationBlocked || this.opening || this.pc || this.retry !== null) return;
+      this.loadQuotaCooldown();
+      if (this.now() < this.retryNotBefore) { this.scheduleStart(); return; }
       const generation = ++this.generation;
+      this.opening = true;
+      this.quotaSeen = false;
       this.state("connecting");
-      this.open(generation).catch((error) => this.fail(generation, error));
+      this.open(generation).catch((error) => this.fail(generation, error)).finally(() => {
+        if (this.current(generation)) this.opening = false;
+      });
+    }
+
+    scheduleStart() {
+      if (this.closed || this.paused || this.authenticationBlocked || this.pc || this.opening || this.retry !== null) return;
+      this.loadQuotaCooldown();
+      const remaining = Math.max(0, this.retryNotBefore - this.now());
+      if (remaining > 0) this.state(this.quotaNotBefore > this.now() ? "quota_wait" : "retrying");
+      this.retry = this.setTimer(() => { this.retry = null; this.start(); }, remaining);
+    }
+
+    loadQuotaCooldown() {
+      if (!this.quotaStorage) return;
+      try {
+        const raw = this.quotaStorage.getItem(QUOTA_STORAGE_KEY);
+        if (raw === null) return;
+        const value = JSON.parse(raw);
+        if (value?.version !== 1 || !Number.isSafeInteger(value.untilEpochMs) || value.untilEpochMs < 0 ||
+            !Number.isInteger(value.level) || value.level < 1 || value.level > 4) {
+          this.quotaStorage.removeItem(QUOTA_STORAGE_KEY); return;
+        }
+        const wall = this.wallNow();
+        const until = Math.min(value.untilEpochMs, wall + MAX_QUOTA_WAIT_MS);
+        // Write the bounded deadline back once; otherwise a malformed far-future value
+        // could create a new five-minute wait on every page reload.
+        const normalized = { version: 1, untilEpochMs: until, level: value.level };
+        if (until !== value.untilEpochMs) this.quotaStorage.setItem(QUOTA_STORAGE_KEY, JSON.stringify(normalized));
+        this.quotaStamp = normalized;
+        this.quotaFailures = Math.max(this.quotaFailures, value.level);
+        this.quotaNotBefore = Math.max(this.quotaNotBefore, this.now() + Math.max(0, until - wall));
+        this.retryNotBefore = Math.max(this.retryNotBefore, this.quotaNotBefore);
+      } catch (_) { /* Storage being disabled must not break video or certificate checks. */ }
+    }
+
+    saveQuotaCooldown() {
+      const value = { version: 1, untilEpochMs: this.wallNow() +
+        Math.min(MAX_QUOTA_WAIT_MS, Math.max(0, this.quotaNotBefore - this.now())), level: this.quotaFailures };
+      this.quotaStamp = value;
+      try { this.quotaStorage?.setItem(QUOTA_STORAGE_KEY, JSON.stringify(value)); } catch (_) {}
+    }
+
+    clearOwnQuotaCooldown() {
+      try {
+        const value = JSON.parse(this.quotaStorage?.getItem(QUOTA_STORAGE_KEY) || "null");
+        if (value && this.quotaStamp && value.untilEpochMs === this.quotaStamp.untilEpochMs &&
+            value.level === this.quotaStamp.level) this.quotaStorage.removeItem(QUOTA_STORAGE_KEY);
+      } catch (_) {}
+      this.quotaStamp = null;
+    }
+
+    // A single failed candidate must not discard another candidate that can still connect.
+    candidateError(generation, event) {
+      if (!this.current(generation) || event.errorCode !== 486 || this.playing || this.quotaSeen) return;
+      this.loadQuotaCooldown();
+      this.quotaSeen = true;
+      this.quotaFailures = Math.min(this.quotaFailures + 1, 4);
+      this.quotaNotBefore = Math.max(this.quotaNotBefore,
+        this.now() + Math.min(60_000 * (2 ** (this.quotaFailures - 1)), MAX_QUOTA_WAIT_MS));
+      this.retryNotBefore = Math.max(this.retryNotBefore, this.quotaNotBefore);
+      this.saveQuotaCooldown();
+      if (this.options.onError) this.options.onError("turn_quota_exceeded");
+    }
+
+    // Default-network events are hints for this receiver only; no vehicle command is sent.
+    networkChanged() {
+      if (this.closed || this.paused || this.authenticationBlocked || this.networkTimer !== null) return;
+      this.networkTimer = this.setTimer(() => {
+        this.networkTimer = null;
+        if (this.closed || this.paused || this.authenticationBlocked) return;
+        ++this.generation;
+        this.release();
+        this.clearTimer(this.retry);
+        this.retry = null;
+        this.scheduleStart();
+      }, 350);
+    }
+
+    pause() {
+      if (this.closed || this.paused) return;
+      this.paused = true;
+      ++this.generation;
+      this.clearTimer(this.retry);
+      this.clearTimer(this.networkTimer);
+      this.retry = this.networkTimer = null;
+      this.release();
+      this.state("closed");
+    }
+
+    resume() {
+      if (this.closed) return;
+      this.paused = false;
+      if (this.authenticationBlocked) { this.state("authentication_failed"); return; }
+      this.scheduleStart();
     }
 
     async open(generation) {
@@ -155,12 +276,15 @@
         this.candidates.push(event.candidate);
         this.flushCandidates(generation);
       };
+      pc.onicecandidateerror = (event) => this.candidateError(generation, event);
       pc.onconnectionstatechange = () => {
         if (!this.current(generation)) return;
         if (pc.connectionState === "connected") {
-          clearTimeout(this.connectionTimer);
+          this.clearTimer(this.connectionTimer);
           this.connectionTimer = null;
-          this.state("playing");
+          if (!this.playing && this.firstFrameTimer === null) {
+            this.firstFrameTimer = this.setTimer(() => this.fail(generation, new Error("first_frame_timeout")), 12_000);
+          }
           this.pollStats(generation);
         } else if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
           this.fail(generation, new Error("media_disconnected"));
@@ -185,7 +309,7 @@
       if (!this.current(generation)) return;
       this.flushCandidates(generation);
       if (pc.connectionState !== "connected") {
-        this.connectionTimer = setTimeout(() => this.fail(generation, new Error("media_timeout")), 15000);
+        this.connectionTimer = this.setTimer(() => this.fail(generation, new Error("media_timeout")), 15000);
       }
     }
 
@@ -206,7 +330,8 @@
     }
 
     async pollStats(generation) {
-      if (!this.current(generation) || !this.pc || this.statsTimer !== null) return;
+      if (!this.current(generation) || !this.pc || this.statsTimer !== null || this.statsPending) return;
+      this.statsPending = true;
       try {
         const report = await this.pc.getStats();
         if (!this.current(generation)) return;
@@ -222,19 +347,29 @@
           }
         });
         if (hasFrameCounter && this.lastFrameCount !== null && framesDecoded <= this.lastFrameCount) {
-          if (this.lastFrameAt !== null && root.performance.now() - this.lastFrameAt >= 6000) {
+          if (this.lastFrameAt !== null && this.now() - this.lastFrameAt >= 6000) {
             this.fail(generation, new Error("media_stalled"));
             return;
           }
         } else if (hasFrameCounter && framesDecoded > 0) {
           this.lastFrameCount = framesDecoded;
-          this.lastFrameAt = root.performance.now();
+          this.lastFrameAt = this.now();
         }
         const local = selected && report.get(selected.localCandidateId);
         const remote = selected && report.get(selected.remoteCandidateId);
         const rtt = selected && selected.currentRoundTripTime;
         const protocol = (value) => ["udp", "tcp", "tls"].includes(value) ? value : "unknown";
         if (local && local.candidateType !== "relay") throw new Error("non_relay_transport");
+        if (hasFrameCounter && framesDecoded > 0 && !this.playing) {
+          this.playing = true;
+          this.clearTimer(this.firstFrameTimer);
+          this.firstFrameTimer = null;
+          this.quotaSeen = false;
+          this.clearOwnQuotaCooldown();
+          this.quotaFailures = this.retryFailures = 0;
+          this.retryNotBefore = this.quotaNotBefore = 0;
+          this.state("playing");
+        }
         if (this.options.onStats) this.options.onStats({ candidateType: local?.candidateType,
           roundTripMs: typeof rtt === "number" && Number.isFinite(rtt) ? Math.round(rtt * 1000) : null,
           localProtocol: protocol(local?.protocol), relayProtocol: protocol(local?.relayProtocol),
@@ -243,53 +378,74 @@
       } catch (error) {
         if (error.message === "non_relay_transport") { this.fail(generation, error); return; }
         // Stats are optional and must not interrupt decoding when a browser lacks a report field.
+      } finally {
+        if (this.current(generation)) this.statsPending = false;
       }
-      if (this.current(generation)) this.statsTimer = setTimeout(() => {
+      if (this.current(generation)) this.statsTimer = this.setTimer(() => {
+        // A queued callback from a released peer must not clear its replacement's timer.
+        if (!this.current(generation)) return;
         this.statsTimer = null;
         this.pollStats(generation);
-      }, 3000);
+      }, this.playing ? 3000 : 1000);
     }
 
     deleteSession(session) {
       // Deletion is best effort and deliberately independent of aborted offer/candidate requests.
       const abort = new AbortController();
-      const timer = setTimeout(() => abort.abort(), 3000);
+      const timer = this.setTimer(() => abort.abort(), 3000);
       Promise.resolve().then(() => this.fetch(session, { method: "DELETE", credentials: "same-origin", mode: "same-origin",
         redirect: "error", cache: "no-store", keepalive: true, signal: abort.signal }))
-        .catch(() => {}).finally(() => clearTimeout(timer));
+        .catch(() => {}).finally(() => this.clearTimer(timer));
     }
 
     release() {
       this.requests.forEach((request) => request.abort());
       this.requests.clear();
-      clearTimeout(this.statsTimer);
-      clearTimeout(this.connectionTimer);
-      this.statsTimer = this.connectionTimer = null;
-      if (this.pc) { this.pc.onconnectionstatechange = null; this.pc.close(); this.pc = null; }
+      this.clearTimer(this.statsTimer);
+      this.clearTimer(this.connectionTimer);
+      this.clearTimer(this.firstFrameTimer);
+      this.statsTimer = this.connectionTimer = this.firstFrameTimer = null;
+      if (this.pc) {
+        this.pc.onconnectionstatechange = this.pc.onicecandidateerror = this.pc.onicecandidate = this.pc.ontrack = null;
+        this.pc.close(); this.pc = null;
+      }
       if (this.session) { this.deleteSession(this.session); this.session = null; }
       this.offer = null;
       this.candidates = [];
       this.patchRunning = false;
+      this.opening = this.statsPending = this.playing = false;
       this.lastFrameCount = this.lastFrameAt = null;
     }
 
     fail(generation, error) {
       if (!this.current(generation)) return;
+      const reason = safeFailureCode(error);
+      const auth = /^http_(401|403)$/.test(reason);
+      const quota = this.quotaSeen;
       ++this.generation;
       this.release();
-      const reason = safeFailureCode(error);
       if (this.options.onError) this.options.onError(reason);
-      const auth = /^http_(401|403)$/.test(reason);
+      this.authenticationBlocked = auth;
       this.state(auth ? "authentication_failed" : reason === "media_stalled" ? "media_stalled" : "retrying");
-      if (!auth) this.retry = setTimeout(() => { this.retry = null; this.start(); }, 2000);
+      if (!auth) {
+        this.retryFailures = Math.min(this.retryFailures + 1, 5);
+        if (quota) {
+          this.quotaNotBefore = Math.max(this.quotaNotBefore, this.now() + 60_000);
+          this.saveQuotaCooldown();
+        }
+        this.retryNotBefore = Math.max(this.retryNotBefore, this.now() +
+          (quota ? 60_000 : Math.min(2000 * (2 ** (this.retryFailures - 1)), 30_000)));
+        this.scheduleStart();
+      }
     }
 
     close() {
       if (this.closed) return;
       this.closed = true;
       ++this.generation;
-      clearTimeout(this.retry);
-      this.retry = null;
+      this.clearTimer(this.retry);
+      this.clearTimer(this.networkTimer);
+      this.retry = this.networkTimer = null;
       this.release();
       this.state("closed");
     }

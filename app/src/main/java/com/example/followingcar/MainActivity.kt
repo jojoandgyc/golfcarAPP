@@ -494,6 +494,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
 @Composable
 private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifier: Modifier = Modifier) {
     val remoteVideo by viewModel.remoteVideo.collectAsStateWithLifecycle()
+    val networkSnapshot by viewModel.networkSnapshot.collectAsStateWithLifecycle()
     var useDirectionPad by rememberSaveable { mutableStateOf(false) }
     var manualSection by rememberSaveable { mutableStateOf(ManualSection.DRIVE) }
     var waitingForModeStop by remember { mutableStateOf(false) }
@@ -561,6 +562,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                         BoardCameraPreview(state = state,
                             onVideoServiceEnabledChange = viewModel::setVideoServiceEnabled,
                             remoteVideo = if (state.remoteMode) remoteVideo else null,
+                            phoneNetwork = networkSnapshot.health.phone,
                             modifier = Modifier.fillMaxWidth().height(panelHeight))
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
