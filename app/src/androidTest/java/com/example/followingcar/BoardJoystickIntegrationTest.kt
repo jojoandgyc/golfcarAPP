@@ -3,6 +3,7 @@ package com.example.followingcar
 import android.os.SystemClock
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -36,7 +37,7 @@ class BoardJoystickIntegrationTest {
             connectThroughUi(viewModel, password)
             enableDryRun(viewModel)
 
-            compose.onNodeWithTag("joystick").performScrollTo().performTouchInput {
+            compose.onNodeWithTag("joystick").performTouchInput {
                 down(center)
                 moveTo(Offset(center.x, height * 0.2f))
             }
@@ -69,7 +70,7 @@ class BoardJoystickIntegrationTest {
             compose.onNodeWithTag("joystick").performTouchInput { up() }
             awaitNeutralAck(viewModel)
 
-            compose.onNodeWithTag("emergencyStop").performScrollTo().performClick()
+            compose.onNodeWithTag("emergencyStop").performClick()
             awaitDisabled(viewModel)
             compose.runOnIdle {
                 assertTrue(viewModel.state.value.driveConfirmedStopped)
@@ -124,6 +125,12 @@ class BoardJoystickIntegrationTest {
 
     private fun connectThroughUi(viewModel: BoardViewModel, password: String) {
         val arguments = InstrumentationRegistry.getArguments()
+        compose.waitUntil(15_000) { !viewModel.state.value.remoteProfileLoading }
+        compose.onNodeWithTag("pageConnection").performClick()
+        compose.onNodeWithTag("connectionLanMode").performScrollTo().performClick()
+        if (compose.onAllNodesWithTag("host").fetchSemanticsNodes().isEmpty()) {
+            compose.onNodeWithTag("connectionLoginSettings").performScrollTo().performClick()
+        }
         compose.onNodeWithTag("host").performScrollTo()
             .performTextReplacement(arguments.getString("boardHost") ?: "172.16.16.82")
         compose.onNodeWithTag("username").performScrollTo()
@@ -138,6 +145,8 @@ class BoardJoystickIntegrationTest {
     }
 
     private fun enableDryRun(viewModel: BoardViewModel) {
+        // Enter the fixed manual layout before starting the simulated session.
+        compose.onNodeWithTag("pageJoystick").performClick()
         compose.runOnUiThread { viewModel.enableDrive(dryRun = true) }
         compose.waitUntil(8_000) {
             viewModel.state.value.driveEnabled || viewModel.state.value.driveError != null

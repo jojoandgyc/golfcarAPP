@@ -9,6 +9,7 @@ import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -30,6 +31,7 @@ class BoardPagesTest {
 
     @Test
     fun tabsShowConnectionFollowJoystickMotorAndTerminalControls() {
+        showLocalLoginSettings()
         compose.onNodeWithTag("host").assertExists()
         compose.onNodeWithTag("pageFollow").performClick()
         compose.onNodeWithTag("followTargetDistance").assertExists()
@@ -44,6 +46,7 @@ class BoardPagesTest {
         compose.onNodeWithTag("pageTerminal").performClick()
         compose.onNodeWithTag("command").assertExists()
         compose.onNodeWithTag("pageConnection").performClick()
+        showLocalLoginSettings()
         compose.onNodeWithTag("host").assertExists()
     }
 
@@ -61,9 +64,32 @@ class BoardPagesTest {
         compose.onNodeWithTag("connectionSummary").assertDoesNotExist()
         compose.onNodeWithTag("motorConfigurationRead").assertIsDisplayed().assertIsNotEnabled()
         compose.onNodeWithTag("motorConfigurationReview").assertIsDisplayed().assertIsNotEnabled()
-        MotorConfigurationField.entries.forEach { field ->
-            compose.onNodeWithTag("motorConfigurationField_${field.id}")
-                .performScrollTo().assertIsNotEnabled()
+        // The overview deliberately does not compose editors. Visit every category and expand
+        // its collapsed groups before checking that all unread fields remain locked.
+        MotorConfigurationField.entries.groupBy { field ->
+            when (field.group) {
+                MotorConfigurationGroup.COMMON, MotorConfigurationGroup.RIGHT_MOTOR,
+                MotorConfigurationGroup.LEFT_MOTOR -> "MOTOR"
+                MotorConfigurationGroup.SYSTEM -> "PROTECTION"
+                MotorConfigurationGroup.BRAKE -> "BRAKE"
+                MotorConfigurationGroup.RS485, MotorConfigurationGroup.CAN,
+                MotorConfigurationGroup.TTL -> "COMMUNICATION"
+                MotorConfigurationGroup.PID_SPEED, MotorConfigurationGroup.PID_D,
+                MotorConfigurationGroup.PID_Q, MotorConfigurationGroup.PID_PARKING -> "PID"
+            }
+        }.forEach { (category, fields) ->
+            compose.onNodeWithTag("motorConfigurationTab_$category").performScrollTo().performClick()
+            fields.groupBy { it.group }.forEach { (group, members) ->
+                if (compose.onAllNodesWithTag("motorConfigurationField_${members.first().id}")
+                        .fetchSemanticsNodes().isEmpty()) {
+                    compose.onNodeWithTag("motorConfigurationGroup_${group.name}")
+                        .performScrollTo().performClick()
+                }
+                members.forEach { field ->
+                    compose.onNodeWithTag("motorConfigurationField_${field.id}")
+                        .performScrollTo().assertIsNotEnabled()
+                }
+            }
         }
         compose.onNodeWithTag("motorConfigurationRead").assertIsDisplayed()
         compose.onNodeWithTag("motorConfigurationReview").assertIsDisplayed()
@@ -117,7 +143,8 @@ class BoardPagesTest {
     @Test
     fun drivingVideoAndControlsFitWithoutPageScrolling() {
         compose.onNodeWithTag("boardHeader").assertIsDisplayed()
-        compose.onNodeWithTag("connectionSummary").assertIsDisplayed()
+        compose.onNodeWithTag("connectionSetupCard").assertIsDisplayed()
+        compose.onNodeWithTag("connectionStatus").assertIsDisplayed()
         compose.onNodeWithTag("pageJoystick").performClick()
         assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
         compose.onNodeWithTag("boardHeader").assertDoesNotExist()
@@ -143,7 +170,8 @@ class BoardPagesTest {
 
         compose.onNodeWithTag("pageConnection").performClick()
         compose.onNodeWithTag("boardHeader").assertIsDisplayed()
-        compose.onNodeWithTag("connectionSummary").assertIsDisplayed()
+        compose.onNodeWithTag("connectionSetupCard").assertIsDisplayed()
+        compose.onNodeWithTag("connectionStatus").assertIsDisplayed()
     }
 
     @Test
@@ -164,7 +192,19 @@ class BoardPagesTest {
         compose.onNodeWithTag("followConfigurationToggle").performScrollTo().performClick()
         compose.onNodeWithTag("inspectFollowConfiguration").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithTag("followConnect").assertIsDisplayed().performClick()
-        compose.onNodeWithTag("host").assertIsDisplayed()
+        compose.onNodeWithTag("connectionSetupCard").assertIsDisplayed()
         compose.onNodeWithTag("boardHeader").assertIsDisplayed()
+        showLocalLoginSettings()
+        compose.onNodeWithTag("host").performScrollTo().assertIsDisplayed()
+    }
+
+    private fun showLocalLoginSettings() {
+        val model = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        compose.waitUntil(15_000) { !model.state.value.remoteProfileLoading }
+        compose.onNodeWithTag("connectionLanMode").performScrollTo().performClick()
+        // Empty credentials expand automatically; saved credentials start collapsed.
+        if (compose.onAllNodesWithTag("host").fetchSemanticsNodes().isEmpty()) {
+            compose.onNodeWithTag("connectionLoginSettings").performScrollTo().performClick()
+        }
     }
 }

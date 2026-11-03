@@ -23,13 +23,16 @@ class BluetoothStatusUiTest {
         assumeTrue(args.getString("runBluetoothStatus") == "true")
         assumeTrue(args.getString("confirmedControlIdle") == "true")
         val model = ViewModelProvider(compose.activity)[BoardViewModel::class.java]
-        compose.waitUntil(15_000) { !model.state.value.remoteProfileLoading }
+        compose.waitUntil(15_000) {
+            !model.state.value.remoteProfileLoading && !model.pairing.state.value.recoveryLoading
+        }
         assertTrue(model.state.value.canManagePairing)
         assertFalse(model.pairing.state.value.hotspotActive)
         assertFalse(model.pairing.state.value.confirmationRequired)
         val oldHost = model.state.value.host
         compose.onNodeWithTag("pageConnection").performClick()
         compose.onNodeWithTag("connectionLanMode").performScrollTo().performClick()
+        compose.onNodeWithTag("connectionPairingDetails").performScrollTo().performClick()
         repeat(3) {
             // Let Android release the previous idle ACL; test fresh radio establishment,
             // rather than passing three times through one still-open physical connection.

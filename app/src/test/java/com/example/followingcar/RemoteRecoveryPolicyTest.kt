@@ -11,8 +11,11 @@ class RemoteRecoveryPolicyTest {
         val state = BoardUiState(remoteProfile = profile, pairingUnconfirmed = true,
             followUncertain = true, motorActionUnconfirmed = true)
         assertFalse(state.canManageConnectionMode)
+        assertNull(state.connectionSelectionBlockReason())
         assertTrue(state.canSelectRemoteMode)
         assertTrue(state.canReconnectViaRemote)
+        assertNull(state.connectionBlockReason(ConnectionMethod.REMOTE,
+            WifiDirectState(confirmationRequired = true)))
         val connected = state.copy(remoteMode = true, connected = true)
         assertTrue(connected.followUncertain)
         assertTrue(connected.motorActionUnconfirmed)

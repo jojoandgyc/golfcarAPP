@@ -3,11 +3,13 @@ package com.example.followingcar
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assume.assumeTrue
@@ -26,14 +28,26 @@ class BoardScreenIntegrationTest {
         val password = arguments.getString("boardPassword").orEmpty()
         val useSavedCredentials = arguments.getString("useSavedBoardCredentials") == "true"
         assumeTrue("Opt in with boardPassword or useSavedBoardCredentials", password.isNotEmpty() || useSavedCredentials)
-        compose.onNodeWithTag("host").performTextReplacement(arguments.getString("boardHost") ?: "172.16.16.82")
-        compose.onNodeWithTag("username").performTextReplacement(arguments.getString("boardUsername") ?: "topeet")
+        val model = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        compose.waitUntil(15_000) { !model.state.value.remoteProfileLoading }
+        compose.onNodeWithTag("pageConnection").performClick()
+        compose.onNodeWithTag("connectionLanMode").performScrollTo().performClick()
+        if (compose.onAllNodesWithTag("host").fetchSemanticsNodes().isEmpty()) {
+            compose.onNodeWithTag("connectionLoginSettings").performScrollTo().performClick()
+        }
+        compose.onNodeWithTag("host").performScrollTo()
+            .performTextReplacement(arguments.getString("boardHost") ?: "172.16.16.82")
+        compose.onNodeWithTag("username").performScrollTo()
+            .performTextReplacement(arguments.getString("boardUsername") ?: "topeet")
         if (password.isNotEmpty()) {
             compose.onNodeWithTag("password").performScrollTo().performTextReplacement(password)
         }
         compose.onNodeWithTag("connect").performScrollTo().performClick()
-        compose.waitUntil(25_000) { textOf("connectionStatus") in listOf("已连接", "连接失败") }
-        compose.onNodeWithTag("connectionStatus").assertTextEquals("已连接")
+        compose.waitUntil(25_000) {
+            val state = model.state.value
+            (state.connected && !state.busy) || state.status == "连接失败"
+        }
+        compose.onNodeWithTag("connectionStatus").assertTextEquals("SSH 已连接")
 
         compose.onNodeWithTag("pageTerminal").performClick()
 

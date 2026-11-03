@@ -531,14 +531,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun updatePassword(value: String) = editConnection { copy(password = value) }
     fun updateCommand(value: String) { mutableState.update { it.copy(command = value) } }
 
-    fun setRemoteMode(remote: Boolean) {
-        if (!(if (remote) state.value.canSelectRemoteMode else state.value.canManageConnectionMode) ||
-            wifiDirect.mutationPending || (!remote &&
-            (wifiDirect.state.value.busy || wifiDirect.state.value.confirmationRequired))) return
+    fun setRemoteMode(remote: Boolean): Boolean {
+        val reason = if (disconnecting) "正在断开连接，请等待完成。"
+            else state.value.connectionSelectionBlockReason(wifiDirect.mutationPending)
+        if (reason != null) {
+            mutableState.update { it.copy(error = reason) }
+            return false
+        }
+        if (state.value.remoteMode == remote) return true
         preferences.edit().putBoolean("remote_mode", remote).apply()
-        mutableState.update { it.copy(remoteMode = remote, error = null, result = null, videoPreviewWanted = false) }
+        mutableState.update { it.withSelectedRemoteMode(remote) }
         Diagnostics.event("connection.mode_changed", ownerDiagnostic,
             fields = mapOf("mode" to if (remote) "REMOTE" else "LOCAL"), critical = true)
+        return true
     }
 
     private suspend fun reloadRemoteIdentity() {
@@ -636,16 +641,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connect(viaWifiDirect: Boolean = false) {
         val input = state.value
-        if (disconnecting || input.busy || input.remoteProfileLoading || input.pairingBusy || (!input.remoteMode && input.pairingUnconfirmed) || input.connected || input.manualActive ||
-            input.followActive || input.followStopping || input.videoServiceBusy) return
-        if (input.remoteMode && (viaWifiDirect || input.remoteProfile == null || input.remoteProfileError != null)) {
-            mutableState.update { it.copy(error = "请先导入有效的远程连接配置，并选择远程连接模式") }
-            return
-        }
         val wireless = wifiDirect.state.value
-        if (wifiDirect.mutationPending || (!input.remoteMode && wireless.confirmationRequired) || (viaWifiDirect && (wireless.busy || wireless.discovering))) {
-            mutableState.update { it.copy(error = if (wireless.confirmationRequired) "上次无线操作结果未确认，请点击刷新无线状态后再连接 SSH。"
-                else "请等待无线组操作结束，并停止搜索设备后再连接 SSH。") }
+        val method = when {
+            input.remoteMode -> ConnectionMethod.REMOTE
+            viaWifiDirect -> ConnectionMethod.WIFI_DIRECT
+            else -> ConnectionMethod.LAN
+        }
+        val reason = when {
+            disconnecting -> "正在断开连接，请等待完成。"
+            input.remoteMode && viaWifiDirect -> "远程连接不能同时使用 Wi-Fi 直连，请重新选择连接方式。"
+            else -> input.connectionBlockReason(method, wireless, wifiDirect.mutationPending)
+        }
+        if (reason != null) {
+            mutableState.update { it.copy(error = reason) }
             return
         }
         val directGroup = if (viaWifiDirect) DirectNetworkLease.from(wireless) else null

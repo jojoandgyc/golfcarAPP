@@ -32,4 +32,29 @@ class RemoteModeStateTest {
         assertFalse(state.canStartFollow)
         assertFalse(state.canEnableDrive)
     }
+
+    @Test fun selectingSettingsPreservesUnconfirmedControlAndPairingRecovery() {
+        val remote = BoardUiState(remoteMode = true, remoteProfile = profile, pairingUnconfirmed = true,
+            pairingHotspotActive = true, followUncertain = true, motorActionUnconfirmed = true,
+            videoPreviewWanted = true)
+        assertNull(remote.connectionSelectionBlockReason())
+        val local = remote.withSelectedRemoteMode(false)
+        assertFalse(local.remoteMode)
+        assertFalse(local.videoPreviewWanted)
+        assertTrue(local.pairingUnconfirmed)
+        assertTrue(local.pairingHotspotActive)
+        assertTrue(local.followUncertain)
+        assertTrue(local.motorActionUnconfirmed)
+        assertFalse(local.canManageWifiDirect)
+        assertFalse(local.canStartFollow)
+        assertFalse(local.canEnableDrive)
+    }
+
+    @Test fun reselectingCurrentModeDoesNotClearVideoIntentOrErrors() {
+        for (remote in listOf(false, true)) {
+            val current = BoardUiState(remoteMode = remote, videoPreviewWanted = true,
+                error = "last_operation_failed", followUncertain = true)
+            assertSame(current, current.withSelectedRemoteMode(remote))
+        }
+    }
 }

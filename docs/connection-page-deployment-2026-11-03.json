@@ -1,0 +1,91 @@
+{
+  "recordedUtc": "2026-11-03T13:37:00.830118+00:00",
+  "versionName": "1.8.7-connection-page",
+  "versionCode": 18,
+  "previousVersion": "1.8.6-video-handover",
+  "sourceCommitBefore": "48386ba",
+  "apkSha256": "58d67c35070ac85d49f44a7e688be851b6f518c43eb3249181e439a533dd4da1",
+  "scope": "Android connection page, connection policy, recovery entry points and related UI tests",
+  "rootCauses": [
+    "A persistent UNKNOWN local pairing result disabled LAN/Direct selection while remote mode hid the recovery entry.",
+    "The primary remote connect button reused a local pairing guard despite the SSH entry point allowing remote recovery.",
+    "LAN connect reused Wi-Fi Direct permission to manage a group, rejecting a confirmed phone hotspot.",
+    "UI could change its Direct selection after ViewModel rejected the mode change."
+  ],
+  "behavior": [
+    "Idle users can view all three methods with historical local uncertainty; selection sends no pairing or wireless-group commands.",
+    "Shared policy protects actual connections; remote connection is independent of historical local uncertainty.",
+    "Actual local connection remains blocked pending local confirmation; recovery appears in every method.",
+    "Connected/control-active/busy/mutating states retain guards and explain the action needed.",
+    "Main action and SSH state precede collapsible login and network details; passwords remain masked by default.",
+    "Same-method selection preserves receive-only video intent; mode change does not erase control or pairing recovery."
+  ],
+  "verification": {
+    "jvm": {
+      "tests": 242,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulator": {
+      "passed": 29,
+      "classes": [
+        "ConnectionSetupCardTest",
+        "ConnectionRecoveryCardTest",
+        "BoardPagesTest"
+      ],
+      "smallViewportDp": [
+        360,
+        420
+      ]
+    },
+    "physicalPhone": {
+      "model": "Samsung SM-S9280",
+      "passed": 2,
+      "tests": [
+        "ConnectionPageRecoveryUiTest",
+        "RemoteConnectionUiTest"
+      ],
+      "existingUnknownJournalUnchanged": true,
+      "threeMethodSelectionsPassed": true,
+      "remoteSshViaDomesticRelayPassed": true,
+      "savedLanCoordinatesPreserved": true,
+      "originalTestApkRestored": true,
+      "stayAwakeSettingUnchanged": true,
+      "finalState": "Connection page in remote mode, SSH disconnected, app foreground"
+    },
+    "boardBefore": {
+      "controlAvailable": true,
+      "videoActiveStates": [
+        "inactive",
+        "",
+        "inactive"
+      ]
+    },
+    "boardAfter": {
+      "controlAvailable": true,
+      "videoActiveStates": [
+        "inactive",
+        "inactive"
+      ]
+    },
+    "notExercised": [
+      "Actual Bluetooth recovery",
+      "Wi-Fi Direct group creation/removal",
+      "Real motor or camera operations"
+    ],
+    "initialUiAssertionsAdapted": [
+      "Password rendering is checked through TextLayoutResult, retaining password input semantics.",
+      "Motor field locks are checked after selecting their existing category/section."
+    ]
+  },
+  "deployment": {
+    "phoneInstalled": true,
+    "boardFilesChanged": false,
+    "serverFilesChanged": false,
+    "motorConfigurationChanged": false,
+    "wifiConfigurationChanged": false
+  },
+  "remainingLocalState": "The genuine prior UNKNOWN pairing record is intentionally retained; use the visible recovery action before local SSH or wireless-group changes.",
+  "localEvidenceDirectory": "E:\\Temp\\golfcar-connection-page-2026-11-03"
+}

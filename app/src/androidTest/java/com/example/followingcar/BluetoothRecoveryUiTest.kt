@@ -104,6 +104,7 @@ class BluetoothRecoveryUiTest {
             assertTrue("Only a confirmed historical outcome may clear the journal",
                 runBlocking { store.load() } == PairingRecoveryLoad.Empty)
             compose.onNodeWithTag("checkPairing").assertDoesNotExist()
+            compose.onNodeWithTag("connectionPairingDetails").performScrollTo().performClick()
             // Only assert the new pairing action is available. Never click it in this test.
             compose.onNodeWithTag("startPairing").performScrollTo().assertIsEnabled()
             completed = true
