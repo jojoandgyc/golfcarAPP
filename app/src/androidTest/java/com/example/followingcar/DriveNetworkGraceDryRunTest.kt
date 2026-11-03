@@ -5,7 +5,6 @@ import androidx.test.platform.app.InstrumentationRegistry
 import java.io.Closeable
 import java.io.File
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -41,11 +40,16 @@ class DriveNetworkGraceDryRunTest {
                 args.getString("confirmedControlIdle") == "true")
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val saved = context.getSharedPreferences("board_connection", 0)
-        val host = (args.getString("boardHost") ?: saved.getString("host", null)).orEmpty().trim()
-        val port = (args.getString("boardPort") ?: saved.getString("port", "22")).orEmpty().toInt()
+        val route = args.getString("driveGraceRoute") ?: "local"
+        require(route == "local" || route == "remote") { "driveGraceRoute must be local or remote" }
+        val credentials = if (route == "remote") RemoteCredentials(context) else null
+        val profile = credentials?.let { requireNotNull(it.load()) { "Import a remote profile before using the remote route" } }
+        val tls = credentials?.createTlsConfig()
+        val host = profile?.host ?: (args.getString("boardHost") ?: saved.getString("host", null)).orEmpty().trim()
+        val port = profile?.controlPort ?: (args.getString("boardPort") ?: saved.getString("port", "22")).orEmpty().toInt()
         val username = saved.getString("username", "topeet").orEmpty()
         val password = context.getSharedPreferences("board_credentials", 0).getString("password", "").orEmpty()
-        assumeTrue("A saved direct board connection is required",
+        assumeTrue("A board endpoint and saved SSH credentials are required",
             host.isNotBlank() && host != "127.0.0.1" && username.isNotBlank() && password.isNotEmpty())
         require(port in 1..65535)
         val observer = BoardSshClient()
@@ -54,13 +58,16 @@ class DriveNetworkGraceDryRunTest {
         var channel: BoardDriveChannel? = null
         val report = JSONObject().put("dryRun", true).put("execute", false)
             .put("cameraOpened", false).put("serialOpened", false)
+            .put("route", route).put("remoteHost", profile?.host ?: JSONObject.NULL)
             .put("holdDirection", direction.name).put("holdMs", holdMs)
         try {
             withTimeout(45_000) {
-                observer.connect(BoardConnection(host, port, username, password))
+                observer.connect(BoardConnection(host, port, username, password, tls))
                 assertTrue("Never run a fault test while board control is occupied",
                     observer.readFollowAvailability().controlAvailable)
-                val proxy = HoldingDriveSshRelay(host, port).also { relay = it }
+                val proxy = HoldingDriveSshRelay(host, port, tls).also { relay = it }
+                // TLS terminates only at this test-owned proxy socket. SSH still authenticates
+                // the pinned board key end to end, including the loopback client connection.
                 client.connect(BoardConnection("127.0.0.1", proxy.port, username, password))
                 val active = client.openDriveChannel(dryRun = true).also { channel = it }
                 assertTrue(active.ready.dryRun)
@@ -173,7 +180,11 @@ class DriveNetworkGraceDryRunTest {
 private enum class HoldDirection { BOTH, RETURN_ONLY }
 
 /** Two independent pumps preserve order and bytes; only these test-owned sockets are delayed. */
-private class HoldingDriveSshRelay(private val host: String, private val boardPort: Int) : Closeable {
+private class HoldingDriveSshRelay(
+    private val host: String,
+    private val boardPort: Int,
+    private val tls: RemoteTlsConfig? = null,
+) : Closeable {
     private val listener = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
     val port: Int get() = listener.localPort
     private val closed = AtomicBoolean()
@@ -183,9 +194,12 @@ private class HoldingDriveSshRelay(private val host: String, private val boardPo
         daemon("drive-grace-relay-accept") {
             while (!closed.get()) {
                 val local = runCatching { listener.accept().apply { tcpNoDelay = true } }.getOrNull() ?: break
-                val remote = Socket()
-                try { remote.tcpNoDelay = true; remote.connect(InetSocketAddress(host, boardPort), 5_000) }
-                catch (_: Exception) { local.close(); remote.close(); continue }
+                val rawSocket = Socket()
+                val remote = try {
+                    // Use the production transport, including client identity, CA validation,
+                    // hostname verification and SNI. The pumps only see encrypted SSH bytes.
+                    openBoardSocket(rawSocket, host, boardPort, 5_000, tls)
+                } catch (_: Exception) { local.close(); rawSocket.close(); continue }
                 val link = Link(local, remote)
                 links += link
                 daemon("drive-grace-relay-out") { link.pump(local, remote, link.outboundHoldUntil) }
