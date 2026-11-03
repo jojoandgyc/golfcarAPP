@@ -57,6 +57,7 @@ data class BoardUiState(
     val driveStatus: String = "手动控制未启用",
     val driveInterlock: DriveInterlock? = null,
     val driveRecoveryNeedsRelease: Boolean = false,
+    val driveFeedbackRecheck: Boolean = false,
     val drivePort: String = "自动检测串口",
     val driveError: String? = null,
     val driveFirstFailure: DiagnosticFailure? = null,
@@ -1221,7 +1222,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 driveFeedbackLeftRpm = null, driveFeedbackRightRpm = null, driveFeedbackVerified = false,
                 driveLastFeedbackNanos = 0L, driveFeedbackAgeAtReceiptMs = Long.MAX_VALUE,
                 driveInterlock = null,
-                driveStatus = "正在开启视频…", driveRecoveryNeedsRelease = false,
+                driveStatus = "正在开启视频…", driveRecoveryNeedsRelease = false, driveFeedbackRecheck = false,
                 parkingSupported = false, parkingSettings = null,
                 parkingUpdating = false, parkingStatus = "正在读取驻车设置…")
         }
@@ -1250,10 +1251,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     mutableState.update { it.copy(driveStatus = "正在确认实测停车反馈…") }
                     val initialStarted = System.nanoTime()
                     val initialAck = activeChannel.exchange(0, 0)
+                    handleDriveRecovery(initialAck, neutralRequest = true)
                     markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
                     mutableState.update { it.withDriveFeedback(initialAck).copy(
                         driveConfirmedStopped = initialAck.stopped && initialAck.hasFreshFeedback()) }
-                    if (state.value.driveConfirmedStopped) {
+                    if (state.value.driveConfirmedStopped && !initialAck.feedbackRecheck) {
                         Diagnostics.event("drive.initial_stop_acknowledged", driveDiagnostic, critical = true)
                         break
                     }
@@ -1291,23 +1293,42 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     // starts a competing channel transaction or queues a movement behind it.
                     val requestedParking = pendingParking
                     if (requestedParking != null) {
-                        check(desiredWheels.stopped && state.value.driveConfirmedStopped) { "请先停车再设置驻车" }
-                        val ack = client.configureParking(activeChannel, requestedParking, driveDiagnostic)
-                        handleDriveRecovery(ack)
-                        check(ack.stopped && ack.parking == requestedParking) { "开发板驻车设置回执不一致" }
-                        Diagnostics.event("parking.confirmed", driveDiagnostic,
-                            fields = mapOf("enabled" to requestedParking.enabled, "currentReadOnly" to true), critical = true)
-                        pendingParking = null
-                        mutableState.update {
-                            it.withDriveFeedback(ack).copy(parkingSettings = ack.parking, parkingUpdating = false,
-                                driveConfirmedStopped = ack.stopped && ack.hasFreshFeedback(),
-                                parkingStatus = if (activeChannel.ready.dryRun) "模拟驻车设置已确认"
-                                    else if (ack.hasFreshFeedback()) "停止模式已切换 · 电流参数未修改"
-                                    else "停止模式已切换 · 等待新鲜轮速反馈")
+                        val current = state.value
+                        val blocked = when {
+                            current.driveFeedbackRecheck -> "FEEDBACK_RECHECK"
+                            current.driveRecoveryNeedsRelease || driveRecoveryGate.needsRelease -> "CONTROL_RECOVERY"
+                            !desiredWheels.stopped || !current.driveConfirmedStopped -> "STOP_UNCONFIRMED"
+                            !current.hasFreshDriveFeedback() -> "FEEDBACK_STALE"
+                            else -> null
                         }
-                        // Recheck emergency/close before the next heartbeat, including when
-                        // the user pressed stop while the configuration ACK was in flight.
-                        continue
+                        if (blocked != null) {
+                            // The last healthy ACK may have admitted this click while another
+                            // heartbeat was in flight. Cancel the unsent mode change, not control.
+                            pendingParking = null
+                            if (!desiredWheels.stopped) desiredGeneration += 1
+                            desiredWheels = WheelSpeeds()
+                            mutableState.update { it.copy(parkingUpdating = false, driveLeft = 0, driveRight = 0,
+                                parkingStatus = "本次驻车切换已取消：停车反馈待复核，确认后请重新切换") }
+                            Diagnostics.event("parking.cancelled_before_send", driveDiagnostic,
+                                source = blocked, critical = true)
+                        } else {
+                            val ack = client.configureParking(activeChannel, requestedParking, driveDiagnostic)
+                            handleDriveRecovery(ack)
+                            check(ack.stopped && ack.parking == requestedParking) { "开发板驻车设置回执不一致" }
+                            Diagnostics.event("parking.confirmed", driveDiagnostic,
+                                fields = mapOf("enabled" to requestedParking.enabled, "currentReadOnly" to true), critical = true)
+                            pendingParking = null
+                            mutableState.update {
+                                it.withDriveFeedback(ack).copy(parkingSettings = ack.parking, parkingUpdating = false,
+                                    driveConfirmedStopped = ack.stopped && ack.hasFreshFeedback(),
+                                    parkingStatus = if (activeChannel.ready.dryRun) "模拟驻车设置已确认"
+                                        else if (ack.hasFreshFeedback()) "停止模式已切换 · 电流参数未修改"
+                                        else "停止模式已切换 · 等待新鲜轮速反馈")
+                            }
+                            // Recheck emergency/close before the next heartbeat, including when
+                            // the user pressed stop while the configuration ACK was in flight.
+                            continue
+                        }
                     }
                     val target = desiredWheels
                     val sentGeneration = desiredGeneration
@@ -1325,6 +1346,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                             driveInterlock = interlock,
                             driveStatus = when {
                                 !ack.hasFreshFeedback() -> "轮速反馈待更新 · 驻车设置暂不可用"
+                                it.driveFeedbackRecheck && !ack.stopped -> "轮速反馈复核中 · 保持停车"
+                                it.driveFeedbackRecheck -> "反馈已恢复 · 松手后再操作"
                                 driveRecoveryGate.needsRelease -> "网络恢复 · 目标已归零，请松手再操作"
                                 ack.recoveryRequired -> "网络已恢复 · 目标已归零"
                                 ack.targetStopped && !ack.stopped -> "目标已归零 · 等待实测停车"
@@ -1376,7 +1399,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     it.withTransportState(client.isConnected).copy(driveStarting = false, driveEnabled = false, driveStopping = false,
                         parkingSupported = false, parkingSettings = null, parkingUpdating = false, driveInterlock = null,
                         driveFeedbackVerified = false,
-                        driveRecoveryNeedsRelease = false,
+                        driveRecoveryNeedsRelease = false, driveFeedbackRecheck = false,
                         parkingStatus = if (parkingModeReleased && channel?.ready?.dryRun == true) "模拟驻车模式已退出，电流参数未修改"
                             else if (parkingModeReleased) "驻车模式已退出，电机电流参数未修改"
                             else if (it.driveError != null) it.parkingStatus
@@ -1392,22 +1415,28 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleDriveRecovery(ack: DriveAck, neutralRequest: Boolean = false) {
+        mutableState.update { it.copy(driveFeedbackRecheck = ack.feedbackRecheck ||
+            (it.driveFeedbackRecheck && driveRecoveryGate.needsRelease)) }
         if (!ack.recoveryRequired) {
             driveRecoveryGate.healthyAck(neutralRequest)
             return
         }
-        if (!driveRecoveryGate.recovered(neutralRequest)) return
+        // Feedback can start during the neutral ACK of an older network recovery.
+        // It must reset newly held input instead of being discarded as that duplicate ACK.
+        if (!driveRecoveryGate.recovered(neutralRequest && !ack.feedbackRecheck)) return
         desiredWheels = WheelSpeeds()
         desiredGeneration += 1
         mutableState.update { it.copy(driveLeft = 0, driveRight = 0,
             driveRecoveryNeedsRelease = driveRecoveryGate.needsRelease) }
         Diagnostics.event("drive.recovery_input_reset", driveDiagnostic,
+            source = if (ack.feedbackRecheck) "FEEDBACK_RECHECK" else "NETWORK_RECOVERY",
             fields = mapOf("needsRelease" to driveRecoveryGate.needsRelease), critical = true)
     }
 
     fun moveJoystick(x: Float, forward: Float) {
         if (!state.value.driveEnabled || state.value.followBlocksControl || state.value.parkingUpdating || pendingParking != null || stopRequest != null) return
         if (!driveRecoveryGate.input()) return
+        if (state.value.driveFeedbackRecheck) return
         val previous = desiredWheels
         desiredWheels = joystickToWheels(x, forward, state.value.speedLimit)
         if (previous != desiredWheels) desiredGeneration += 1
@@ -1431,7 +1460,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun changeSpeedLimit(value: Int) {
-        if (state.value.parkingUpdating || !desiredWheels.stopped || (state.value.driveEnabled &&
+        if (state.value.parkingUpdating || state.value.driveFeedbackRecheck || state.value.driveRecoveryNeedsRelease ||
+            !desiredWheels.stopped || (state.value.driveEnabled &&
                 (!state.value.driveConfirmedStopped || !state.value.hasFreshDriveFeedback()))) return
         mutableState.update { it.copy(speedLimit = value.coerceIn(10, 100)) }
         Diagnostics.event("drive.speed_limit_changed", activeDiagnostic(), fields = mapOf("rpm" to state.value.speedLimit))

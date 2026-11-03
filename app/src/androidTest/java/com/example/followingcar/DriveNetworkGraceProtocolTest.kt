@@ -114,6 +114,7 @@ class DriveNetworkGraceProtocolTest {
         assertEquals(900L, driveAckTimeoutMillis(control.ready.networkGraceMs))
         val reply = control.exchange(30, -30)
         assertFalse(reply.recoveryRequired)
+        assertFalse(reply.feedbackRecheck)
         assertFalse(reply.stopped)
         assertEquals(30, reply.left)
         assertEquals(-30, reply.right)
@@ -191,6 +192,38 @@ class DriveNetworkGraceProtocolTest {
                 }
             }.exceptionOrNull()
             assertTrue("$command cannot succeed while wheels are still moving", failure is IOException)
+            assertFalse(control.isOpen)
+        }
+    }
+
+    @Test fun briefFeedbackRecheckPreservesRawRpmAndUsesItsOwnDiagnosticSource() = runBlocking {
+        val control = open(ready(), ack(recovery = true).put("feedbackRecheck", true)
+            .put("stopped", false).put("feedbackLeftRpm", -1).put("feedbackSamples", 0),
+            ack(seq = 2, recovery = true).put("feedbackRecheck", true),
+            ack(seq = 3, left = 30, right = -30, recovery = false).put("feedbackRecheck", false))
+        val pending = control.exchange(30, -30)
+        assertTrue(pending.feedbackRecheck)
+        assertTrue(pending.recoveryRequired)
+        assertTrue(pending.targetStopped)
+        assertFalse(pending.stopped)
+        assertEquals(-1, pending.feedback?.leftRpm)
+        val recovered = control.exchange(0, 0)
+        assertTrue(recovered.feedbackRecheck)
+        assertTrue(recovered.stopped)
+        assertFalse(control.exchange(30, -30).feedbackRecheck)
+        assertTrue(control.isOpen)
+        assertTrue(engine.snapshot().failures.isEmpty())
+        val events = engine.snapshot().events.map(::JSONObject).map { it.optString("event") }
+        assertTrue("drive.feedback_recheck" in events)
+        assertFalse("drive.network_recovery" in events)
+    }
+
+    @Test fun malformedOrUnprotectedFeedbackRecheckIsRejected() = runBlocking {
+        for (reply in listOf(ack().put("feedbackRecheck", "true"), ack().put("feedbackRecheck", 1),
+            ack().put("feedbackRecheck", JSONObject.NULL), ack(recovery = false).put("feedbackRecheck", true),
+            ack(left = 30, right = -30).put("feedbackRecheck", true))) {
+            val control = open(ready(), reply)
+            assertTrue(runCatching { control.exchange(30, -30) }.exceptionOrNull() is IOException)
             assertFalse(control.isOpen)
         }
     }

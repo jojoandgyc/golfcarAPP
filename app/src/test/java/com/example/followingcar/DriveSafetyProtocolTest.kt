@@ -127,6 +127,7 @@ class DriveSafetyProtocolTest {
         assertFalse(ready.canEditParkingAt(received + 451_000_000L))
         for (locked in listOf(ready.copy(driveFeedbackVerified = false), ready.copy(driveConfirmedStopped = false),
             ready.copy(driveFeedbackLeftRpm = 1), ready.copy(driveFeedbackRightRpm = -1),
+            ready.copy(driveFeedbackRecheck = true), ready.copy(driveRecoveryNeedsRelease = true),
             ready.copy(motorActionUnconfirmed = true), ready.copy(followUncertain = true)))
             assertFalse(locked.canEditParkingAt(received))
     }

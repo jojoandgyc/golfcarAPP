@@ -70,6 +70,8 @@ FEEDBACK_INTERVAL_SECONDS = 0.1
 FEEDBACK_MAX_AGE_SECONDS = 0.25
 STOP_REFRESH_SECONDS = 0.2
 STANDSTILL_TIMEOUT_SECONDS = 1.5
+MOTION_RECHECK_MAX_RPM = 2
+MOTION_RECHECK_SECONDS = 0.6
 SERIAL_TIMEOUT = 0.15
 IR_POLL_SECONDS = 0.02
 MAX_LINE_BYTES = 512
@@ -137,6 +139,8 @@ class Motors:
         self.last_stop_at: float | None = None
         self.stop_requested_at: float | None = None
         self.standstill_seen = False
+        self.motion_recheck_at: float | None = None
+        self.motion_recovery_required = False
         self.fault_reason: str | None = None
         self.diagnostic = BestEffortDiagnostic(NullDiagnosticLog())
 
@@ -194,6 +198,10 @@ class Motors:
 
     def _sample_feedback(self, *, force: bool = False, cleanup: bool = False) -> None:
         now = time.monotonic()
+        if not cleanup and self.motion_recheck_at is not None and (
+            now - self.motion_recheck_at >= MOTION_RECHECK_SECONDS
+        ):
+            self._trip(f"Motion feedback recheck timed out: left={self.feedback[0]}, right={self.feedback[1]} RPM")
         if not force and self.feedback_at is not None and now - self.feedback_at < FEEDBACK_INTERVAL_SECONDS:
             return
         try:
@@ -226,14 +234,27 @@ class Motors:
             if cleanup:
                 raise SessionError(f"Motor fault remains during cleanup: {left_error}/{right_error}")
             self._trip(f"Motor fault feedback: left={left_error}, right={right_error}")
+        # A low-amplitude episode has a fixed deadline. A late zero or a forced
+        # duplicate read cannot extend it or clear it without two fresh samples.
+        if not cleanup and self.motion_recheck_at is not None and (
+            observed_at - self.motion_recheck_at >= MOTION_RECHECK_SECONDS
+        ):
+            self._trip(f"Motion feedback recheck timed out: left={left}, right={right} RPM")
         if self.last_target != (0, 0):
             self.zero_samples, self.last_zero_at = 0, None
             return
         if left != 0 or right != 0:
             self.zero_samples, self.last_zero_at = 0, None
             if not cleanup and self.standstill_seen:
-                self._trip(f"Unexpected motion after standstill: left={left}, right={right} RPM")
-            if not cleanup and self.stop_requested_at is not None and (
+                if max(abs(left), abs(right)) > MOTION_RECHECK_MAX_RPM:
+                    self._trip(f"Unexpected motion after standstill: left={left}, right={right} RPM")
+                if self.motion_recheck_at is None:
+                    self.motion_recheck_at = observed_at
+                    self.motion_recovery_required = True
+                    self.diagnostic.event("drive.feedback_recheck_started", critical=True,
+                        maxRpm=MOTION_RECHECK_MAX_RPM, timeoutMs=int(MOTION_RECHECK_SECONDS * 1000),
+                        **self.feedback_state())
+            if not cleanup and not self.standstill_seen and self.stop_requested_at is not None and (
                 self.feedback_at - self.stop_requested_at >= STANDSTILL_TIMEOUT_SECONDS
             ):
                 self._trip(f"Standstill timeout: left={left}, right={right} RPM")
@@ -247,6 +268,12 @@ class Motors:
             self.last_zero_at = self.feedback_at
         if self.zero_samples >= 2:
             self.standstill_seen = True
+            if self.motion_recheck_at is not None:
+                elapsed = observed_at - self.motion_recheck_at
+                self.motion_recheck_at = None
+                self.diagnostic.event("drive.feedback_recheck_zero_confirmed", critical=True,
+                    elapsedMs=int(elapsed * 1000), releaseRequired=self.motion_recovery_required,
+                    **self.feedback_state())
 
     @property
     def zero_samples(self) -> int:
@@ -262,6 +289,7 @@ class Motors:
     @property
     def stopped_confirmed(self) -> bool:
         return (self.fault_reason is None and self.last_target == (0, 0) and self.zero_samples >= 2
+                and self.motion_recheck_at is None
                 and self.feedback == (0, 0, 0, 0) and self.feedback_at is not None
                 and time.monotonic() - self.feedback_at <= FEEDBACK_MAX_AGE_SECONDS)
 
@@ -271,6 +299,11 @@ class Motors:
                 "feedbackLeftError": self.feedback[2], "feedbackRightError": self.feedback[3],
                 "feedbackAgeMs": age, "feedbackSamples": self.zero_samples,
                 "feedbackSource": "simulated" if self.client is None else "hardware"}
+
+    def release_motion_recovery(self) -> None:
+        if self.motion_recovery_required and self.motion_recheck_at is None and self.stopped_confirmed:
+            self.motion_recovery_required = False
+            self.diagnostic.event("drive.feedback_recheck_released", critical=True, **self.feedback_state())
 
     def await_standstill(self, *, cleanup: bool = False, deadline: float | None = None) -> None:
         deadline = min(time.monotonic() + STANDSTILL_TIMEOUT_SECONDS,
@@ -318,6 +351,10 @@ class Motors:
             self.stop()
             return (0, 0)
         self.poll_safety()
+        # Even after feedback recovers, discard held/queued motion until an
+        # explicit neutral request has acknowledged the new zero-speed evidence.
+        if self.motion_recovery_required:
+            return (0, 0)
         self.requested_target = (left, right)
         if self.check_infrared():
             return (0, 0)
@@ -415,7 +452,7 @@ class Motors:
         # Both ON and OFF reissue zero speed and stop; never modify current parameters.
         self.stop(force=True, emergency=not enabled, release_interlock=False)
         # Require two NEW observations after the mode change, retaining the prior
-        # standstill latch: any nonzero feedback now is an immediate fault.
+        # standstill latch: bounded tiny feedback gets rechecked; larger motion faults.
         self.zero_samples, self.last_zero_at = 0, None
         self.await_standstill(deadline=transaction_deadline)
         self.diagnostic.event("parking.mode_confirmed", critical=True,
@@ -479,6 +516,10 @@ class ProtocolSession:
         self.run_id = secrets.token_hex(16)
         self.recovery_required = False
 
+    @property
+    def recovery_active(self) -> bool:
+        return self.recovery_required or self.motors.motion_recovery_required
+
     def pause_for_network(self) -> None:
         # Do not use shutdown(): network grace must not write parking registers.
         # Keep any IR latch until an explicit neutral request releases it. Neither
@@ -495,6 +536,8 @@ class ProtocolSession:
                 "targetStopped": True, "stopped": self.motors.stopped_confirmed,
                 **self.motors.feedback_state(),
                 "networkGraceMs": int(NETWORK_GRACE_SECONDS * 1000),
+                "motionRecheckMaxRpm": MOTION_RECHECK_MAX_RPM,
+                "motionRecheckMs": int(MOTION_RECHECK_SECONDS * 1000),
                 "infraredSupported": self.motors.infrared is not None,
                 **self.motors.parking_state()}
 
@@ -516,14 +559,16 @@ class ProtocolSession:
         if command != "drive" and (left != 0 or right != 0):
             raise SessionError("Non-drive commands require zero motor targets")
         closing = command in ("estop", "close")
-        recovering = self.recovery_required
+        feedback_recheck = self.motors.motion_recovery_required
+        recovering = self.recovery_active
+        neutral = command == "stop" or (command == "drive" and (left, right) == (0, 0))
         if command == "parking":
             self.motors.set_parking(message["parkingEnabled"])
         elif closing:
             self.motors.shutdown()
         elif recovering:
             # A delayed held joystick target must never restart motion after the lease expired.
-            if command == "stop" or (command == "drive" and (left, right) == (0, 0)):
+            if neutral:
                 # The network pause used emergency stop even when parking was enabled.
                 # Reapply its confirmed normal-stop mode without rewriting its registers.
                 self.motors.stop(force=True)
@@ -534,7 +579,21 @@ class ProtocolSession:
             left, right = 0, 0
         else:
             left, right = self.motors.drive(left, right)
-        self.motors._sample_feedback(force=True)
+        if closing or command == "parking":
+            # These transactions already ended with two fresh zero observations.
+            # A redundant sample must not turn their success into an unconfirmed
+            # terminal ACK that would skip cleanup on the way out.
+            if not self.motors.stopped_confirmed:
+                raise SessionError("Terminal or parking standstill confirmation is no longer fresh")
+        else:
+            self.motors._sample_feedback(force=True)
+        # The recheck can start in drive.poll or in the final feedback sample,
+        # after the original request branch was chosen. Its ACK must still
+        # explain a suppressed target and discard stale input on the App.
+        feedback_recheck = feedback_recheck or self.motors.motion_recovery_required
+        recovering = recovering or self.recovery_active
+        if neutral:
+            self.motors.release_motion_recovery()
         infrared = (self.motors.infrared_state() if command == "drive" else
                     {"infraredBlocked": False, "infraredDirections": []})
         self.next_seq += 1
@@ -546,6 +605,7 @@ class ProtocolSession:
                 # Neutral clears the latch for subsequent requests, but its own ACK must
                 # still tell the App to discard the held target and require fresh input.
                 "recoveryRequired": recovering,
+                "feedbackRecheck": feedback_recheck,
                 **self.motors.parking_state(), **infrared}, closing
 
 
@@ -720,7 +780,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             response, closing = session.accept(message)
             # Terminal acceptance already verified emergency stop and measured standstill.
             # No configuration registers are changed, including on cleanup.
-            cleanup_confirmed = closing
+            cleanup_confirmed = closing and response["stopped"]
             completed = time.monotonic()
             processed_ms = (completed - received) * 1000
             parking = message["cmd"] == "parking"
@@ -730,7 +790,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             if not closing and completed >= received + limit:
                 raise SessionError("Parking transaction exceeded timeout" if parking else
                                    "Motor transaction exceeded control watchdog")
-            if not closing and session.recovery_required and completed >= session_deadline:
+            if not closing and session.recovery_active and completed >= session_deadline:
                 raise SessionError("Control watchdog network grace expired")
             if stopped.is_set():
                 raise SessionError("Session terminated")
@@ -742,8 +802,9 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             last_request = request
             last_received = received
             if response["recoveryRequired"]:
-                diagnostic.event("drive.network_recovery_ack", critical=True, request=request,
-                    recoveryRequired=True, neutralAccepted=not session.recovery_required,
+                diagnostic.event("drive.feedback_recheck_ack" if response["feedbackRecheck"] else
+                    "drive.network_recovery_ack", critical=True, request=request,
+                    recoveryRequired=True, neutralAccepted=not session.recovery_active,
                     stopped=response["stopped"], ackMonotonicMs=ack_at * 1000,
                     sessionDeadlineMonotonicMs=session_deadline * 1000)
             sample_count += 1
@@ -760,6 +821,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
                     maxIrPollMs=getattr(pump, "max_poll_seconds", 0) * 1000,
                     infraredBlocked=blocked, infraredDirections=response["infraredDirections"],
                     targetStopped=response["targetStopped"], stopped=response["stopped"],
+                    feedbackRecheck=response["feedbackRecheck"],
                     **motors.feedback_state(), **motors.parking_state())
                 summary_at, sample_count = completed, 0
                 max_processing_ms = max_request_gap_ms = 0.0
@@ -768,7 +830,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
                 break
             # Suppressed held commands and parking during recovery cannot renew
             # either deadline. Only a validated neutral request releases the latch.
-            if not session.recovery_required:
+            if not session.recovery_active:
                 deadline = (completed if parking else received) + WATCHDOG_SECONDS
                 session_deadline = (completed if parking else received) + NETWORK_GRACE_SECONDS
                 motion_expired = False
@@ -789,7 +851,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             lastAckAgeMs=None if last_ack_at is None else (now - last_ack_at) * 1000,
             leaseRemainingMs=(deadline - now) * 1000,
             networkGraceRemainingMs=(session_deadline - now) * 1000,
-            recoveryRequired=session.recovery_required,
+            recoveryRequired=session.recovery_active,
+            feedbackRecheck=motors.motion_recovery_required,
             lastIrPollMs=getattr(pump, "last_poll_seconds", 0) * 1000,
             maxIrPollMs=getattr(pump, "max_poll_seconds", 0) * 1000,
             infrared=motors.infrared_state())

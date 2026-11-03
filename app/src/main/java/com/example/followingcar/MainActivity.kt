@@ -573,6 +573,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
     }
     val controlling = state.driveEnabled || state.driveStarting || state.driveStopping
     val canAdjustSpeed = !state.parkingUpdating && !state.followBlocksControl &&
+        !state.driveFeedbackRecheck && !state.driveRecoveryNeedsRelease &&
         (!controlling || (state.driveEnabled && state.driveLeft == 0 && state.driveRight == 0 && state.driveConfirmedStopped))
     val latestError = state.driveError ?: state.videoServiceError ?: state.error
     val errorText = state.driveFirstFailure?.let {
@@ -746,6 +747,8 @@ internal fun ParkingControls(
         state.followBlocksControl -> "自动跟随占用或状态待确认"
         state.motorActionUnconfirmed -> "电机状态待核对"
         state.busy -> "其他操作正在进行"
+        state.driveFeedbackRecheck -> if (state.driveConfirmedStopped) "反馈已恢复，请松手后再操作" else "轮速反馈复核中，保持停车"
+        state.driveRecoveryNeedsRelease -> "请松手完成控制恢复"
         !enabled && !settings.canEnable -> parkingCurrentIssue(settings)
         state.driveLeft != 0 || state.driveRight != 0 -> "目标转速尚未回零"
         !feedbackKnown -> "等待停车确认"
@@ -805,6 +808,8 @@ internal fun ParkingControls(
                 !feedbackKnown -> "最近轮速反馈：尚无可信读数"
                 !state.driveFeedbackVerified -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 未验证或已过期"
                 !feedbackFresh -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 已过期"
+                state.driveFeedbackRecheck && !state.driveConfirmedStopped -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 复核中，保持停车"
+                state.driveFeedbackRecheck -> "最近轮速反馈已回零，松手后再操作"
                 !feedbackStopped -> "最近轮速反馈：左 ${state.driveFeedbackLeftRpm} / 右 ${state.driveFeedbackRightRpm} RPM · 尚未停稳"
                 !state.driveConfirmedStopped -> "最近轮速反馈已回零，正在复核停车"
                 else -> "最近轮速反馈：左 0 / 右 0 RPM · 已确认停车"

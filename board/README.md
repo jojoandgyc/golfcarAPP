@@ -57,15 +57,28 @@ Any explicit current edit belongs to the separate guarded motor configuration UI
 Safety polling samples idle feedback at 100 ms intervals and refreshes hardware
 zero/stop at 200 ms intervals, including while waiting for input. Before a queued
 neutral refresh can erase unexpected-motion evidence, feedback is checked again.
-Once standstill was confirmed, any observed nonzero speed immediately latches a
-fault and requests emergency stop on both sides; read failures and motor errors
-also fail closed. Network/IR emergency hold is not silently changed to normal
+After standstill was confirmed, a nonzero observation with both absolute speeds
+at most 2 RPM starts a fixed 600 ms feedback recheck. Raw speeds remain visible,
+`stopped` becomes false and zero/stop refresh continues without ending the session.
+The episode ends only after two fresh, spaced zero samples; a single zero,
+alternating signs/sides or repeated requests never renew its deadline. A separate
+recovery latch suppresses held movement until an explicit neutral request confirms
+the recovered zero evidence. ACK `feedbackRecheck=true` is additive and always
+accompanies `recoveryRequired=true` and zero accepted targets, including the final
+recovery ACK. READY advertises `motionRecheckMaxRpm` and `motionRecheckMs`.
+Larger post-standstill speed, an expired episode, read failures and motor errors
+latch a fault and request emergency stop on both sides. The deadline is checked
+before returning a cached sample and after serial reads; an in-flight bounded
+serial transaction is not preempted. This is a recheck allowance, not proof of
+encoder noise or standstill. Network/IR emergency hold is not silently changed to normal
 parking by periodic polling. Moving-to-stopped transitions allow up to 1.5 s
 for measured standstill; parking pre/post checks share a 2 s transaction budget.
 Serial I/O is still bounded at 150 ms per transaction; these polling intervals
 are scheduling targets, not hard real-time guarantees on failed serial I/O.
 Emergency writes are attempted on both sides even if one fails or a deadline
 expires. A feedback-confirmed zero speed is not proof of a mechanical brake.
+Terminal and parking transactions reuse their final fresh two-zero confirmation;
+they never ACK success with unconfirmed standstill after an extra redundant read.
 
 The existing 600 ms soft-stop/5 s network grace and explicit-release recovery
 remain. Hardware feedback faults terminate the session and cannot be cleared by

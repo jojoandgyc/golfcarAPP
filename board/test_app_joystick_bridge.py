@@ -549,8 +549,10 @@ class BridgeProtocolTests(unittest.TestCase):
 
         class TimedMotors(Motors):
             def set_parking(self, enabled):
-                super().set_parking(enabled)
+                # Delay the operation, then let its real final confirmation run.
+                # Delaying after return models stale evidence rather than slow I/O.
                 clock[0] += duration
+                super().set_parking(enabled)
 
             def drive(self, left, right):
                 target = super().drive(left, right)
@@ -611,8 +613,8 @@ class BridgeProtocolTests(unittest.TestCase):
             polls = 0
 
             def set_parking(self, enabled):
-                super().set_parking(enabled)
                 clock[0] += parking_seconds
+                super().set_parking(enabled)
 
             def check_infrared(self):
                 self.polls += 1

@@ -226,14 +226,93 @@ class DriveStartupStateTest {
         assertTrue(events.any { it.optString("event") == "drive.stop_acknowledged" })
     }
 
+    @Test fun queuedParkingIsCancelledWithoutEndingControlWhenInFlightAckNeedsRecheck() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, transformAck = { request, ack ->
+            if (request.getLong("seq") == 2L) ack.put("stopped", false)
+                .put("feedbackLeftRpm", -1).put("feedbackSamples", 0)
+                .put("feedbackRecheck", true).put("recoveryRequired", true)
+        })
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            assertTrue(fixture.vm.state.value.canEditParking)
+            fixture.vm.setParkingEnabled(true)
+            assertTrue(fixture.vm.state.value.parkingUpdating)
+        }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { while (fixture.bridge.requests.size < 4) delay(10) }
+        assertTrue(fixture.updates.any { it.driveFeedbackRecheck && !it.driveConfirmedStopped })
+        assertTrue(fixture.vm.state.value.driveEnabled)
+        assertFalse(fixture.vm.state.value.parkingUpdating)
+        assertFalse(fixture.vm.state.value.driveFeedbackRecheck)
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertTrue(fixture.bridge.requests.all { it.getString("cmd") == "stop" })
+        assertTrue(fixture.vm.state.value.parkingStatus.contains("已取消"))
+        val events = engine.snapshot().events.map(::JSONObject)
+        assertEquals("FEEDBACK_RECHECK", events.single {
+            it.optString("event") == "parking.cancelled_before_send"
+        }.getString("source"))
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
+    @Test fun queuedParkingWithExpiredAckIsCancelledInsteadOfThrowing() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2)
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) { fixture.vm.setParkingEnabled(true) }
+        assertTrue(fixture.vm.state.value.parkingUpdating)
+        delay(550) // Still within the negotiated ACK deadline, beyond the parking evidence budget.
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { while (fixture.bridge.requests.size < 4) delay(10) }
+        assertTrue(fixture.vm.state.value.driveEnabled)
+        assertFalse(fixture.vm.state.value.parkingUpdating)
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertTrue(fixture.bridge.requests.all { it.getString("cmd") == "stop" })
+        assertTrue(fixture.vm.state.value.parkingStatus.contains("已取消"))
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
+    @Test fun feedbackRecoveryClearsHeldTargetEvenDuringOlderNetworkNeutralConfirmation() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, allowMovement = true,
+            transformAck = { request, ack ->
+                if (request.getLong("seq") == 2L) ack.put("stopped", false)
+                    .put("feedbackLeftRpm", 2).put("feedbackSamples", 0)
+                    .put("feedbackRecheck", true).put("recoveryRequired", true)
+            })
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            // Model the existing network gate waiting for its neutral ACK. A new
+            // feedback source on that ACK must not be swallowed as a duplicate.
+            (field(fixture.vm, "driveRecoveryGate") as DriveRecoveryGate).recovered(neutralRequest = false)
+            fixture.vm.moveJoystick(0f, 1f)
+        }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { while (fixture.bridge.requests.size < 4) delay(10) }
+        withContext(Dispatchers.Main) {
+            assertTrue(fixture.vm.state.value.driveRecoveryNeedsRelease)
+            assertTrue(fixture.vm.state.value.driveFeedbackRecheck)
+            assertTrue(fixture.vm.state.value.driveStatus.contains("反馈已恢复"))
+            assertFalse(fixture.vm.state.value.canEditParking)
+            fixture.vm.moveJoystick(0f, 1f)
+            assertEquals(0, fixture.vm.state.value.driveLeft)
+            fixture.vm.releaseJoystick()
+        }
+        assertTrue(fixture.bridge.requests.all { it.getInt("left") == 0 && it.getInt("right") == 0 })
+        withTimeout(3_000) { fixture.vm.state.first { !it.driveFeedbackRecheck } }
+        withContext(Dispatchers.Main) { fixture.vm.moveJoystick(0f, 1f) }
+        withTimeout(3_000) { while (fixture.bridge.requests.none { it.getString("cmd") == "drive" }) delay(10) }
+        assertTrue(fixture.vm.state.value.driveEnabled)
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertTrue(engine.snapshot().failures.isEmpty())
+    }
+
     private suspend fun startFixture(networkGrace: Boolean = false, blockWrite: Boolean = false,
-        holdSequence: Long = 1): Fixture {
+        holdSequence: Long = 1, allowMovement: Boolean = false,
+        transformAck: (JSONObject, JSONObject) -> Unit = { _, _ -> }): Fixture {
         val vm = withContext(Dispatchers.Main) {
             val store = ViewModelStore().also(stores::add)
             ViewModelProvider(store, ViewModelProvider.AndroidViewModelFactory(application))[BoardViewModel::class.java]
         }
         withTimeout(3_000) { vm.state.first { !it.remoteProfileLoading } }
-        val bridge = DelayedInitialAckChannel(networkGrace, blockWrite, holdSequence)
+        val bridge = DelayedInitialAckChannel(networkGrace, blockWrite, holdSequence, allowMovement, transformAck)
         val videoActions = CopyOnWriteArrayList<Boolean>()
         val queued = ConcurrentLinkedQueue<ChannelExec>().apply {
             add(VideoReplyChannel(true, videoActions)); add(bridge); add(VideoReplyChannel(false, videoActions))
@@ -308,7 +387,8 @@ class DriveStartupStateTest {
     }
 
     private class DelayedInitialAckChannel(private val networkGrace: Boolean,
-        private val blockWrite: Boolean, private val holdSequence: Long) : ChannelExec() {
+        private val blockWrite: Boolean, private val holdSequence: Long,
+        private val allowMovement: Boolean, private val transformAck: (JSONObject, JSONObject) -> Unit) : ChannelExec() {
         private val replies = QueuedInput()
         private val buffer = ByteArrayOutputStream()
         private val released = AtomicBoolean()
@@ -342,7 +422,7 @@ class DriveStartupStateTest {
                 buffer.reset()
                 check(request.getLong("seq") == expectedSequence++)
                 check(request.getString("token") == token)
-                check(request.getInt("left") == 0 && request.getInt("right") == 0)
+                check(allowMovement || request.getInt("left") == 0 && request.getInt("right") == 0)
                 requests.add(request)
                 if (request.getLong("seq") == holdSequence) {
                     pending = request
@@ -366,9 +446,10 @@ class DriveStartupStateTest {
         private fun acknowledge(request: JSONObject) {
             token = tokenFor(request.getLong("seq") + 1)
             val ack = JSONObject().put("type", "ack").put("seq", request.getLong("seq"))
-                .put("token", token).put("left", 0).put("right", 0).put("stopped", true)
+                .put("token", token).put("left", request.getInt("left")).put("right", request.getInt("right"))
                 .withDriveSafetyFixture()
             if (networkGrace) ack.put("recoveryRequired", false)
+            transformAck(request, ack)
             replies.append(ack)
         }
         override fun isConnected(): Boolean = connected && !disconnected

@@ -182,6 +182,21 @@ class ParkingControlsTest {
         compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
     }
 
+    @Test fun feedbackRecheckShowsActualSmallSpeedAndKeepsSwitchLockedUntilRecoveryClears() {
+        val state = mutableStateOf(ready().copy(driveFeedbackRecheck = true,
+            driveConfirmedStopped = false, driveFeedbackLeftRpm = -1))
+        var requests = 0
+        compose.setContent { MaterialTheme { ParkingControls(state.value, TEST_NOW_NANOS) { requests++ } } }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("轮速反馈复核中，保持停车")
+        compose.onNodeWithTag("parkingFeedback").assertTextContains("左 -1 / 右 0 RPM · 复核中", substring = true)
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.runOnIdle { state.value = ready().copy(driveFeedbackRecheck = true, driveRecoveryNeedsRelease = true) }
+        compose.onNodeWithTag("parkingAvailability").assertTextEquals("反馈已恢复，请松手后再操作")
+        compose.onNodeWithTag("parkingSwitch").assertIsNotEnabled().performClick()
+        compose.runOnIdle { assertEquals(0, requests); state.value = ready() }
+        compose.onNodeWithTag("parkingSwitch").assertIsEnabled()
+    }
+
     @Test fun zeroCurrentReasonNamesAffectedSideBesideSwitchAndShowsRealValues() {
         var requests = 0
         val state = mutableStateOf(ready(ParkingSettings(maxCurrentAmps = 15.0)))

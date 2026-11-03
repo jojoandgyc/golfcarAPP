@@ -1,0 +1,87 @@
+{
+  "recordedAtUtc": "2026-11-03T15:33:58.211047+00:00",
+  "app": {
+    "versionCode": 22,
+    "versionName": "1.8.11-motion-recheck",
+    "apkSha256": "fd8ad4a300b1dd1142adac043879d5d08c3ac3a61a5b5f8ea2bf97d98af93b82",
+    "phoneInstallation": {
+      "status": "installed",
+      "installedAtUtc": "2026-11-03T15:34:27.606061+00:00",
+      "versionCode": 22,
+      "versionName": "1.8.11-motion-recheck",
+      "installedApkSha256": "fd8ad4a300b1dd1142adac043879d5d08c3ac3a61a5b5f8ea2bf97d98af93b82",
+      "connectionPreferencesPreserved": true,
+      "preInstallControlCheck": {
+        "activeControls": [],
+        "serialIdle": true,
+        "bridgeSha256": "e3da7324aac2ede6c0938e91891136ae1f21d1c4f4735342a283393e679617e9"
+      },
+      "appLaunchedByAgent": false,
+      "hardwareCommandsSent": false
+    }
+  },
+  "sourceBaseCommit": "4cc89a3",
+  "bridge": {
+    "alreadyDeployed": false,
+    "oldSha256": "71db3daaae6c666120a02a9ec0377ba24170a68bf67ef149a9261bdebb43c021",
+    "newSha256": "e3da7324aac2ede6c0938e91891136ae1f21d1c4f4735342a283393e679617e9",
+    "backup": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py.bak.motion-recheck-20261103T153257Z",
+    "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+    "controlIdle": true,
+    "serialIdle": true,
+    "hardwareCommandsSent": false
+  },
+  "incident": {
+    "runId": "2ae4fe94acda14b6098ed27d307cafea",
+    "appFirstFailureUtc": "2026-11-03T15:16:16.618859Z",
+    "appFirstFailureTaipei": "2026-11-03T23:16:16.618859+08:00",
+    "trigger": "Unexpected motion after standstill: left=-1, right=0 RPM",
+    "sshStillConnected": true,
+    "boardCleanupConfirmed": true,
+    "physicalCauseOfSmallReadingProven": false
+  },
+  "behavior": {
+    "postConfirmedStandstillRecheckMaxAbsRpm": 2,
+    "fixedRecheckWindowMs": 600,
+    "zeroFeedbackRequirementUnchanged": true,
+    "rawFeedbackPreserved": true,
+    "zeroSpeedStopRefreshContinues": true,
+    "twoFreshSpacedZeroSamplesToRecover": true,
+    "explicitNeutralRequiredBeforeFreshMotion": true,
+    "heldInputCannotResumeOrExtendDeadline": true,
+    "largerMotionOrSustainedEpisodeStillStops": true,
+    "motorErrorsAndFeedbackFailuresStillStop": true,
+    "cachedReturnAndPostReadDeadlineChecks": true,
+    "inFlightSerialIoIsNotPreempted": true,
+    "pendingParkingLosesEvidence": "Cancel unsent parking operation and continue neutral heartbeat; do not abort session",
+    "terminalAndParkingSuccessRequireFreshZeroConfirmation": true
+  },
+  "validation": {
+    "jvm": {
+      "tests": 268,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorProtocolAndUi": {
+      "tests": 71,
+      "passed": 71
+    },
+    "boardLinuxSimulation": {
+      "tests": 117,
+      "passed": 117,
+      "skipped": 0
+    },
+    "emulatorRealSshBoardDryRun": {
+      "tests": 3,
+      "passed": 3,
+      "hardwareSerialOpened": false
+    },
+    "realMotorTestsPerformed": false
+  },
+  "deploymentConstraints": {
+    "motorCurrentConfigurationChanged": false,
+    "networkOrFollowRuntimeChanged": false,
+    "realHardwareCommandsSent": false
+  }
+}

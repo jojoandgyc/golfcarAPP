@@ -41,6 +41,7 @@ data class DriveAck(
     val feedback: DriveFeedback? = null,
     val feedbackReceivedNanos: Long = 0L,
     val feedbackAgeAtReceiptMs: Long = Long.MAX_VALUE,
+    val feedbackRecheck: Boolean = false,
 )
 
 /**
@@ -212,6 +213,12 @@ class BoardDriveChannel private constructor(
                         requireMessage(false, failure.message ?: "开发板网络恢复回执无效")
                         false
                     }
+                    val rawFeedbackRecheck = reply.opt("feedbackRecheck")
+                    requireMessage(!reply.has("feedbackRecheck") || rawFeedbackRecheck is Boolean,
+                        "开发板轮速复核回执格式无效")
+                    val feedbackRecheck = rawFeedbackRecheck == true
+                    requireMessage(!feedbackRecheck || recoveryRequired && measured.targetStopped,
+                        "轮速复核时必须保持零目标并重新确认输入")
                     val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight,
                         measured.targetStopped, recoveryRequired)
                     val actualParking = if (ready.parkingSupported) readParking(reply) else null
@@ -225,9 +232,12 @@ class BoardDriveChannel private constructor(
                     lastAckSequence = sentSequence
                     lastAckNanos = System.nanoTime()
                     val rtt = elapsedMillis(started)
-                    if (recoveryRequired || rtt >= 900L) Diagnostics.event("drive.network_recovery", diagnosticContext,
+                    if (recoveryRequired || rtt >= 900L) Diagnostics.event(
+                        if (feedbackRecheck) "drive.feedback_recheck" else "drive.network_recovery", diagnosticContext,
                         fields = mapOf("seq" to sentSequence, "elapsedMs" to rtt,
-                            "recoveryRequired" to recoveryRequired, "stopped" to stopped,
+                            "recoveryRequired" to recoveryRequired, "feedbackRecheck" to feedbackRecheck,
+                            "stopped" to stopped, "feedbackLeftRpm" to measured.feedback.leftRpm,
+                            "feedbackRightRpm" to measured.feedback.rightRpm,
                             "networkGraceMs" to ready.networkGraceMs), critical = true)
                     lastAckRttMs = rtt
                     summaryCount += 1
@@ -241,6 +251,7 @@ class BoardDriveChannel private constructor(
                             "meanRttMs" to summaryRttTotal / summaryCount,
                             "leftRpm" to actualLeft, "rightRpm" to actualRight, "targetStopped" to measured.targetStopped,
                             "stopped" to stopped, "feedbackLeftRpm" to measured.feedback.leftRpm,
+                            "feedbackRecheck" to feedbackRecheck,
                             "feedbackRightRpm" to measured.feedback.rightRpm,
                             "feedbackLeftError" to measured.feedback.leftError,
                             "feedbackRightError" to measured.feedback.rightError,
@@ -254,7 +265,8 @@ class BoardDriveChannel private constructor(
                     }
                     phase = "idle"
                     DriveAck(actualLeft, actualRight, stopped, actualParking, interlock, recoveryRequired,
-                        measured.targetStopped, measured.feedback, lastAckNanos, measured.feedback.ageMs + rtt)
+                        measured.targetStopped, measured.feedback, lastAckNanos, measured.feedback.ageMs + rtt,
+                        feedbackRecheck)
                 }
             } catch (timeout: TimeoutCancellationException) {
                 transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }
