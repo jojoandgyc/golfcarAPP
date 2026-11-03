@@ -131,8 +131,9 @@ private enum class ManualSection { DRIVE, PARKING, CAMERA }
 @Composable
 private fun BoardScreen(viewModel: BoardViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val networkHealth by viewModel.networkHealth.collectAsStateWithLifecycle()
-    val networkNow by viewModel.networkNow.collectAsStateWithLifecycle()
+    val networkSnapshot by viewModel.networkSnapshot.collectAsStateWithLifecycle()
+    val networkHealth = networkSnapshot.health
+    val networkNow = networkSnapshot.nowElapsedMs
     val networkRefreshing by viewModel.networkRefreshing.collectAsStateWithLifecycle()
     val wireless by viewModel.wifiDirect.state.collectAsStateWithLifecycle()
     val pairing by viewModel.pairing.state.collectAsStateWithLifecycle()

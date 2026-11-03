@@ -43,6 +43,8 @@ data class RouteHealth(
     val failure: ReachabilityFailure? = null,
     // Last-seen history is not automatically usable as current evidence after a failure/change.
     val onlineEvidenceValid: Boolean = status == Reachability.ONLINE,
+    // Refresh activity is separate from the last confirmed result and its expiry.
+    val probeInProgress: Boolean = false,
 ) {
     fun isFreshOnline(now: Long): Boolean {
         val success = lastOnlineElapsedMs ?: return false
@@ -56,26 +58,30 @@ data class RouteHealth(
         else -> status
     }
 
-    fun checking(): RouteHealth = copy(status = Reachability.CHECKING, failure = null,
-        onlineEvidenceValid = onlineEvidenceValid && status in setOf(Reachability.ONLINE, Reachability.CHECKING))
+    fun checking(): RouteHealth = copy(probeInProgress = true)
+
+    fun cancelChecking(): RouteHealth = copy(probeInProgress = false)
 
     fun online(now: Long): RouteHealth = copy(status = Reachability.ONLINE,
-        lastCheckedElapsedMs = now, lastOnlineElapsedMs = now, failure = null, onlineEvidenceValid = true)
+        lastCheckedElapsedMs = now, lastOnlineElapsedMs = now, failure = null,
+        onlineEvidenceValid = true, probeInProgress = false)
 
     fun unavailable(now: Long, reason: ReachabilityFailure = ReachabilityFailure.UNREACHABLE): RouteHealth =
         copy(status = Reachability.UNREACHABLE, lastCheckedElapsedMs = now, failure = reason,
-            onlineEvidenceValid = false)
+            onlineEvidenceValid = false, probeInProgress = false)
 
     fun invalidate(): RouteHealth = copy(
         status = if (lastOnlineElapsedMs != null) Reachability.STALE else Reachability.UNKNOWN,
         failure = null,
         onlineEvidenceValid = false,
+        probeInProgress = false,
     )
 
     /** A slow, older probe must not overwrite a successful ACK observed after it began. */
     fun acceptProbe(result: RouteHealth, probeStartedAt: Long): RouteHealth =
         if ((lastCheckedElapsedMs ?: Long.MIN_VALUE) > probeStartedAt) this
-        else result.copy(lastOnlineElapsedMs = result.lastOnlineElapsedMs ?: lastOnlineElapsedMs)
+        else result.copy(lastOnlineElapsedMs = result.lastOnlineElapsedMs ?: lastOnlineElapsedMs,
+            probeInProgress = false)
 
     fun lastOnlineAgeSeconds(now: Long): Long? = lastOnlineElapsedMs
         ?.takeIf { now >= it }?.let { (now - it) / 1_000L }

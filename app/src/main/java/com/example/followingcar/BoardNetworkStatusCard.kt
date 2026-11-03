@@ -58,6 +58,7 @@ internal fun BoardNetworkStatusCard(
     val reconnectEnabled = canReconnectRemote
     val indicator = if (localOnline || remoteOnline) MaterialTheme.colorScheme.primary
         else MaterialTheme.colorScheme.outline
+    val checking = health.local.probeInProgress || health.remote.probeInProgress
 
     if (compact) {
         Surface(modifier.fillMaxWidth().testTag("networkHealthCompact"),
@@ -72,6 +73,9 @@ internal fun BoardNetworkStatusCard(
                         style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.testTag("networkHealthCompactDetail"))
                 }
+                if (checking) Text("复核中", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("networkCompactRefreshing"))
                 if (offerRemote && remoteConfigured) TextButton(
                     onClick = { if (reconnectEnabled) onReconnectRemote() }, enabled = reconnectEnabled,
                     modifier = Modifier.testTag("networkCompactRemoteReconnect")) { Text("公网重连") }
@@ -120,11 +124,11 @@ internal fun BoardNetworkStatusCard(
 @Composable
 private fun RouteStatusRow(label: String, route: RouteHealth, nowElapsedMs: Long, tag: String) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        val status = if (route.status == Reachability.CHECKING) {
-            if (route.isFreshOnline(nowElapsedMs)) "正在检测 · 上次确认仍有效" else "正在检测"
-        } else route.statusLabel(nowElapsedMs)
-        Text("$label：$status", style = MaterialTheme.typography.bodyMedium,
+        Text("$label：${route.statusLabel(nowElapsedMs)}", style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.testTag(tag))
+        if (route.probeInProgress) Text("正在后台复核…", style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.testTag("${tag}Refreshing"))
         route.lastOnlineElapsedMs?.let { last ->
             val expired = if (route.effectiveStatus(nowElapsedMs) == Reachability.STALE) "上次确认已过期 · " else ""
             Text("$expired${ageLabel(nowElapsedMs, last)}确认可达", style = MaterialTheme.typography.bodySmall,

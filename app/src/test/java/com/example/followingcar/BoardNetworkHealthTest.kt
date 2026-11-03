@@ -23,8 +23,9 @@ class BoardNetworkHealthTest {
     @Test fun checkInProgressRetainsOnlyUnexpiredEvidence() {
         val route = RouteHealth().online(1_000).checking()
         assertTrue(route.isFreshOnline(10_000))
-        assertEquals(Reachability.CHECKING, route.effectiveStatus(32_000))
-        assertEquals(Reachability.CHECKING, RouteHealth().checking().effectiveStatus(1_000))
+        assertTrue(route.probeInProgress)
+        assertEquals(Reachability.STALE, route.effectiveStatus(32_000))
+        assertEquals(Reachability.UNKNOWN, RouteHealth().checking().effectiveStatus(1_000))
     }
 
     @Test fun failedAuthenticationImmediatelyRemovesOnlineClaimButRetainsLastSeen() {
@@ -41,8 +42,10 @@ class BoardNetworkHealthTest {
             val checking = previous.unavailable(9_500).checking()
             val health = BoardNetworkHealth().updateRoute(path, checking)
             assertFalse(health.route(path).isFreshOnline(10_000))
-            assertEquals(Reachability.CHECKING, health.route(path).effectiveStatus(10_000))
-            assertEquals("小车状态待确认", health.onlineLabel(10_000))
+            assertEquals(Reachability.UNREACHABLE, health.route(path).effectiveStatus(10_000))
+            assertEquals(ReachabilityFailure.UNREACHABLE, checking.failure)
+            assertTrue(checking.probeInProgress)
+            assertNotEquals("小车在线", health.onlineLabel(10_000))
             assertEquals(9_000L, checking.lastOnlineElapsedMs)
             assertEquals(1L, checking.lastOnlineAgeSeconds(10_000))
             assertTrue(checking.online(10_001).isFreshOnline(10_001))
@@ -56,6 +59,7 @@ class BoardNetworkHealthTest {
             val health = BoardNetworkHealth().updateRoute(path, checking)
             assertFalse(checking.isFreshOnline(10_000))
             assertFalse(health.remoteFallbackAvailable(10_000))
+            assertEquals(Reachability.STALE, checking.effectiveStatus(10_000))
             assertEquals("小车状态待确认", health.onlineLabel(10_000))
             assertEquals(9_000L, checking.lastOnlineElapsedMs)
             assertTrue(checking.online(10_001).isFreshOnline(10_001))
@@ -96,5 +100,56 @@ class BoardNetworkHealthTest {
         assertEquals("小车在线", changed.onlineLabel(30))
         val unreachable = changed.copy(local = changed.local.unavailable(30), remote = changed.remote.unavailable(30))
         assertEquals("小车暂不可达", unreachable.onlineLabel(31))
+    }
+
+    @Test fun cancellingRefreshPreservesStableResultEvidenceAndFailureOnBothPaths() {
+        val stableResults = listOf(RouteHealth(), RouteHealth().online(1_000),
+            RouteHealth().online(1_000).invalidate(),
+            RouteHealth().online(1_000).unavailable(1_100, ReachabilityFailure.TIMEOUT))
+        for (path in BoardRoute.entries) for (original in stableResults) {
+            val checking = original.checking().checking()
+            val health = BoardNetworkHealth().updateRoute(path, checking)
+            assertEquals(original.status, checking.status)
+            assertEquals(original.failure, checking.failure)
+            assertEquals(original.lastCheckedElapsedMs, checking.lastCheckedElapsedMs)
+            assertEquals(original.isFreshOnline(1_200), checking.isFreshOnline(1_200))
+            assertTrue(health.route(path).probeInProgress)
+            assertEquals(original, health.route(path).cancelChecking())
+        }
+    }
+
+    @Test fun retryNeverChangesConfirmedUnreachableSummaryOrHidesTheFailure() {
+        val unavailable = RouteHealth().online(1_000).unavailable(1_100, ReachabilityFailure.TIMEOUT)
+        val health = BoardNetworkHealth(local = unavailable, remote = unavailable)
+        val checking = health.copy(local = health.local.checking(), remote = health.remote.checking())
+        assertEquals("小车暂不可达", checking.onlineLabel(1_200))
+        assertEquals(ReachabilityFailure.TIMEOUT, checking.local.failure)
+        assertFalse(checking.local.isFreshOnline(1_200))
+        assertFalse(checking.remoteFallbackAvailable(1_200))
+        assertEquals(health, checking.copy(local = checking.local.cancelChecking(), remote = checking.remote.cancelChecking()))
+    }
+
+    @Test fun refreshAndCancellationCannotExtendFreshnessWithoutANewAck() {
+        val refreshing = RouteHealth().online(1_000).checking()
+        assertTrue(refreshing.isFreshOnline(31_000))
+        assertFalse(refreshing.isFreshOnline(31_001))
+        val cancelled = refreshing.cancelChecking()
+        assertFalse(cancelled.isFreshOnline(31_001))
+        assertEquals(Reachability.STALE, cancelled.effectiveStatus(31_001))
+        assertEquals(1_000L, cancelled.lastOnlineElapsedMs)
+        assertFalse(refreshing.isFreshOnline(999))
+        assertFalse(cancelled.isFreshOnline(999))
+    }
+
+    @Test fun everyCompletedOutcomeClearsRefreshActivity() {
+        val checking = RouteHealth().online(1_000).checking()
+        assertFalse(checking.online(1_100).probeInProgress)
+        assertFalse(checking.unavailable(1_100).probeInProgress)
+        assertFalse(checking.invalidate().probeInProgress)
+        val accepted = checking.acceptProbe(RouteHealth().online(1_100), 1_050)
+        assertFalse(accepted.probeInProgress)
+        assertTrue(accepted.isFreshOnline(1_200))
+        val newerAck = checking.online(1_200)
+        assertEquals(newerAck, newerAck.acceptProbe(RouteHealth().unavailable(1_300), 1_050))
     }
 }

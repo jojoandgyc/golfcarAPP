@@ -141,16 +141,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val reachabilityProbe = BoardReachabilityProbe()
     private val localPresenceDiagnostic = Diagnostics.newContext()
     private val remotePresenceDiagnostic = Diagnostics.newContext()
-    private val mutableNetworkHealth = MutableStateFlow(BoardNetworkHealth())
-    val networkHealth = mutableNetworkHealth.asStateFlow()
-    private val mutableNetworkNow = MutableStateFlow(SystemClock.elapsedRealtime())
-    val networkNow = mutableNetworkNow.asStateFlow()
+    private val networkStatus = BoardNetworkStatusStore(SystemClock::elapsedRealtime)
+    val networkSnapshot = networkStatus.snapshot
     private val mutableNetworkRefreshing = MutableStateFlow(false)
     val networkRefreshing = mutableNetworkRefreshing.asStateFlow()
     private var networkForeground = false
     private var networkProbeJob: Job? = null
     private var networkProbeGeneration = 0L
     private var nextNetworkProbeAt = 0L
+    private var networkProbeForceRetry = false
     private val ownerDiagnostic = Diagnostics.newContext()
     private var followDiagnostic = followRecovery?.context ?: DiagnosticContext(
         preferences.getString("last_follow_operation", null) ?: Diagnostics.newContext().operationId)
@@ -330,8 +329,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private fun observeNetworkHealth() {
         viewModelScope.launch {
             networkMonitor.state.collect { phone ->
-                val previous = mutableNetworkHealth.value.phone
-                mutableNetworkHealth.update { it.copy(phone = phone) }
+                val previous = networkStatus.health.phone
+                networkStatus.update { it.copy(phone = phone) }
                 if (phone.revision != previous.revision) {
                     cancelNetworkProbe()
                     // A default-network/Internet change does not prove the local car link was lost.
@@ -350,21 +349,21 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 if (settings != currentSettings) {
                     settings = currentSettings
                     cancelNetworkProbe()
-                    mutableNetworkHealth.update { it.copy(local = RouteHealth(), remote = RouteHealth(
+                    networkStatus.update { it.copy(local = RouteHealth(), remote = RouteHealth(
                         status = if (current.remoteProfile == null && !current.remoteProfileLoading)
                             Reachability.NOT_CONFIGURED else Reachability.UNKNOWN)) }
                     nextNetworkProbeAt = 0L
                 }
                 if (previous.connected && !current.connected && !disconnecting && !intentionalConnectionClose) {
                     val route = if (previous.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL
-                    mutableNetworkHealth.update { health ->
+                    networkStatus.update { health ->
                         health.updateRoute(route, health.route(route).unavailable(SystemClock.elapsedRealtime()))
                     }
                     cancelNetworkProbe()
                     nextNetworkProbeAt = 0L
                     Diagnostics.event("network.control_connection_lost", activeDiagnostic(), fields = mapOf(
-                        "route" to route.name, "phoneInternetValidated" to mutableNetworkHealth.value.phone.internetValidated,
-                        "phoneWifiAvailable" to mutableNetworkHealth.value.phone.wifiAvailable), critical = true)
+                        "route" to route.name, "phoneInternetValidated" to networkStatus.health.phone.internetValidated,
+                        "phoneWifiAvailable" to networkStatus.health.phone.wifiAvailable), critical = true)
                 }
                 if (current.connected && current.followLastReplyElapsedMs != null &&
                     current.followLastReplyElapsedMs != previous.followLastReplyElapsedMs) {
@@ -380,8 +379,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             while (true) {
                 if (networkForeground) {
                     val now = SystemClock.elapsedRealtime()
-                    mutableNetworkNow.value = now
-                    if (now >= nextNetworkProbeAt && canProbeNetwork(state.value) && networkProbeJob == null)
+                    networkStatus.tick()
+                    if (now >= nextNetworkProbeAt && canProbeNetwork(state.value) && networkProbeJob?.isActive != true)
                         probeBoardRoutes()
                 }
                 delay(1_000)
@@ -398,9 +397,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         networkProbeJob?.cancel()
         networkProbeJob = null
         mutableNetworkRefreshing.value = false
-        mutableNetworkHealth.update { health -> health.copy(
-            local = if (health.local.status == Reachability.CHECKING) health.local.invalidate() else health.local,
-            remote = if (health.remote.status == Reachability.CHECKING) health.remote.invalidate() else health.remote) }
+        networkStatus.update { health -> health.copy(
+            local = health.local.cancelChecking(), remote = health.remote.cancelChecking()) }
     }
 
     fun setNetworkForeground(foreground: Boolean) {
@@ -414,19 +412,21 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshNetworkHealth() {
         if (!networkForeground || !canProbeNetwork(state.value)) return
         cancelNetworkProbe()
-        mutableNetworkHealth.update { it.copy(local = it.local.invalidate(), remote = it.remote.invalidate()) }
+        networkProbeForceRetry = true
         networkMonitor.refresh()
         nextNetworkProbeAt = 0L
         Diagnostics.event("network.refresh_requested", ownerDiagnostic, source = "USER_REFRESH")
     }
 
     private fun markBoardReachable(route: BoardRoute, now: Long = SystemClock.elapsedRealtime()) {
-        mutableNetworkHealth.update { health -> health.updateRoute(route, health.route(route).online(now)) }
+        networkStatus.update { health -> health.updateRoute(route, health.route(route).online(now)) }
     }
 
     private fun probeBoardRoutes() {
         val input = state.value
         val generation = ++networkProbeGeneration
+        val forceRetry = networkProbeForceRetry
+        networkProbeForceRetry = false
         // Rate-limited and cancelled whenever control starts. No extra SSH work during driving.
         nextNetworkProbeAt = SystemClock.elapsedRealtime() + 20_000L
         mutableNetworkRefreshing.value = true
@@ -436,17 +436,17 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     currentCoroutineContext().ensureActive()
                     if (!networkForeground || !canProbeNetwork(state.value) || generation != networkProbeGeneration) return@launch
                     // Invalid credentials require an edit or explicit refresh, not recurring authentication attempts.
-                    if (mutableNetworkHealth.value.route(route).failure in setOf(ReachabilityFailure.AUTHENTICATION,
+                    if (!forceRetry && networkStatus.health.route(route).failure in setOf(ReachabilityFailure.AUTHENTICATION,
                             ReachabilityFailure.IDENTITY, ReachabilityFailure.CONFIGURATION)) continue
                     val started = SystemClock.elapsedRealtime()
                     val configured = input.username.isNotBlank() && input.password.isNotEmpty() &&
                         if (route == BoardRoute.LOCAL) input.host.isNotBlank() && input.port.toIntOrNull() in 1..65535
                         else input.remoteProfile != null && input.remoteProfileError == null
                     if (!configured) {
-                        mutableNetworkHealth.update { it.updateRoute(route, RouteHealth(Reachability.NOT_CONFIGURED)) }
+                        networkStatus.update { it.updateRoute(route, RouteHealth(Reachability.NOT_CONFIGURED)) }
                         continue
                     }
-                    mutableNetworkHealth.update { it.updateRoute(route, it.route(route).checking()) }
+                    networkStatus.update { it.updateRoute(route, it.route(route).checking()) }
                     val result = try {
                         val tls = if (route == BoardRoute.REMOTE) withContext(Dispatchers.IO) {
                             remoteCredentials.createTlsConfig()
@@ -462,7 +462,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     currentCoroutineContext().ensureActive()
                     if (generation != networkProbeGeneration) return@launch
-                    mutableNetworkHealth.update { health ->
+                    networkStatus.update { health ->
                         health.updateRoute(route, health.route(route).acceptProbe(result, started))
                     }
                     Diagnostics.event("network.board_probe", ownerDiagnostic, fields = mapOf("route" to route.name,

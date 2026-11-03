@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "dateLocal": "2026-11-03",
+  "timezone": "Asia/Taipei",
+  "installedHostUtc": "2026-11-03T08:53:00.605710+00:00",
+  "versionName": "1.8.5-presence-stability",
+  "versionCode": 16,
+  "apkSha256": "0473f16beaef9338cbb99fb1e2623577682b5a103a1971267a1d77592244b16e",
+  "credentialsAndRemoteProfilePreserved": true,
+  "phoneInstalled": true,
+  "cause": "Fresh follow ACK timestamps were combined with a separately updated 1-second UI clock. The older UI time made a valid ACK appear to come from the future, so the strict freshness check alternated between online and unconfirmed.",
+  "changes": [
+    "Publish network evidence and elapsed-realtime clock in one immutable StateFlow snapshot.",
+    "Keep background refresh separate from the last confirmed route status and failure.",
+    "Cancelling a probe or explicit refresh preserves bounded evidence; endpoint/credential changes and actual failures still invalidate it.",
+    "Explicit refresh can retry authentication failures without discarding the previous visible result.",
+    "A completed no-op probe job no longer prevents future scheduling."
+  ],
+  "validation": {
+    "jvmTestsPassed": 216,
+    "emulatorComposeTestsPassed": 16,
+    "phoneComposeSnapshotTestsPassed": 3,
+    "continuousAckBeforeClockTickRegressionPassed": true,
+    "thirtySecondExpiryPreserved": true,
+    "clockRewindStillRejected": true,
+    "failedEvidenceNotRevivedByRetry": true,
+    "phoneOriginalTestPackageRestored": true,
+    "phoneStayOnUnchanged": 2,
+    "recentPhoneProbeResults": [
+      {
+        "time": "2026-11-03T08:55:36.362485Z",
+        "route": "LOCAL",
+        "result": "ONLINE",
+        "failure": null,
+        "durationMs": 318
+      },
+      {
+        "time": "2026-11-03T08:55:37.204542Z",
+        "route": "REMOTE",
+        "result": "ONLINE",
+        "failure": null,
+        "durationMs": 838
+      },
+      {
+        "time": "2026-11-03T08:55:53.312025Z",
+        "route": "LOCAL",
+        "result": "ONLINE",
+        "failure": null,
+        "durationMs": 237
+      },
+      {
+        "time": "2026-11-03T08:55:59.342030Z",
+        "route": "REMOTE",
+        "result": "UNREACHABLE",
+        "failure": "TIMEOUT",
+        "durationMs": 6029
+      },
+      {
+        "time": "2026-11-03T08:56:10.241285Z",
+        "route": "LOCAL",
+        "result": "ONLINE",
+        "failure": null,
+        "durationMs": 275
+      },
+      {
+        "time": "2026-11-03T08:56:16.264691Z",
+        "route": "REMOTE",
+        "result": "UNREACHABLE",
+        "failure": "TIMEOUT",
+        "durationMs": 6023
+      }
+    ],
+    "phoneVisualResult": "Car remained online through the local path while the public path reported actual authentication-probe timeouts."
+  },
+  "deployment": {
+    "installedAfterUserStoppedFollow": true,
+    "boardCodeChanged": false,
+    "controlTimeoutsChanged": false,
+    "motorConfigurationChanged": false,
+    "networkConfigurationChanged": false,
+    "realMotorTests": false,
+    "cameraTests": false
+  },
+  "evidenceDirectory": "E:\\Temp\\golfcar-presence-fix-2026-11-03"
+}

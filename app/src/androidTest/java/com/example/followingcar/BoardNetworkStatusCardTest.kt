@@ -1,5 +1,6 @@
 package com.example.followingcar
 
+import androidx.compose.foundation.layout.Column
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -93,14 +94,16 @@ class BoardNetworkStatusCardTest {
 
     @Test fun checkingIsVisibleWhilePreviousFreshConfirmationRemainsValid() {
         val health = BoardNetworkHealth(local = RouteHealth().online(9_000L).checking(),
-            remote = RouteHealth(status = Reachability.CHECKING))
+            remote = RouteHealth().checking())
         compose.setContent { FollowingCarTheme {
             BoardNetworkStatusCard(health, 10_000L, connected = false, remoteMode = false,
                 canReconnectRemote = false, refreshing = true, onRefresh = {}, onReconnectRemote = {})
         } }
         compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车在线 · 局域网")
-        compose.onNodeWithTag("networkLocalStatus").assertTextContains("正在检测 · 上次确认仍有效", substring = true)
-        compose.onNodeWithTag("networkRemoteStatus").assertTextEquals("公网：正在检测")
+        compose.onNodeWithTag("networkLocalStatus").assertTextEquals("局域网：可达")
+        compose.onNodeWithTag("networkLocalStatusRefreshing").assertTextEquals("正在后台复核…")
+        compose.onNodeWithTag("networkRemoteStatus").assertTextEquals("公网：尚未确认")
+        compose.onNodeWithTag("networkRemoteStatusRefreshing").assertExists()
     }
 
     @Test fun refreshingBlocksDuplicateRefreshButAllowsExplicitRemoteRecovery() {
@@ -108,7 +111,7 @@ class BoardNetworkStatusCardTest {
         var reconnects = 0
         val refreshing = mutableStateOf(true)
         val canRefresh = mutableStateOf(true)
-        val health = BoardNetworkHealth(local = RouteHealth(status = Reachability.CHECKING),
+        val health = BoardNetworkHealth(local = RouteHealth().checking(),
             remote = RouteHealth(status = Reachability.UNKNOWN))
         compose.setContent { FollowingCarTheme {
             BoardNetworkStatusCard(health, 10_000L, connected = false, remoteMode = false,
@@ -148,7 +151,9 @@ class BoardNetworkStatusCardTest {
                 onReconnectRemote = { reconnects++ })
         } }
         compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车状态待确认")
-        compose.onNodeWithTag("networkLocalStatus").assertTextEquals("局域网：正在检测")
+        compose.onNodeWithTag("networkLocalStatus").assertTextEquals("局域网：暂不可达")
+        compose.onNodeWithTag("networkLocalStatusFailure").assertTextEquals(ReachabilityFailure.UNREACHABLE.label)
+        compose.onNodeWithTag("networkLocalStatusRefreshing").assertExists()
         compose.onNodeWithTag("networkRefresh").assertIsNotEnabled()
         compose.onNodeWithTag("networkRemoteReconnect").assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(1, reconnects) }
@@ -185,5 +190,67 @@ class BoardNetworkStatusCardTest {
         compose.runOnIdle { assertEquals(0, refreshes); assertEquals(0, reconnects); allowed.value = true }
         compose.onNodeWithTag("networkCompactRemoteReconnect").assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(1, reconnects) }
+    }
+
+    @Test fun backgroundRefreshAndCancellationKeepFullAndCompactOnlineHeadingsStable() {
+        val health = mutableStateOf(BoardNetworkHealth(local = RouteHealth().online(9_000L)))
+        val now = mutableStateOf(10_000L)
+        compose.setContent { FollowingCarTheme { Column {
+            BoardNetworkStatusCard(health.value, now.value, connected = true, remoteMode = false,
+                canReconnectRemote = false, refreshing = health.value.local.probeInProgress,
+                onRefresh = {}, onReconnectRemote = {})
+            BoardNetworkStatusCard(health.value, now.value, connected = true, remoteMode = false,
+                canReconnectRemote = false, refreshing = health.value.local.probeInProgress,
+                onRefresh = {}, onReconnectRemote = {}, compact = true)
+        } } }
+        compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车在线 · 局域网")
+        compose.onNodeWithTag("networkHealthCompactSummary").assertTextEquals("小车在线 · 局域网")
+        compose.runOnIdle { health.value = health.value.copy(local = health.value.local.checking()) }
+        compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车在线 · 局域网")
+        compose.onNodeWithTag("networkHealthCompactSummary").assertTextEquals("小车在线 · 局域网")
+        compose.onNodeWithTag("networkLocalStatus").assertTextEquals("局域网：可达")
+        compose.onNodeWithTag("networkLocalStatusRefreshing").assertExists()
+        compose.onNodeWithTag("networkCompactRefreshing").assertExists()
+        compose.runOnIdle { health.value = health.value.copy(local = health.value.local.cancelChecking()) }
+        compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车在线 · 局域网")
+        compose.onNodeWithTag("networkHealthCompactSummary").assertTextEquals("小车在线 · 局域网")
+        compose.onNodeWithTag("networkLocalStatusRefreshing").assertDoesNotExist()
+        compose.onNodeWithTag("networkCompactRefreshing").assertDoesNotExist()
+        compose.runOnIdle {
+            health.value = health.value.copy(local = health.value.local.checking())
+            now.value = 39_001L
+        }
+        compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车状态待确认")
+        compose.onNodeWithTag("networkHealthCompactSummary").assertTextEquals("小车状态待确认")
+        compose.onNodeWithTag("networkLocalStatus").assertTextEquals("局域网：状态已过期，待确认")
+        compose.onNodeWithTag("networkLocalStatusRefreshing").assertExists()
+    }
+
+    @Test fun failedPathRetryKeepsFullAndCompactUnreachableHeadingsAndFailureVisible() {
+        val failed = RouteHealth().online(9_000L).unavailable(9_500L, ReachabilityFailure.TIMEOUT)
+        val health = mutableStateOf(BoardNetworkHealth(local = failed, remote = failed))
+        compose.setContent { FollowingCarTheme { Column {
+            BoardNetworkStatusCard(health.value, 10_000L, connected = false, remoteMode = true,
+                canReconnectRemote = false, refreshing = health.value.local.probeInProgress,
+                onRefresh = {}, onReconnectRemote = {})
+            BoardNetworkStatusCard(health.value, 10_000L, connected = false, remoteMode = true,
+                canReconnectRemote = false, refreshing = health.value.local.probeInProgress,
+                onRefresh = {}, onReconnectRemote = {}, compact = true)
+        } } }
+        compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车暂不可达")
+        compose.onNodeWithTag("networkHealthCompactSummary").assertTextEquals("小车暂不可达")
+        compose.runOnIdle { health.value = health.value.copy(
+            local = health.value.local.checking(), remote = health.value.remote.checking()) }
+        compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车暂不可达")
+        compose.onNodeWithTag("networkHealthCompactSummary").assertTextEquals("小车暂不可达")
+        compose.onNodeWithTag("networkLocalStatus").assertTextEquals("局域网：暂不可达")
+        compose.onNodeWithTag("networkLocalStatusFailure").assertTextEquals(ReachabilityFailure.TIMEOUT.label)
+        compose.onNodeWithTag("networkCompactRefreshing").assertExists()
+        compose.runOnIdle { health.value = health.value.copy(
+            local = health.value.local.cancelChecking(), remote = health.value.remote.cancelChecking()) }
+        compose.onNodeWithTag("networkHealthSummary").assertTextEquals("小车暂不可达")
+        compose.onNodeWithTag("networkHealthCompactSummary").assertTextEquals("小车暂不可达")
+        compose.onNodeWithTag("networkLocalStatusFailure").assertTextEquals(ReachabilityFailure.TIMEOUT.label)
+        compose.onNodeWithTag("networkCompactRefreshing").assertDoesNotExist()
     }
 }
