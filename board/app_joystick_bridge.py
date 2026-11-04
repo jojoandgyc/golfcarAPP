@@ -23,6 +23,8 @@ import threading
 import time
 from typing import Any
 
+from app_parking_settings import DriverIO, SimulatedIO, execute as execute_parking, validate_request as validate_parking_request, response as parking_response
+
 try:
     from app_diagnostic_log import DiagnosticLog, NullDiagnosticLog
 except Exception:
@@ -64,6 +66,7 @@ MAX_RPM = 100
 WATCHDOG_SECONDS = 0.6
 NETWORK_GRACE_SECONDS = 5.0
 PARKING_TRANSACTION_SECONDS = 2.0
+UNIFIED_PARKING_TRANSACTION_SECONDS = 3.0
 MAX_PARKING_CURRENT = 60
 SAFETY_VERSION = 2
 FEEDBACK_INTERVAL_SECONDS = 0.1
@@ -118,8 +121,8 @@ class InfraredInterlock:
 class Motors:
     """Session control, with read-only parking configuration and measured standstill.
 
-    No path in this class writes configuration registers. A parking switch selects
-    NORMAL/EMERGENCY stop mode; it never invents a current or clears saved settings.
+    Legacy controls never write configuration. Explicit unified parking requests
+    alone may update the two allowlisted currents; all other settings are preserved.
     """
 
     def __init__(self, client: Any = None, *, infrared: InfraredInterlock | None = None) -> None:
@@ -129,6 +132,11 @@ class Motors:
         self.ir_latched_directions: set[str] = set()
         self.parking_enabled = False
         self.emergency_hold = True
+        self.parking_mode_override: int | None = None
+        self.parking_command_state: bool | None = None
+        self.parking_input_release_required = False
+        self.parking_hardware_failure: str | None = None
+        self.parking_simulation = None
         self.parking_left_current = self.parking_right_current = 5.0 if client is None else 0.0
         self.parking_max_current = 60.0 if client is None else 0.0
         self.feedback = (0, 0, 0, 0)  # left/right RPM, left/right fault code
@@ -155,7 +163,10 @@ class Motors:
         previous = self.last_target
         if emergency:
             self.emergency_hold = True
-        mode = 0 if self.parking_enabled and not emergency else 1
+            self.parking_mode_override = None
+            self.parking_command_state = None
+        mode = (1 if emergency else self.parking_mode_override if self.parking_mode_override is not None
+                else 0 if self.parking_enabled else 1)
         errors = []
         if self.client is not None:
             for name, operation in (
@@ -395,7 +406,7 @@ class Motors:
         self.poll_safety()
         # Even after feedback recovers, discard held/queued motion until an
         # explicit neutral request has acknowledged the new zero-speed evidence.
-        if self.feedback_recovery_required:
+        if self.feedback_recovery_required or self.parking_input_release_required:
             return (0, 0)
         self.requested_target = (left, right)
         if self.check_infrared():
@@ -458,7 +469,7 @@ class Motors:
         if release_interlock:
             self.requested_target = (0, 0)
             self.ir_latched_directions.clear()
-            self.emergency_hold = emergency or self.standstill_pending
+            self.emergency_hold = emergency or (self.standstill_pending and self.parking_mode_override is None)
         if refresh:
             try:
                 self._write_stop(emergency=emergency or self.emergency_hold)
@@ -491,6 +502,8 @@ class Motors:
             raise SessionError("Parking current must be configured for both motors within the output-current limit")
         self.diagnostic.event("parking.mode_requested", critical=True, enabled=enabled,
                               **self.parking_state(), **self.feedback_state())
+        self.parking_mode_override = None
+        self.parking_command_state = True if enabled else None
         self.parking_enabled = enabled
         self.emergency_hold = not enabled
         # Both ON and OFF reissue zero speed and stop; never modify current parameters.
@@ -511,8 +524,80 @@ class Motors:
         self.zero_samples, self.last_zero_at = 0, None
         self.await_standstill(cleanup=True)
 
+    def unified_parking(self, request: dict[str, Any]) -> dict[str, Any]:
+        if request['op'] == 'read' and self.last_target != (0, 0):
+            # A malformed caller must not hold motion through slow read transactions.
+            # Normal App callers enqueue a separate neutral command before this read.
+            result = parking_response(request)
+            result.update(simulation=self.client is None, errorCode='motion_targets_active',
+                mode=self.parking_command_state,
+                modeSource='manual_session' if self.parking_command_state is not None else 'unknown',
+                leftRaw=round(self.parking_left_current*100), rightRaw=round(self.parking_right_current*100),
+                maxRaw=round(self.parking_max_current*100), leftRpm=self.feedback[0],rightRpm=self.feedback[1],
+                leftError=self.feedback[2],rightError=self.feedback[3])
+            return result
+        if request['op'] != 'read':
+            self._require_healthy()
+        started = time.monotonic()
+        previous_target = self.last_target
+        if self.client is None:
+            if self.parking_simulation is None:
+                self.parking_simulation = SimulatedIO()
+            io = self.parking_simulation
+            io.registers.update({0x76: round(self.parking_left_current * 100),
+                                 0x6D: round(self.parking_right_current * 100),
+                                 0x58: round(self.parking_max_current * 100)})
+        else:
+            io = DriverIO(self.client)
+        result = execute_parking(request, io, self.parking_command_state,
+            'manual_session', allow_sequence_id=True)
+        result['simulation'] = self.client is None
+        if request['op'] == 'read' and self.last_target != (0, 0):
+            result.update(ok=False, errorCode='motion_targets_active')
+        for key, attribute in (('leftRaw', 'parking_left_current'), ('rightRaw', 'parking_right_current'),
+                               ('maxRaw', 'parking_max_current')):
+            if result[key] is not None:
+                setattr(self, attribute, result[key] / 100.0)
+        if request['op'] != 'read' and result['writeMayHaveOccurred']:
+            self.last_target = (0, 0)
+            self.requested_target = (0, 0)
+            self.ir_latched_directions.clear()
+            self.parking_input_release_required = True
+            self.last_stop_at = time.monotonic()
+            if previous_target != (0, 0) or self.stop_requested_at is None:
+                self.stop_requested_at = started
+            self.zero_samples, self.last_zero_at = 0, None
+        if result['ok'] and request['op'] == 'mode':
+            self.parking_enabled = request['enabled']
+            self.parking_mode_override = 0 if request['enabled'] else 2
+            self.parking_command_state = request['enabled']
+            self.emergency_hold = False
+        if all(result[k] is not None for k in ('leftRpm','rightRpm','leftError','rightError')):
+            self.feedback = (result['leftRpm'],result['rightRpm'],result['leftError'],result['rightError'])
+            self.feedback_at = getattr(io, 'feedback_observed_at', None)
+            # These observations are not the spaced zero pair used by physical-stop confirmation.
+            self.zero_samples, self.last_zero_at = 0, None
+        hard_codes = {'parking_io_failed', 'invalid_feedback', 'zero_target_unconfirmed',
+                      'mode_write_unconfirmed', 'motor_fault', 'readback_mismatch', 'parking_transaction_timeout'}
+        code = result['errorCode']
+        if code in hard_codes:
+            self.parking_hardware_failure = code
+            self.fault_reason = 'Unified parking hardware failure: ' + code
+            self.parking_enabled = False
+            try:
+                self._write_stop(emergency=True)
+            except Exception:
+                pass
+            result.update(mode=None,modeSource='unknown')
+        self.diagnostic.event('parking.settings_result', critical=True, op=request['op'],
+            ok=result['ok'], errorCode=result['errorCode'], writeMayHaveOccurred=result['writeMayHaveOccurred'],
+            mode=result['mode'], modeSource=result['modeSource'], results=result['results'])
+        return result
+
     def parking_state(self) -> dict[str, Any]:
         return {"parkingEnabled": self.parking_enabled,
+                "parkingMode": self.parking_command_state,
+                "parkingModeSource": "manual_session" if self.parking_command_state is not None else "unknown",
                 "parkingLeftCurrentAmps": self.parking_left_current,
                 "parkingRightCurrentAmps": self.parking_right_current,
                 "parkingMaxCurrentAmps": self.parking_max_current, "parkingCurrentReadOnly": True}
@@ -521,7 +606,11 @@ class Motors:
 def validate_request_keys(message: Any) -> None:
     if not isinstance(message, dict):
         raise SessionError("Request must be a JSON object")
-    expected = PARKING_REQUEST_KEYS if message.get("cmd") == "parking" else REQUEST_KEYS
+    if message.get("cmd") == "parking_settings":
+        extra = {"enabled"} if message.get("op") == "mode" else {"leftRaw", "rightRaw"} if message.get("op") == "currents" else set()
+        expected = REQUEST_KEYS | {"op"} | extra
+    else:
+        expected = PARKING_REQUEST_KEYS if message.get("cmd") == "parking" else REQUEST_KEYS
     if set(message) != expected:
         raise SessionError("Unexpected request fields for command")
 
@@ -562,7 +651,8 @@ class ProtocolSession:
 
     @property
     def recovery_active(self) -> bool:
-        return self.recovery_required or self.motors.feedback_recovery_required
+        return (self.recovery_required or self.motors.feedback_recovery_required
+                or self.motors.parking_input_release_required)
 
     def pause_for_network(self) -> None:
         # Do not use shutdown(): network grace must not write parking registers.
@@ -582,7 +672,7 @@ class ProtocolSession:
                 "networkGraceMs": int(NETWORK_GRACE_SECONDS * 1000),
                 "motionRecheckMaxRpm": MOTION_RECHECK_MAX_RPM,
                 "motionRecheckMs": int(MOTION_RECHECK_SECONDS * 1000),
-                "standstillWaitSupported": True,
+                "standstillWaitSupported": True, "unifiedParkingSupported": True,
                 "infraredSupported": self.motors.infrared is not None,
                 **self.motors.parking_state()}
 
@@ -599,7 +689,7 @@ class ProtocolSession:
         if type(left) is not int or type(right) is not int or \
                 not -MAX_RPM <= left <= MAX_RPM or not -MAX_RPM <= right <= MAX_RPM:
             raise SessionError(f"Motor RPM must be integers in [-{MAX_RPM}, {MAX_RPM}]")
-        if command not in ("drive", "stop", "estop", "close", "parking"):
+        if command not in ("drive", "stop", "estop", "close", "parking", "parking_settings"):
             raise SessionError("Unknown command")
         if command != "drive" and (left != 0 or right != 0):
             raise SessionError("Non-drive commands require zero motor targets")
@@ -608,7 +698,16 @@ class ProtocolSession:
         standstill_pending = self.motors.standstill_pending
         recovering = self.recovery_active
         neutral = command == "stop" or (command == "drive" and (left, right) == (0, 0))
-        if command == "parking":
+        parking_result = None
+        if command == "parking_settings":
+            parking_request = {"schemaVersion": 1, "requestId": str(seq),
+                **{key: value for key, value in message.items() if key not in REQUEST_KEYS}}
+            validate_parking_request(parking_request, allow_sequence_id=True)
+            parking_result = self.motors.unified_parking(parking_request)
+            if self.motors.last_target is None:
+                raise SessionError("Unified parking zero target could not be confirmed")
+            left, right = self.motors.last_target
+        elif command == "parking":
             self.motors.set_parking(message["parkingEnabled"])
         elif closing:
             self.motors.shutdown()
@@ -633,7 +732,7 @@ class ProtocolSession:
             # terminal ACK that would skip cleanup on the way out.
             if not self.motors.stopped_confirmed:
                 raise SessionError("Terminal or parking standstill confirmation is no longer fresh")
-        else:
+        elif command != "parking_settings":
             self.motors._sample_feedback(force=True)
         # The recheck can start in drive.poll or in the final feedback sample,
         # after the original request branch was chosen. Its ACK must still
@@ -642,6 +741,7 @@ class ProtocolSession:
         standstill_pending = standstill_pending or self.motors.standstill_pending
         recovering = recovering or self.recovery_active
         if neutral:
+            self.motors.parking_input_release_required = False
             self.motors.release_motion_recovery()
         infrared = (self.motors.infrared_state() if command == "drive" else
                     {"infraredBlocked": False, "infraredDirections": []})
@@ -656,7 +756,8 @@ class ProtocolSession:
                 "recoveryRequired": recovering,
                 "feedbackRecheck": feedback_recheck,
                 "standstillPending": standstill_pending,
-                **self.motors.parking_state(), **infrared}, closing
+                **self.motors.parking_state(), **infrared,
+                **({"parkingResult": parking_result} if parking_result is not None else {})}, closing
 
 
 class InputPump:
@@ -731,7 +832,7 @@ class JsonOutput:
 
     def send(self, payload: dict[str, Any]) -> None:
         data = (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
-        if len(data) > 1024:
+        if len(data) > 4096:
             raise SessionError("Response too large")
         if os.write(self.fd, data) != len(data):
             raise SessionError("Control output blocked")
@@ -825,7 +926,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
                        (1 <= message[key] <= 2**63 - 1 if key == "seq" else -MAX_RPM <= message[key] <= MAX_RPM)
                        else None for key in ("seq", "left", "right")}
             request["cmd"] = message["cmd"] if message["cmd"] in (
-                "drive", "stop", "estop", "close", "parking") else "invalid"
+                "drive", "stop", "estop", "close", "parking", "parking_settings") else "invalid"
             request_gap_ms = None if last_received is None else (received - last_received) * 1000
             phase = "motor_transaction"
             response, closing = session.accept(message)
@@ -834,10 +935,11 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             cleanup_confirmed = closing and response["stopped"]
             completed = time.monotonic()
             processed_ms = (completed - received) * 1000
-            parking = message["cmd"] == "parking"
+            parking = message["cmd"] in ("parking", "parking_settings")
             # Only configuration with already stopped motors may outlive the motion lease.
             # Serial transactions themselves remain bounded by SERIAL_TIMEOUT.
-            limit = PARKING_TRANSACTION_SECONDS if parking else WATCHDOG_SECONDS
+            limit = (UNIFIED_PARKING_TRANSACTION_SECONDS if message["cmd"] == "parking_settings" else
+                     PARKING_TRANSACTION_SECONDS if parking else WATCHDOG_SECONDS)
             if not closing and completed >= received + limit:
                 raise SessionError("Parking transaction exceeded timeout" if parking else
                                    "Motor transaction exceeded control watchdog")
@@ -847,6 +949,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
                 raise SessionError("Session terminated")
             phase = "ack_write"
             output.send(response)
+            if motors.parking_hardware_failure:
+                raise SessionError("Unified parking hardware failure: " + motors.parking_hardware_failure)
             ack_at = time.monotonic()
             last_ack_at = ack_at
             last_ack_seq = response["seq"]
@@ -888,7 +992,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             standstill_heartbeat = response["standstillPending"] and (
                 message["cmd"] == "stop" or
                 message["cmd"] == "drive" and (message["left"], message["right"]) == (0, 0))
-            if not session.recovery_active or standstill_heartbeat:
+            denied_moving_read = (response.get("parkingResult", {}).get("errorCode") == "motion_targets_active")
+            if not denied_moving_read and (not session.recovery_active or standstill_heartbeat):
                 deadline = (completed if parking else received) + WATCHDOG_SECONDS
                 session_deadline = (completed if parking else received) + NETWORK_GRACE_SECONDS
                 motion_expired = False

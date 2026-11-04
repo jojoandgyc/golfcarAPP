@@ -78,7 +78,7 @@ internal fun validatedDriveFeedback(values: Map<String, Any?>, dryRun: Boolean,
     return ValidatedDriveFeedback(targetStopped, stopped, feedback)
 }
 
-internal fun validatedParkingSettings(values: Map<String, Any?>): ParkingSettings {
+internal fun validatedParkingSettings(values: Map<String, Any?>, commandModeOnly: Boolean = false): ParkingSettings {
     val enabled = values["parkingEnabled"]
     require(enabled is Boolean) { "开发板驻车模式字段无效" }
     fun amps(key: String): Double {
@@ -90,7 +90,7 @@ internal fun validatedParkingSettings(values: Map<String, Any?>): ParkingSetting
     }
     val settings = ParkingSettings(enabled, amps("parkingLeftCurrentAmps"), amps("parkingRightCurrentAmps"),
         amps("parkingMaxCurrentAmps"))
-    require(!settings.enabled || settings.canEnable) { "开发板已启用驻车但电流配置无效" }
+    require(commandModeOnly || !settings.enabled || settings.canEnable) { "开发板已启用驻车但电流配置无效" }
     return settings
 }
 

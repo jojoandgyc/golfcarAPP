@@ -465,7 +465,8 @@ internal class BoundedOutputStream(private val limit: Int) : OutputStream() {
 /** Never let caller-provided command labels or terminal exceptions leak command contents. */
 internal fun safeDiagnosticCommandKind(kind: String): String = when (kind) {
     "board_status", "memory", "disk", "network", "video_inspect", "video_start", "video_stop",
-    "follow_config", "follow_availability", "motor_config_read", "motor_config_write", "motor_action" -> kind
+    "follow_config", "follow_availability", "motor_config_read", "motor_config_write", "motor_action",
+    "parking_read", "parking_mode", "parking_currents" -> kind
     else -> "terminal"
 }
 

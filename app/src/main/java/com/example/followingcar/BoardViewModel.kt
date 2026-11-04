@@ -188,6 +188,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         MotorSerialSettings(preferences.getInt("motor_slave", 1), preferences.getInt("motor_baud", 115200),
             preferences.getInt("motor_parity", 0)).takeIf { it.isValid } ?: MotorSerialSettings()))
     val motorConfiguration = mutableMotorConfiguration.asStateFlow()
+    private val mutableParkingPage = MutableStateFlow(ParkingPageState())
+    internal val parkingPage = mutableParkingPage.asStateFlow()
+    private var parkingLeftEdited = false
+    private var parkingRightEdited = false
+    private var parkingObservationConnectionId: String? = null
+    private var pendingUnifiedParking: ParkingRequest? = null
     private val wifiDirectDelegate = lazy {
         WifiDirectController(application) { state.value.canManageWifiDirect }
     }
@@ -252,6 +258,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             state.collect { current ->
+                val connectionId = client.diagnosticConnectionId
+                mutableParkingPage.update { parking ->
+                    val stale = !current.connected || current.driveStarting || current.driveStopping ||
+                        current.followBlocksControl || current.motorActionUnconfirmed || parkingObservationConnectionId != null &&
+                        parkingObservationConnectionId != connectionId
+                    parking.copy(connected = current.connected, mode = if (stale) null else parking.mode,
+                        feedbackText = if (stale) null else parking.feedbackText,
+                        message = if (stale && parking.mode != null) "连接或控制占用已变化，驻车模式待确认；电流为上次读值" else parking.message)
+                }
                 if (!current.connected || current.manualActive || current.followBlocksControl) {
                     mutableMotorConfiguration.update { motor ->
                         if (motor.snapshot == null || motor.requiresRead) motor else motor.copy(requiresRead = true,
@@ -791,6 +806,184 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    internal fun editParkingLeft(value: String) {
+        parkingLeftEdited = true
+        mutableParkingPage.update { it.copy(draftLeft = value.take(32)) }
+    }
+
+    internal fun editParkingRight(value: String) {
+        parkingRightEdited = true
+        mutableParkingPage.update { it.copy(draftRight = value.take(32)) }
+    }
+
+    internal fun refreshParking() = submitParkingRequest(ParkingRequest("read"))
+
+    internal fun requestParkingMode(enabled: Boolean) = submitParkingRequest(ParkingRequest("mode", enabled = enabled))
+
+    internal fun saveParkingCurrents() {
+        val draft = parkingPage.value
+        val left = parkingDraftRaw(draft.draftLeft)
+        val right = parkingDraftRaw(draft.draftRight)
+        if (left == null || right == null) {
+            mutableParkingPage.update { it.copy(error = "请输入 0–60 A 的左右电流，最多两位小数") }
+            return
+        }
+        // Freeze only this request. Later user edits remain independent of its readback.
+        submitParkingRequest(ParkingRequest("currents", leftRaw = left, rightRaw = right))
+    }
+
+    private fun submitParkingRequest(request: ParkingRequest) {
+        val current = state.value
+        val blocked = when {
+            parkingPage.value.busy -> "驻车操作正在进行，请等待本次结果"
+            disconnecting || !current.connected || !client.isConnected -> "请先连接小车；已编辑的电流会保留"
+            current.followBlocksControl -> "自动跟随正在占用或退出尚未确认，请先结束跟随并核对占用"
+            current.motorActionUnconfirmed -> "上次电机操作尚未确认，请先核对控制占用"
+            current.pairingBusy || current.pairingUnconfirmed -> "无线配网尚未结束，请先完成连接确认"
+            current.driveStarting || current.driveStopping -> "手动控制正在启动或停用，请等待完成后重试"
+            current.busy || current.videoServiceBusy || current.parkingUpdating -> "其他操作正在进行，请稍后重试"
+            current.driveEnabled && driveChannel?.ready?.unifiedParkingSupported != true -> "开发板尚未支持统一驻车接口，请更新桥接程序"
+            else -> null
+        }
+        if (blocked != null) {
+            mutableParkingPage.update { it.copy(error = blocked) }
+            return
+        }
+        mutableParkingPage.update { it.copy(busy = true, error = null,
+            message = when (request.op) { "read" -> "正在读取驻车信息…"; "mode" -> "正在发送停止模式指令…"; else -> "正在读取当前上限并保存驻车电流…" }) }
+        Diagnostics.event("parking.operation_requested", activeDiagnostic(),
+            fields = mapOf("op" to request.op, "route" to if (current.driveEnabled) "manual_owner" else "idle"), critical = true)
+        if (current.driveEnabled) {
+            desiredWheels = WheelSpeeds()
+            desiredGeneration += 1
+            // A previously held input cannot resume when the operation completes.
+            driveRecoveryGate.recovered(neutralRequest = false)
+            pendingUnifiedParking = request
+            mutableState.update { it.copy(driveLeft = 0, driveRight = 0, driveConfirmedStopped = false,
+                parkingUpdating = true, driveRecoveryNeedsRelease = driveRecoveryGate.needsRelease) }
+            driveWakeup.trySend(Unit)
+        } else {
+            val connectionId = client.diagnosticConnectionId
+            val diagnostic = Diagnostics.newContext(connectionId)
+            mutableState.update { it.copy(busy = true) }
+            operation = viewModelScope.launch {
+                try {
+                    val reply = if (request.op == "currents") {
+                        val baseline = client.parkingRequest(ParkingRequest("read"), diagnostic)
+                        if (!baseline.ok) baseline else if (!parkingCurrentsWithinReadLimit(request, baseline)) null
+                        else client.parkingRequest(request, Diagnostics.newContext(connectionId))
+                    } else client.parkingRequest(request, diagnostic)
+                    if (client.diagnosticConnectionId == connectionId && client.isConnected && !disconnecting) {
+                        if (reply != null) acceptParkingReply(reply, request)
+                    } else parkingOperationUnknown(request)
+                } catch (cancelled: CancellationException) {
+                    parkingOperationUnknown(request)
+                    throw cancelled
+                } catch (failure: Exception) {
+                    parkingOperationUnknown(request)
+                    Diagnostics.failure(diagnostic, "parking.operation_failed", failure)
+                    mutableState.update { it.withTransportState(client.isConnected) }
+                } finally {
+                    mutableParkingPage.update { it.copy(busy = false) }
+                    if (!disconnecting) mutableState.update { it.copy(busy = false) }
+                }
+            }
+        }
+    }
+
+    private fun parkingCurrentsWithinReadLimit(request: ParkingRequest, baseline: ParkingReply): Boolean {
+        val maximum = baseline.maxRaw
+        val valid = maximum != null && request.leftRaw != null && request.rightRaw != null &&
+            request.leftRaw <= maximum && request.rightRaw <= maximum
+        if (!valid) {
+            acceptParkingReply(baseline, ParkingRequest("read"))
+            mutableParkingPage.update { it.copy(error = "左右驻车电流不能超过刚读取的最大输出电流；本次未写入") }
+        }
+        return valid
+    }
+
+    private fun acceptParkingReply(reply: ParkingReply, request: ParkingRequest) {
+        parkingObservationConnectionId = client.diagnosticConnectionId
+        val resultText = reply.results.joinToString("；") {
+            (if (it.side == "left") "左" else "右") + when (it.status) {
+                "verified" -> "已回读确认 ${parkingRawText(requireNotNull(it.actualRaw))} A"
+                "not_attempted" -> "未写入"
+                else -> "结果待核对"
+            }
+        }
+        mutableParkingPage.update { page -> page.copy(mode = reply.mode,
+            leftCurrentAmps = reply.leftRaw?.div(100.0) ?: page.leftCurrentAmps.takeUnless {
+                request.op == "currents" && reply.writeMayHaveOccurred },
+            rightCurrentAmps = reply.rightRaw?.div(100.0) ?: page.rightCurrentAmps.takeUnless {
+                request.op == "currents" && reply.writeMayHaveOccurred },
+            maxCurrentAmps = reply.maxRaw?.div(100.0) ?: page.maxCurrentAmps,
+            draftLeft = if (!parkingLeftEdited && reply.leftRaw != null) parkingRawText(reply.leftRaw) else page.draftLeft,
+            draftRight = if (!parkingRightEdited && reply.rightRaw != null) parkingRawText(reply.rightRaw) else page.draftRight,
+            feedbackText = if (reply.leftRpm != null && reply.rightRpm != null)
+                "轮速：左 ${reply.leftRpm} / 右 ${reply.rightRpm} RPM" else null,
+            message = when {
+                resultText.isNotBlank() -> resultText + if (reply.leftRaw == 0 || reply.rightRaw == 0) "；0 A 的一侧不能提供驻车电流" else ""
+                reply.ok && request.op == "mode" ->
+                    (if (reply.mode == true) "开启驻车" else "自由停止") + "指令已确认"
+                !reply.ok -> "本次操作未完成，请查看错误信息"
+                reply.mode == null -> "电流已读取"
+                else -> "驻车信息已更新"
+            }, error = if (reply.ok) null else parkingReplyError(reply)) }
+        if (request.op == "currents" && (reply.ok || reply.writeMayHaveOccurred)) {
+            mutableMotorConfiguration.update { it.copy(requiresRead = true,
+                message = "驻车电流可能已更新，请重新读取电机配置；其他编辑草稿已保留") }
+        }
+        if (reply.leftRaw != null && reply.rightRaw != null && reply.maxRaw != null)
+            mutableState.update { it.copy(lastReadParkingSettings = ParkingSettings(false,
+                reply.leftRaw / 100.0, reply.rightRaw / 100.0, reply.maxRaw / 100.0)) }
+        Diagnostics.event("parking.operation_completed", activeDiagnostic(), fields = mapOf("op" to request.op,
+            "ok" to reply.ok, "modeSource" to reply.modeSource, "writeMayHaveOccurred" to reply.writeMayHaveOccurred,
+            "results" to reply.results.map { "${it.side}:${it.status}" }), critical = true)
+    }
+
+    private fun parkingOperationUnknown(request: ParkingRequest?) {
+        mutableParkingPage.update { it.copy(mode = null, busy = false, feedbackText = null,
+            leftCurrentAmps = if (request?.op == "currents") null else it.leftCurrentAmps,
+            rightCurrentAmps = if (request?.op == "currents") null else it.rightCurrentAmps,
+            error = if (request?.op == "read") "驻车读取未完成，请重新连接后重试"
+                else "驻车设置结果未确认，请重新连接并读取核对；不会自动重试") }
+    }
+
+    private fun observeDriveParking(ack: DriveAck) {
+        val settings = ack.parking ?: return
+        parkingObservationConnectionId = client.diagnosticConnectionId
+        mutableParkingPage.update { page -> page.copy(
+            mode = ack.parkingMode,
+            leftCurrentAmps = settings.leftCurrentAmps, rightCurrentAmps = settings.rightCurrentAmps,
+            maxCurrentAmps = settings.maxCurrentAmps,
+            draftLeft = if (!parkingLeftEdited) parkingRawText((settings.leftCurrentAmps * 100).toInt()) else page.draftLeft,
+            draftRight = if (!parkingRightEdited) parkingRawText((settings.rightCurrentAmps * 100).toInt()) else page.draftRight,
+            feedbackText = ack.feedback?.let { "轮速：左 ${it.leftRpm} / 右 ${it.rightRpm} RPM" }) }
+    }
+
+    private suspend fun performOwnerParking(channel: BoardDriveChannel, request: ParkingRequest) {
+        // READ stays read-only on the board. This explicit neutral request establishes
+        // zero targets before any owner parking request; it does not assert physical rest.
+        val neutral = channel.exchange(0, 0)
+        handleDriveRecovery(neutral, neutralRequest = true)
+        mutableState.update { it.withDriveFeedback(neutral).copy(driveConfirmedStopped =
+            neutral.stopped && neutral.hasFreshFeedback(), parkingSettings = neutral.parking) }
+        if (stopRequest != null) return
+        suspend fun exchange(operation: ParkingRequest): ParkingReply {
+            val ack = channel.parkingSettings(operation)
+            handleDriveRecovery(ack, neutralRequest = true)
+            mutableState.update { it.withDriveFeedback(ack).copy(driveConfirmedStopped =
+                ack.stopped && ack.hasFreshFeedback(), parkingSettings = ack.parking) }
+            return requireNotNull(ack.parkingResult)
+        }
+        val result = if (request.op == "currents") {
+            val baseline = exchange(ParkingRequest("read"))
+            if (!baseline.ok) baseline else if (!parkingCurrentsWithinReadLimit(request, baseline)) null
+            else if (stopRequest == null) exchange(request) else null
+        } else exchange(request)
+        if (stopRequest == null && result != null) acceptParkingReply(result, request)
+    }
+
     fun refreshMotorConfiguration() {
         refreshMotorConfiguration(preserveDrafts = false)
     }
@@ -1293,6 +1486,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     // All configuration shares this loop with heartbeats; a UI callback never
                     // starts a competing channel transaction or queues a movement behind it.
+                    val unifiedRequest = pendingUnifiedParking
+                    if (unifiedRequest != null) {
+                        performOwnerParking(activeChannel, unifiedRequest)
+                        pendingUnifiedParking = null
+                        mutableState.update { it.copy(parkingUpdating = false) }
+                        mutableParkingPage.update { it.copy(busy = false) }
+                        continue
+                    }
                     val requestedParking = pendingParking
                     if (requestedParking != null) {
                         val current = state.value
@@ -1339,6 +1540,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     val ack = activeChannel.exchange(target.left, target.right)
                     val wasStandstillPending = state.value.driveStandstillPending
                     handleDriveRecovery(ack, neutralRequest = target.stopped)
+                    observeDriveParking(ack)
                     markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
                     val interlock = ack.interlock?.takeIf { it.blocked }
                     if (interlock != state.value.driveInterlock) Diagnostics.event("drive.infrared_interlock",
@@ -1386,6 +1588,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     parkingStatus = "驻车状态未确认，重新启用后读取") }
                 throw cancelled
             } catch (failure: Exception) {
+                if (failure is ParkingResultException) {
+                    pendingUnifiedParking?.let { acceptParkingReply(failure.result, it) }
+                    pendingUnifiedParking = null
+                    mutableParkingPage.update { it.copy(busy = false) }
+                }
                 val first = Diagnostics.failure(driveDiagnostic, "drive.failed", failure)
                 mutableState.update {
                     it.withTransportState(client.isConnected).copy(driveStatus = "手动控制已停用", driveConfirmedStopped = false,
@@ -1401,6 +1608,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 driveRecoveryGate.reset()
                 desiredWheels = WheelSpeeds()
                 pendingParking = null
+                if (pendingUnifiedParking != null) parkingOperationUnknown(pendingUnifiedParking)
+                pendingUnifiedParking = null
+                mutableParkingPage.update { it.copy(mode = null, busy = false,
+                    message = if (it.error != null) it.message else "手动控制已结束，驻车模式待确认；电流为上次读值") }
                 // Motor stop/close always precedes service cleanup. Retain manual ownership
                 // until cleanup finishes so follow cannot race a late camera-service start.
                 mutableState.update { it.copy(driveStarting = false, driveEnabled = false,
@@ -1461,7 +1672,13 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun moveJoystick(x: Float, forward: Float) {
-        if (!state.value.driveEnabled || state.value.followBlocksControl || state.value.parkingUpdating || pendingParking != null || stopRequest != null) return
+        if (!state.value.driveEnabled || state.value.followBlocksControl || stopRequest != null) return
+        if (state.value.parkingUpdating || pendingParking != null || pendingUnifiedParking != null) {
+            driveRecoveryGate.input()
+            driveRecoveryGate.recovered(neutralRequest = false)
+            mutableState.update { it.copy(driveRecoveryNeedsRelease = true) }
+            return
+        }
         if (!driveRecoveryGate.input()) return
         if (state.value.driveFeedbackRecheck || state.value.driveStandstillPending) {
             // Input can begin after the final recovery ACK but before its healthy

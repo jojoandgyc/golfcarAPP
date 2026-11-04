@@ -30,22 +30,25 @@ class BoardPagesTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
 
     @Test
-    fun parkingCurrentEditorIsReachableWithoutStartingDriveOrReadingRegisters() {
+    fun parkingControlsAndCurrentInputsShareOnePageWithoutStartingDrive() {
         val vm = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
         compose.onNodeWithTag("pageJoystick").performClick()
         compose.onNodeWithTag("manualParkingTab").performClick()
-        compose.onNodeWithTag("parkingCurrentSettingsButton").assertIsDisplayed().performClick()
-        compose.onNodeWithTag("parkingSwitch").assertDoesNotExist()
+        compose.onNodeWithTag("parkingPage").assertIsDisplayed()
+        compose.onNodeWithTag("parkingPageEnable").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parkingPageDisable").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parkingPageLeftInput").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parkingPageRightInput").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parkingCurrentSettingsButton").assertDoesNotExist()
+        compose.onNodeWithTag("parkingCurrentBackButton").assertDoesNotExist()
         compose.onNodeWithTag("enableDrive").assertDoesNotExist()
-        compose.onNodeWithTag("parkingCurrentDone").assertIsDisplayed().assertIsEnabled()
         compose.runOnIdle {
             assertFalse(vm.state.value.manualActive)
             assertFalse(vm.state.value.busy)
             assertNull(vm.motorConfiguration.value.snapshot)
             assertFalse(vm.motorConfiguration.value.busy)
         }
-        compose.onNodeWithTag("parkingCurrentDone").performClick()
-        compose.onNodeWithTag("parkingSwitch").assertExists()
+        compose.onNodeWithTag("manualDriveTab").performClick()
         compose.onNodeWithTag("enableDrive").assertIsDisplayed().assertIsNotEnabled()
     }
 
@@ -177,15 +180,13 @@ class BoardPagesTest {
         compose.onNodeWithTag("enableDrive").assertIsDisplayed()
 
         compose.onNodeWithTag("manualParkingTab").performClick()
-        assertTrue(compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes().isEmpty())
-        compose.onNodeWithTag("parkingSwitch").assertIsDisplayed()
-        compose.onNodeWithTag("parkingCurrent").assertIsDisplayed()
-        compose.onNodeWithTag("parkingLeftCurrent").assertIsDisplayed().assertTextEquals("左：— A")
-        compose.onNodeWithTag("parkingRightCurrent").assertIsDisplayed().assertTextEquals("右：— A")
-        compose.onNodeWithTag("parkingIncrease").assertDoesNotExist()
-        compose.onNodeWithTag("parkingDecrease").assertDoesNotExist()
+        compose.onNodeWithTag("parkingPage").assertIsDisplayed()
+        compose.onNodeWithTag("parkingPageMode").assertTextEquals("驻车状态待确认")
+        compose.onNodeWithTag("parkingPageLeftInput").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parkingPageRightInput").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parkingPageSave").assertIsDisplayed()
         compose.onNodeWithTag("drivingCameraPanel").assertDoesNotExist()
-        compose.onNodeWithTag("enableDrive").assertIsDisplayed()
+        compose.onNodeWithTag("enableDrive").assertDoesNotExist()
 
         compose.onNodeWithTag("manualDriveTab").performClick()
         compose.onNodeWithTag("drivingCameraPanel").assertIsDisplayed()

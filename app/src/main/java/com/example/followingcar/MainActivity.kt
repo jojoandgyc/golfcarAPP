@@ -542,13 +542,15 @@ private fun BoardScreen(viewModel: BoardViewModel) {
 private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifier: Modifier = Modifier) {
     val remoteVideo by viewModel.remoteVideo.collectAsStateWithLifecycle()
     val networkSnapshot by viewModel.networkSnapshot.collectAsStateWithLifecycle()
-    val motorConfiguration by viewModel.motorConfiguration.collectAsStateWithLifecycle()
+    val parkingPage by viewModel.parkingPage.collectAsStateWithLifecycle()
     var useDirectionPad by rememberSaveable { mutableStateOf(false) }
     var manualSection by rememberSaveable { mutableStateOf(ManualSection.DRIVE) }
-    var editingParkingCurrent by rememberSaveable { mutableStateOf(false) }
     var waitingForModeStop by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
     var showError by remember { mutableStateOf(false) }
+    LaunchedEffect(manualSection, state.connected) {
+        if (manualSection == ManualSection.PARKING && state.connected) viewModel.refreshParking()
+    }
     LaunchedEffect(waitingForModeStop, state.driveConfirmedStopped, state.driveEnabled) {
         if (waitingForModeStop && (!state.driveEnabled || state.driveConfirmedStopped)) {
             waitingForModeStop = false
@@ -569,7 +571,6 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
             viewModel.releaseJoystick()
         }
         manualSection = next
-        editingParkingCurrent = false
     }
     val controlling = state.driveEnabled || state.driveStarting || state.driveStopping
     val canAdjustSpeed = !state.parkingUpdating && !state.followBlocksControl &&
@@ -595,29 +596,18 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                     modifier = Modifier.testTag("driveError")) { Text("故障") }
                 TextButton(onClick = { showHelp = true }) { Text("说明") }
             }
-            Text("${state.status} · ${state.driveStatus}",
+            if (manualSection != ManualSection.PARKING) Text("${state.status} · ${state.driveStatus}",
                 modifier = Modifier.fillMaxWidth().testTag("driveStatus"),
                 style = MaterialTheme.typography.bodySmall, maxLines = 1,
                 overflow = TextOverflow.Ellipsis)
             if (manualSection == ManualSection.PARKING) {
-                Column(Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    if (editingParkingCurrent) {
-                        TextButton(onClick = { editingParkingCurrent = false },
-                            modifier = Modifier.testTag("parkingCurrentBackButton")) { Text("返回驻车开关") }
-                        ParkingCurrentEditor(boardState = state, configuration = motorConfiguration,
-                            onRead = viewModel::refreshParkingCurrentConfiguration,
-                            onApply = viewModel::applyParkingCurrentConfiguration,
-                            modifier = Modifier.fillMaxWidth())
-                    } else {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                            TextButton(onClick = {
-                                viewModel.recordUiEvent("ui.parking_current_editor", "OPEN")
-                                editingParkingCurrent = true
-                            }, modifier = Modifier.testTag("parkingCurrentSettingsButton")) { Text("设置驻车电流") }
-                        }
-                        ParkingControls(state = state, onEnabledChange = viewModel::setParkingEnabled)
-                    }
-                }
+                ParkingPage(state = parkingPage,
+                    onRefresh = viewModel::refreshParking,
+                    onLeftChange = viewModel::editParkingLeft,
+                    onRightChange = viewModel::editParkingRight,
+                    onSave = viewModel::saveParkingCurrents,
+                    onEnabledChange = viewModel::requestParkingMode,
+                    modifier = Modifier.fillMaxWidth().weight(1f))
             } else {
                 Column(Modifier.fillMaxWidth().weight(1f),
                     verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -684,13 +674,13 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                         overflow = TextOverflow.Ellipsis)
                 }
             }
-            if (!controlling) {
-                Button(onClick = { if (editingParkingCurrent) editingParkingCurrent = false else viewModel.enableDrive() },
-                    enabled = editingParkingCurrent || state.canEnableDrive,
-                    modifier = Modifier.fillMaxWidth().testTag(if (editingParkingCurrent) "parkingCurrentDone" else "enableDrive")) {
-                    Text(if (editingParkingCurrent) "返回驻车开关" else "启用手动控制")
+            if (!controlling && manualSection != ManualSection.PARKING) {
+                Button(onClick = { viewModel.enableDrive() },
+                    enabled = state.canEnableDrive,
+                    modifier = Modifier.fillMaxWidth().testTag("enableDrive")) {
+                    Text("启用手动控制")
                 }
-            } else {
+            } else if (controlling) {
                 Button(onClick = { viewModel.disableDrive("已急停 · 重新启用后可操作", emergency = true) },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error,
                         contentColor = MaterialTheme.colorScheme.onError),

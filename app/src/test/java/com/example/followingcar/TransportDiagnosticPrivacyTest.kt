@@ -12,6 +12,9 @@ class TransportDiagnosticPrivacyTest {
     fun arbitraryCommandLabelsCannotBecomeLogFields() {
         assertEquals("follow_availability", safeDiagnosticCommandKind("follow_availability"))
         assertEquals("video_stop", safeDiagnosticCommandKind("video_stop"))
+        listOf("parking_read", "parking_mode", "parking_currents").forEach {
+            assertEquals(it, safeDiagnosticCommandKind(it))
+        }
         assertEquals("terminal", safeDiagnosticCommandKind("echo token=private-value"))
         assertEquals("terminal", safeDiagnosticCommandKind(""))
     }

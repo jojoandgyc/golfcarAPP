@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 BRIDGE = Path(__file__).resolve().parents[1] / "board" / "app_motor_config_bridge.py"
+PARKING_BRIDGE = BRIDGE.with_name("app_parking_bridge.py")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -33,7 +34,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"kind": "followingcar-motor-simulator", "simulation": True})
 
     def do_POST(self):
-        if self.path != "/request":
+        if self.path not in ("/request", "/parking-request"):
             self.send_json(404, {"error": "not_found"})
             return
         try:
@@ -43,7 +44,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             data = self.rfile.read(size)
             # The strict production request parser and Modbus simulator do all validation.
-            result = subprocess.run([sys.executable, "-B", str(BRIDGE), "--request", "--simulate"],
+            bridge = PARKING_BRIDGE if self.path == "/parking-request" else BRIDGE
+            result = subprocess.run([sys.executable, "-B", str(bridge), "--request", "--simulate"],
                                     input=data, capture_output=True, timeout=75)
             body = json.loads(result.stdout)
             if body.get("simulation") is not True:

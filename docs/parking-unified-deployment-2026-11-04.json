@@ -1,0 +1,250 @@
+{
+  "recordedAtUtc": "2026-11-04T05:23:48.533854+00:00",
+  "sourceBaseCommit": "6f3d1f3b4570de2262a6e96f636041a328b42792",
+  "status": "deployed_and_verified",
+  "app": {
+    "appVersion": "1.8.14-unified-parking",
+    "versionCode": 25,
+    "apkSha256": "070329ba076ab3c925fee3884df0ff2f7e61081f9d9f15ee33df35d3af3fb064",
+    "boardSources": {
+      "app_joystick_bridge.py": "1f6d17a099982edaac5eca435e1ba6c9ea8704f619a2345005dd6ce59f2f7fcc",
+      "app_parking_settings.py": "8b9cc82fbdbfa82ac4ab8828f8dc874ebdbfddd67d17dac0be7996b1a25dba3b",
+      "app_parking_bridge.py": "f6e686bc04aeaf1e8afda895085cf92e2af908ea730af5b39ece50a0229470b5"
+    },
+    "phoneInstallation": {
+      "installedAtUtc": "2026-11-04T05:07:54.306993+00:00",
+      "versionCode": 25,
+      "versionName": "1.8.14-unified-parking",
+      "apkSha256": "070329ba076ab3c925fee3884df0ff2f7e61081f9d9f15ee33df35d3af3fb064",
+      "installedApkSha256": "070329ba076ab3c925fee3884df0ff2f7e61081f9d9f15ee33df35d3af3fb064",
+      "alreadyInstalled": false,
+      "previousVersionCode": 24,
+      "previousApkSha256": "bc5a0aee65685062e39393971cbe807e6298ff3258ec128ee4815ddc620e201b",
+      "backup": "E:\\Temp\\golfcar-parking-unified-2026-11-04\\phone-before-v24-20261104T050751Z-cd535e0a.apk",
+      "connectionPreferencesPreserved": true,
+      "controlLease": {
+        "event": "locked",
+        "controlIdle": true,
+        "serialIdle": true,
+        "bothControlLocksHeld": true,
+        "guardSha256": "7e537b8147e73246fcad974c2c84bec9b485692296fa6c7c6640e51d695abf6e",
+        "leaseSeconds": 60
+      },
+      "realMotorWritesSent": false,
+      "controlLeaseRelease": {
+        "event": "unlocked",
+        "reason": "released"
+      }
+    }
+  },
+  "boardInitialDeployment": {
+    "deployedAtUtc": "2026-11-04T05:08:23.177860+00:00",
+    "files": [
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_parking_settings.py",
+        "sha256": "8b9cc82fbdbfa82ac4ab8828f8dc874ebdbfddd67d17dac0be7996b1a25dba3b",
+        "oldSha256": null,
+        "backup": null
+      },
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_parking_bridge.py",
+        "sha256": "5f0c3cfb599fe767cb7b0107f2eea24da4c39855bcb892702e189c4ca351f6a6",
+        "oldSha256": null,
+        "backup": null
+      },
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+        "sha256": "1f6d17a099982edaac5eca435e1ba6c9ea8704f619a2345005dd6ce59f2f7fcc",
+        "oldSha256": "fef016e2d71911b639f4776451ddfb66a38c8063a9d719845282595046d987b8",
+        "backup": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py.bak.unified-parking-20261104T050823Z"
+      }
+    ],
+    "bothControlLocksHeld": true,
+    "controlIdle": true,
+    "serialIdle": true,
+    "realMotorWritesSent": false,
+    "stagedSimulationPassed": true
+  },
+  "boardReaderUpdate": {
+    "deployedAtUtc": "2026-11-04T05:16:04.376659+00:00",
+    "files": [
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_parking_settings.py",
+        "sha256": "8b9cc82fbdbfa82ac4ab8828f8dc874ebdbfddd67d17dac0be7996b1a25dba3b",
+        "alreadyDeployed": true
+      },
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_parking_bridge.py",
+        "sha256": "f6e686bc04aeaf1e8afda895085cf92e2af908ea730af5b39ece50a0229470b5",
+        "oldSha256": "5f0c3cfb599fe767cb7b0107f2eea24da4c39855bcb892702e189c4ca351f6a6",
+        "backup": "/home/topeet/lianzhan/scripts/app_parking_bridge.py.bak.unified-parking-20261104T051604Z"
+      },
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+        "sha256": "1f6d17a099982edaac5eca435e1ba6c9ea8704f619a2345005dd6ce59f2f7fcc",
+        "alreadyDeployed": true
+      }
+    ],
+    "bothControlLocksHeld": true,
+    "controlIdle": true,
+    "serialIdle": true,
+    "realMotorWritesSent": false,
+    "stagedSimulationPassed": true
+  },
+  "behavior": {
+    "singlePage": "Parking mode actions, left/right drafts, readbacks and save on one fixed page; no editor subpage or manual-control prerequisite.",
+    "drafts": "Always editable; late replies preserve new edits.",
+    "idleOperations": "Dedicated bridge under existing control locks; does not start video or joystick.",
+    "manualOperations": "Existing owner serializes neutral targets, read and parking settings; no competing serial process or replay of held input.",
+    "currentRegisters": "Only left 0x0076 and right 0x006D saved via FC10 after zero targets; no max/PID/other configuration writes.",
+    "modeCommands": "New ON uses normal-stop 0; new OFF uses free-stop 2. Network/hardware/terminal safety retains emergency-stop 1.",
+    "modeKnowledge": "Controller has no physical parking-state readback; show latest explicitly confirmed command. Unknown never means OFF.",
+    "partialResults": "Per-side verified/unknown/not-attempted; no automatic retry or rollback.",
+    "inputProtocol": "One bounded JSON line; no wait for SSH stdin EOF."
+  },
+  "validation": {
+    "jvm": {
+      "tests": 268,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorProtocolUiAndCrossLanguageSimulation": {
+      "tests": 102,
+      "passed": 102
+    },
+    "boardOffline": {
+      "tests": 223,
+      "passed": 223,
+      "skipped": 0
+    },
+    "deployedSshMemorySimulation": {
+      "tests": 5,
+      "passed": 5,
+      "realBoardSsh": true,
+      "allControlSessionsDryRun": true,
+      "realSerialOpened": false,
+      "realMotorCommandsSent": false
+    },
+    "initialReaderRetest": {
+      "passed": false,
+      "cause": "Four requests exceeded the 30 s test budget because remote sudo invocations intermittently stalled for about 10 s."
+    },
+    "finalReaderRetest": {
+      "tests": 1,
+      "passed": 1,
+      "simulationOnly": true,
+      "durationSeconds": 1.153
+    },
+    "realPhoneReadOnlyUi": {
+      "checkedAtUtc": "2026-11-04T05:16:27.375622+00:00",
+      "buttonsEnabled": {
+        "开启驻车": true,
+        "解除驻车": true,
+        "保存驻车电流": true
+      },
+      "readback": "读回：左 0 / 右 0 A · 输出上限 15 A",
+      "modeText": "驻车状态待确认",
+      "refreshDurationMs": 691,
+      "refreshOk": true,
+      "realMotorWritesSentByAgent": false,
+      "modeOperatedByAgent": false
+    },
+    "userCurrentSaveObserved": {
+      "completedAtUtc": "2026-11-04T05:11:07.905Z",
+      "ok": true,
+      "agentSubsequentReadbackRaw": [
+        500,
+        500
+      ],
+      "agentDidNotSubmitTheWrite": true,
+      "laterUserReadbackMayDiffer": true
+    }
+  },
+  "remoteCommandLatencyRepair": {
+    "observation": {
+      "hostname": "topeet",
+      "hostsRelevant": [],
+      "nssHosts": [
+        "hosts:          files mdns4_minimal [NOTFOUND=return] dns"
+      ],
+      "getentExit": 0,
+      "getentOutput": "fe80::2cdf:2f96:eb21:9e13 topeet",
+      "lookupMs": 15
+    },
+    "repair": {
+      "changed": true,
+      "backup": "/etc/hosts.bak.golfcar-parking-20261104T052150Z",
+      "beforeSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "afterSha256": "ad01d6538600ba7a96c8c5b18ce9ddf0092c58af3aa4087436d1bb30d6c061e4",
+      "localIpv4": "127.0.1.1",
+      "wifiOrRoutesChanged": false,
+      "motorParametersChanged": false
+    },
+    "before": [
+      {
+        "kind": "true",
+        "elapsedMs": 250,
+        "exit": 0,
+        "stdoutBytes": 0,
+        "stderrBytes": 0
+      },
+      {
+        "kind": "sudo -n true",
+        "elapsedMs": 10156,
+        "exit": 0,
+        "stdoutBytes": 0,
+        "stderrBytes": 0
+      },
+      {
+        "kind": "/usr/bin/python3 -B -c pass",
+        "elapsedMs": 63,
+        "exit": 0,
+        "stdoutBytes": 0,
+        "stderrBytes": 0
+      },
+      {
+        "kind": "sudo -n /usr/bin/python3 -B -c pass",
+        "elapsedMs": 5109,
+        "exit": 0,
+        "stdoutBytes": 0,
+        "stderrBytes": 0
+      },
+      {
+        "kind": "sudo -n /usr/bin/python3 -B /home/topeet/lianzhan/scripts/app_parking_bridge.py",
+        "elapsedMs": 188,
+        "exit": 0,
+        "stdoutBytes": 319,
+        "stderrBytes": 0
+      }
+    ],
+    "after": [
+      {
+        "attempt": 1,
+        "elapsedMs": 313,
+        "exitCode": 0
+      },
+      {
+        "attempt": 2,
+        "elapsedMs": 109,
+        "exitCode": 0
+      },
+      {
+        "attempt": 3,
+        "elapsedMs": 110,
+        "exitCode": 0
+      }
+    ],
+    "description": "The board had an empty /etc/hosts. Add only 127.0.1.1 topeet so sudo hostname lookup no longer depends on network DNS/mDNS; original file backed up."
+  },
+  "deploymentConstraints": {
+    "realModeSwitchTestByAgent": false,
+    "realMotorCurrentWriteByAgent": false,
+    "wifiIpOrRoutesChanged": false,
+    "localHostnameMappingChanged": true,
+    "followRuntimeChanged": false,
+    "otherMotorConfigurationChangedByAgent": false,
+    "oldVersionsBackedUp": true,
+    "physicalFreeStopReleaseEffectRequiresUserTest": true
+  }
+}

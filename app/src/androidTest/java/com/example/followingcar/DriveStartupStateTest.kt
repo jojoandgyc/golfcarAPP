@@ -34,6 +34,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
+import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -431,15 +432,91 @@ class DriveStartupStateTest {
         assertTrue(engine.snapshot().failures.isEmpty())
     }
 
+    @Test fun unifiedParkingSaveUsesOwnerNeutralThenReadAndWriteAndPreservesNewDraftEdits() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, allowMovement = true, unifiedParking = true)
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            fixture.vm.moveJoystick(0f, 1f)
+            fixture.vm.editParkingLeft("4.25")
+            fixture.vm.editParkingRight("8")
+            fixture.vm.saveParkingCurrents()
+            assertTrue(fixture.vm.parkingPage.value.busy)
+            fixture.vm.editParkingLeft("") // Clearing during the request is also a new draft.
+        }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy && it.leftCurrentAmps == 4.25 } }
+        withContext(Dispatchers.Main) {
+            val page = fixture.vm.parkingPage.value
+            assertNull(page.error)
+            assertEquals("", page.draftLeft)
+            assertEquals("8", page.draftRight)
+            assertEquals(8.0, page.rightCurrentAmps)
+            assertTrue(fixture.vm.state.value.driveEnabled)
+            assertTrue(fixture.vm.state.value.driveRecoveryNeedsRelease)
+            assertEquals(listOf(true), fixture.videoActions.toList())
+            fixture.vm.moveJoystick(0f, 1f)
+            assertEquals(0, fixture.vm.state.value.driveLeft)
+        }
+        val owner = fixture.bridge.requests.filter { it.getString("cmd") == "parking_settings" }
+        assertEquals(listOf("read", "currents"), owner.map { it.getString("op") })
+        val readIndex = fixture.bridge.requests.indexOf(owner.first())
+        assertEquals("stop", fixture.bridge.requests[readIndex - 1].getString("cmd"))
+        assertTrue(fixture.bridge.requests.all { it.getInt("left") == 0 && it.getInt("right") == 0 })
+        withContext(Dispatchers.Main) { fixture.vm.releaseJoystick(); fixture.vm.moveJoystick(0f, 1f) }
+        withTimeout(3_000) { while (fixture.bridge.requests.none { it.getString("cmd") == "drive" }) delay(10) }
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+    }
+
+    @Test fun unifiedModeAcceptsUnconfirmedPhysicalStopAndSoftFailureDoesNotExitDrive() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, unifiedParking = true,
+            transformAck = { request, ack ->
+                if (request.getLong("seq") >= 2 && request.getString("cmd") !in setOf("close", "estop")) {
+                    ack.put("stopped", false).put("feedbackLeftRpm", 2).put("feedbackRightRpm", -1).put("feedbackSamples", 0)
+                }
+                if (request.optString("op") == "mode") ack.getJSONObject("parkingResult")
+                    .put("ok", false).put("errorCode", "external_control_source")
+            })
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { fixture.vm.state.first { it.driveEnabled && !it.driveConfirmedStopped } }
+        withContext(Dispatchers.Main) { fixture.vm.requestParkingMode(true) }
+        withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy && it.error != null } }
+        assertTrue(fixture.vm.parkingPage.value.error!!.contains("通讯控制"))
+        assertTrue(fixture.vm.state.value.driveEnabled)
+        assertFalse(fixture.vm.state.value.driveConfirmedStopped)
+        assertNull(fixture.vm.state.value.driveFirstFailure)
+        assertEquals(listOf(true), fixture.videoActions.toList())
+    }
+
+    @Test fun unifiedReadDoesNotRestoreClearedDraftAndDisconnectedModeBecomesUnknown() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, unifiedParking = true)
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            fixture.vm.editParkingLeft("")
+            fixture.vm.requestParkingMode(false)
+        }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy && it.mode == false } }
+        withContext(Dispatchers.Main) { fixture.vm.refreshParking() }
+        withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy } }
+        assertEquals("", fixture.vm.parkingPage.value.draftLeft)
+        withContext(Dispatchers.Main) { fixture.vm.disableDrive("test") }
+        awaitFinished(fixture)
+        assertNull(fixture.vm.parkingPage.value.mode)
+        assertEquals("", fixture.vm.parkingPage.value.draftLeft)
+        assertEquals(listOf(true, false), fixture.videoActions.toList())
+    }
+
     private suspend fun startFixture(networkGrace: Boolean = false, blockWrite: Boolean = false,
         holdSequence: Long = 1, allowMovement: Boolean = false,
+        unifiedParking: Boolean = false,
         transformAck: (JSONObject, JSONObject) -> Unit = { _, _ -> }): Fixture {
         val vm = withContext(Dispatchers.Main) {
             val store = ViewModelStore().also(stores::add)
             ViewModelProvider(store, ViewModelProvider.AndroidViewModelFactory(application))[BoardViewModel::class.java]
         }
         withTimeout(3_000) { vm.state.first { !it.remoteProfileLoading } }
-        val bridge = DelayedInitialAckChannel(networkGrace, blockWrite, holdSequence, allowMovement, transformAck)
+        val bridge = DelayedInitialAckChannel(networkGrace, blockWrite, holdSequence, allowMovement, unifiedParking, transformAck)
         val videoActions = CopyOnWriteArrayList<Boolean>()
         val queued = ConcurrentLinkedQueue<ChannelExec>().apply {
             add(VideoReplyChannel(true, videoActions)); add(bridge); add(VideoReplyChannel(false, videoActions))
@@ -515,7 +592,8 @@ class DriveStartupStateTest {
 
     private class DelayedInitialAckChannel(private val networkGrace: Boolean,
         private val blockWrite: Boolean, private val holdSequence: Long,
-        private val allowMovement: Boolean, private val transformAck: (JSONObject, JSONObject) -> Unit) : ChannelExec() {
+        private val allowMovement: Boolean, private val unifiedParking: Boolean,
+        private val transformAck: (JSONObject, JSONObject) -> Unit) : ChannelExec() {
         private val replies = QueuedInput()
         private val buffer = ByteArrayOutputStream()
         private val released = AtomicBoolean()
@@ -523,6 +601,9 @@ class DriveStartupStateTest {
         private var expectedSequence = 1L
         private var token = tokenFor(1)
         private var parkingEnabled = false
+        private var parkingMode: Boolean? = null
+        private var leftCurrentRaw = 500
+        private var rightCurrentRaw = 500
         @Volatile private var connected = false
         @Volatile private var disconnected = false
         @Volatile private var pending: JSONObject? = null
@@ -540,6 +621,7 @@ class DriveStartupStateTest {
                 .put("dryRun", true).put("port", "synthetic-only").put("watchdogMs", 600).put("maxRpm", 60)
                 .withDriveSafetyFixture()
             if (networkGrace) ready.put("networkGraceMs", 5_000)
+            if (unifiedParking) ready.put("unifiedParkingSupported", true)
             replies.append(ready)
         }
         override fun getInputStream(): InputStream = replies
@@ -573,15 +655,38 @@ class DriveStartupStateTest {
         }
         private fun acknowledge(request: JSONObject) {
             when (request.getString("cmd")) {
-                "parking" -> parkingEnabled = request.getBoolean("parkingEnabled")
-                "close", "estop" -> parkingEnabled = false
+                "parking" -> { parkingEnabled = request.getBoolean("parkingEnabled"); parkingMode = if (parkingEnabled) true else null }
+                "close", "estop" -> { parkingEnabled = false; parkingMode = null }
+                "parking_settings" -> when (request.getString("op")) {
+                    "mode" -> { parkingEnabled = request.getBoolean("enabled"); parkingMode = parkingEnabled }
+                    "currents" -> { leftCurrentRaw = request.getInt("leftRaw"); rightCurrentRaw = request.getInt("rightRaw") }
+                }
             }
             token = tokenFor(request.getLong("seq") + 1)
             val ack = JSONObject().put("type", "ack").put("seq", request.getLong("seq"))
                 .put("token", token).put("left", request.getInt("left")).put("right", request.getInt("right"))
                 .withDriveSafetyFixture()
                 .put("parkingEnabled", parkingEnabled)
+                .put("parkingLeftCurrentAmps", leftCurrentRaw / 100.0)
+                .put("parkingRightCurrentAmps", rightCurrentRaw / 100.0)
             if (networkGrace) ack.put("recoveryRequired", false)
+            if (unifiedParking) ack.put("parkingMode", parkingMode ?: JSONObject.NULL)
+                .put("parkingModeSource", if (parkingMode == null) "unknown" else "manual_session")
+            if (request.getString("cmd") == "parking_settings") {
+                val op = request.getString("op")
+                val result = JSONObject().put("type", "parking").put("schemaVersion", 1)
+                    .put("requestId", request.getLong("seq").toString()).put("op", op).put("ok", true)
+                    .put("simulation", true).put("mode", parkingMode ?: JSONObject.NULL)
+                    .put("modeSource", if (parkingMode == null) "unknown" else "manual_session")
+                    .put("leftRaw", leftCurrentRaw).put("rightRaw", rightCurrentRaw).put("maxRaw", 6000)
+                    .put("leftRpm", 0).put("rightRpm", 0).put("leftError", 0).put("rightError", 0)
+                    .put("writeMayHaveOccurred", op != "read").put("errorCode", JSONObject.NULL)
+                    .put("results", JSONArray().apply { if (op == "currents") {
+                        for ((side, raw) in listOf("left" to leftCurrentRaw, "right" to rightCurrentRaw))
+                            put(JSONObject().put("side", side).put("status", "verified").put("requestedRaw", raw).put("actualRaw", raw))
+                    } })
+                ack.put("parkingResult", result)
+            }
             transformAck(request, ack)
             parkingEnabled = ack.getBoolean("parkingEnabled")
             replies.append(ack)

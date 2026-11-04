@@ -31,6 +31,7 @@ data class DriveReady(
     val safetyVersion: Int = 0,
     val parkingCurrentReadOnly: Boolean = false,
     val feedback: DriveFeedback? = null,
+    val unifiedParkingSupported: Boolean = false,
 )
 data class DriveAck(
     val left: Int, val right: Int, val stopped: Boolean,
@@ -43,6 +44,9 @@ data class DriveAck(
     val feedbackAgeAtReceiptMs: Long = Long.MAX_VALUE,
     val feedbackRecheck: Boolean = false,
     val standstillPending: Boolean = false,
+    val parkingResult: ParkingReply? = null,
+    val parkingMode: Boolean? = null,
+    val parkingModeSource: String? = null,
 )
 
 /**
@@ -130,6 +134,12 @@ class BoardDriveChannel private constructor(
         return transact("parking", 0, 0, settings)
     }
 
+    /** Uses the existing owner and request sequence; never opens a competing motor bridge. */
+    internal suspend fun parkingSettings(request: ParkingRequest): DriveAck {
+        check(ready.unifiedParkingSupported) { "开发板尚未支持统一驻车接口，请更新桥接程序" }
+        return transact("parking_settings", 0, 0, parkingRequest = request)
+    }
+
     /** Nonblocking for UI/lifecycle callers. EOF or the board watchdog stops the motors. */
     fun close(reason: String = "requested", invalidateTransport: Boolean = false) {
         if (!closed.compareAndSet(false, true)) return
@@ -148,6 +158,7 @@ class BoardDriveChannel private constructor(
 
     private suspend fun transact(
         command: String, left: Int, right: Int, parking: ParkingSettings? = null,
+        parkingRequest: ParkingRequest? = null,
     ): DriveAck =
         withContext(Dispatchers.IO) {
             check(ready.safetyVersion == REQUIRED_DRIVE_SAFETY_VERSION && ready.parkingCurrentReadOnly) {
@@ -157,14 +168,19 @@ class BoardDriveChannel private constructor(
             transaction.begin(terminal = command == "estop" || command == "close")
             val started = System.nanoTime()
             val transition = command != currentCommand
-            val important = parking != null || command == "estop" || command == "close" || transition
+            val important = parking != null || parkingRequest != null || command == "estop" || command == "close" || transition
             val report = important || elapsedMillis(summaryAt) >= 1_000L
             currentCommand = command
             phase = "check_open"
+            var parkingReplyBeforeFailure: ParkingReply? = null
             try {
                 check(isOpen) { "摇杆控制通道已关闭，请重新启用" }
                 val closing = command == "estop" || command == "close"
-                withTimeout(if (parking != null || closing) PARKING_ACK_TIMEOUT_MS else driveAckTimeoutMillis(ready.networkGraceMs)) {
+                withTimeout(when {
+                    parkingRequest != null -> UNIFIED_PARKING_ACK_TIMEOUT_MS
+                    parking != null || closing -> PARKING_ACK_TIMEOUT_MS
+                    else -> driveAckTimeoutMillis(ready.networkGraceMs)
+                }) {
                     sequence += 1
                     val sentSequence = sequence
                     val previousToken = token
@@ -173,6 +189,7 @@ class BoardDriveChannel private constructor(
                     if (parking != null) {
                         request.put("parkingEnabled", parking.enabled)
                     }
+                    parkingRequest?.addTo(request)
                     phase = "write"
                     val sendingNanos = System.nanoTime()
                     sendGapMs = if (lastSendNanos == 0L) null else
@@ -203,6 +220,10 @@ class BoardDriveChannel private constructor(
                         rawRight.toDouble() == rawRight.toInt().toDouble(), "开发板速度或停车回执格式无效")
                     val actualLeft = (rawLeft as Number).toInt()
                     val actualRight = (rawRight as Number).toInt()
+                    val parkingResult = if (parkingRequest != null) {
+                        parseParkingReply(reply.getJSONObject("parkingResult"), sentSequence.toString(), parkingRequest, ready.dryRun)
+                    } else null
+                    parkingReplyBeforeFailure = parkingResult
                     val measured = readFeedback(reply, ready.dryRun, actualLeft, actualRight)
                     val stopped = measured.stopped
                     requireMessage(!(closing || parking != null) || stopped,
@@ -228,18 +249,53 @@ class BoardDriveChannel private constructor(
                     val standstillPending = rawStandstillPending == true
                     requireMessage(!standstillPending || feedbackRecheck && recoveryRequired && measured.targetStopped,
                         "停车等待时必须保持零目标与输入恢复锁")
-                    val interlock = readInterlock(reply, command, left, right, actualLeft, actualRight,
-                        measured.targetStopped, recoveryRequired)
+                    val refusedMovingRead = parkingRequest?.op == "read" && parkingResult?.ok == false &&
+                        parkingResult.errorCode == "motion_targets_active" && !parkingResult.writeMayHaveOccurred
+                    requireMessage(parkingRequest == null || ready.unifiedParkingSupported &&
+                        (measured.targetStopped || refusedMovingRead), "统一驻车操作必须保持零转速目标")
+                    val interlock = readInterlock(reply, command,
+                        if (refusedMovingRead) actualLeft else left, if (refusedMovingRead) actualRight else right,
+                        actualLeft, actualRight, measured.targetStopped, recoveryRequired)
                     val actualParking = if (ready.parkingSupported) readParking(reply) else null
+                    val modeSource = if (ready.unifiedParkingSupported) reply.opt("parkingModeSource") else null
+                    val rawMode = if (ready.unifiedParkingSupported) reply.opt("parkingMode") else null
+                    if (ready.unifiedParkingSupported) {
+                        requireMessage(reply.has("parkingMode") && (rawMode == JSONObject.NULL || rawMode is Boolean) &&
+                            modeSource in setOf("unknown", "manual_session"), "开发板驻车模式来源字段无效")
+                        requireMessage((rawMode == JSONObject.NULL) == (modeSource == "unknown"), "开发板驻车模式来源不一致")
+                        requireMessage(rawMode !is Boolean || rawMode == actualParking?.enabled,
+                            "开发板驻车模式记录不一致")
+                        requireMessage(parkingResult == null || !parkingResult.ok || parkingResult.mode == rawMode as? Boolean,
+                            "驻车操作结果与模式记录不一致")
+                    }
                     if (ready.parkingSupported) {
                         val expectedParking = if (closing) confirmedParking?.copy(enabled = false)
                             else parking ?: confirmedParking
-                        requireMessage(!standstillPending || actualParking?.enabled == false,
+                        requireMessage(ready.unifiedParkingSupported || !standstillPending || actualParking?.enabled == false,
                             "停车等待时电子驻车必须保持关闭")
                         val safeParkingRelease = standstillPending &&
                             actualParking == expectedParking?.copy(enabled = false)
-                        requireMessage(actualParking == expectedParking || safeParkingRelease,
-                            "开发板驻车回执与设置不一致")
+                        if (parkingResult != null) {
+                            requireMessage(actualParking != null && expectedParking != null &&
+                                actualParking.maxCurrentAmps == expectedParking.maxCurrentAmps,
+                                "驻车操作不能更改最大输出电流")
+                            val actual = requireNotNull(actualParking)
+                            val previous = requireNotNull(expectedParking)
+                            requireMessage(parkingResult.leftRaw == null || parkingResult.leftRaw / 100.0 == actual.leftCurrentAmps,
+                                "左驻车电流回读不一致")
+                            requireMessage(parkingResult.rightRaw == null || parkingResult.rightRaw / 100.0 == actual.rightCurrentAmps,
+                                "右驻车电流回读不一致")
+                            requireMessage(parkingResult.maxRaw == null || parkingResult.maxRaw / 100.0 == actual.maxCurrentAmps,
+                                "最大输出电流回读不一致")
+                            requireMessage(parkingResult.mode == null || parkingResult.mode == actual.enabled,
+                                "驻车模式回读不一致")
+                            requireMessage(parkingRequest?.op == "currents" ||
+                                actual.copy(enabled = previous.enabled) == previous,
+                                "模式和读取操作不能修改驻车电流")
+                            requireMessage(parkingRequest?.op != "read" || actual == previous || safeParkingRelease,
+                                "读取操作不能修改驻车模式")
+                        } else requireMessage(actualParking == expectedParking || safeParkingRelease,
+                                "开发板驻车回执与设置不一致")
                     }
                     token = nextToken
                     confirmedParking = actualParking
@@ -297,7 +353,7 @@ class BoardDriveChannel private constructor(
                     phase = "idle"
                     DriveAck(actualLeft, actualRight, stopped, actualParking, interlock, recoveryRequired,
                         measured.targetStopped, measured.feedback, lastAckNanos, measured.feedback.ageMs + rtt,
-                        feedbackRecheck, standstillPending)
+                        feedbackRecheck, standstillPending, parkingResult, rawMode as? Boolean, modeSource as? String)
                 }
             } catch (timeout: TimeoutCancellationException) {
                 transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }
@@ -321,6 +377,9 @@ class BoardDriveChannel private constructor(
                             "originalExceptionClass" to failure.javaClass.name))
                 }
                 close(if (failure is CancellationException) "transaction_cancelled" else "transaction_failed")
+                val result = parkingReplyBeforeFailure
+                if (result != null && !result.ok && failure !is CancellationException)
+                    throw ParkingResultException(result, safeFailure)
                 throw safeFailure
             } finally {
                 transaction.finish()
@@ -413,7 +472,8 @@ class BoardDriveChannel private constructor(
         "channelEof" to channel.isEOF, "blockingIo" to blockingIo.get(),
         "transactionPending" to hasPendingTransaction,
         "activeStopSource" to transaction.requestedStopSource(),
-        "ackTimeoutMs" to if (::ready.isInitialized) driveAckTimeoutMillis(ready.networkGraceMs) else null,
+        "ackTimeoutMs" to if (currentCommand == "parking_settings") UNIFIED_PARKING_ACK_TIMEOUT_MS
+            else if (::ready.isInitialized) driveAckTimeoutMillis(ready.networkGraceMs) else null,
     )
 
     private fun requireMessage(condition: Boolean, message: String) {
@@ -427,7 +487,8 @@ class BoardDriveChannel private constructor(
 
     private fun readParking(message: JSONObject): ParkingSettings {
         return readSafety { validatedParkingSettings(listOf("parkingEnabled", "parkingLeftCurrentAmps",
-            "parkingRightCurrentAmps", "parkingMaxCurrentAmps").associateWith(message::opt)) }
+            "parkingRightCurrentAmps", "parkingMaxCurrentAmps").associateWith(message::opt),
+            commandModeOnly = ::ready.isInitialized && ready.unifiedParkingSupported) }
     }
 
     private fun readFeedback(message: JSONObject, dryRun: Boolean, left: Int, right: Int): ValidatedDriveFeedback =
@@ -474,6 +535,7 @@ class BoardDriveChannel private constructor(
     internal companion object {
         // Parking mode changes and terminal cleanup wait for measured zero-speed feedback.
         private const val PARKING_ACK_TIMEOUT_MS = 2_500L
+        private const val UNIFIED_PARKING_ACK_TIMEOUT_MS = 4_000L
         private const val START_TIMEOUT_MS = 5_000L
         private const val MAX_LINE_BYTES = 4096
         private val cleanup = Executors.newCachedThreadPool { runnable ->
@@ -525,6 +587,9 @@ class BoardDriveChannel private constructor(
                         val rawInfraredSupported = reply.opt("infraredSupported")
                         control.requireMessage(!reply.has("infraredSupported") || rawInfraredSupported is Boolean,
                             "开发板红外保护能力字段无效")
+                        val rawUnifiedParking = reply.opt("unifiedParkingSupported")
+                        control.requireMessage(!reply.has("unifiedParkingSupported") || rawUnifiedParking is Boolean,
+                            "开发板统一驻车能力字段无效")
                         val rawRunId = reply.opt("runId")
                         val rawGrace = reply.opt("networkGraceMs")
                         control.requireMessage(!reply.has("networkGraceMs") ||
@@ -541,6 +606,7 @@ class BoardDriveChannel private constructor(
                             networkGraceMs = (rawGrace as? Number)?.toInt(),
                             safetyVersion = REQUIRED_DRIVE_SAFETY_VERSION, parkingCurrentReadOnly = true,
                             feedback = initialFeedback.feedback,
+                            unifiedParkingSupported = rawUnifiedParking == true,
                         )
                         control.requireMessage(ready.dryRun == dryRun, "开发板控制模式不匹配")
                         control.requireMessage(ready.maxRpm in 1..100 && ready.watchdogMs == 600, "开发板限速或超时参数不匹配")
