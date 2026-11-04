@@ -1,19 +1,99 @@
 {
   "recordedAtUtc": "2026-11-03T16:06:41.884266+00:00",
   "sourceBaseCommit": "bc9091b6749f406e74c4ff74e5c8956e7de44b88",
-  "status": "validated_pending_paired_deployment",
+  "status": "deployed_and_verified",
   "app": {
     "versionCode": 24,
     "versionName": "1.8.13-standstill-wait",
     "apkSha256": "bc5a0aee65685062e39393971cbe807e6298ff3258ec128ee4815ddc620e201b",
-    "phoneInstalledThisRevision": false
+    "phoneInstalledThisRevision": true,
+    "phoneInstallation": {
+      "installedAtUtc": "2026-11-04T04:20:26.040628+00:00",
+      "versionCode": 24,
+      "versionName": "1.8.13-standstill-wait",
+      "apkSha256": "bc5a0aee65685062e39393971cbe807e6298ff3258ec128ee4815ddc620e201b",
+      "installedApkSha256": "bc5a0aee65685062e39393971cbe807e6298ff3258ec128ee4815ddc620e201b",
+      "alreadyInstalled": false,
+      "previousVersionCode": 23,
+      "previousApkSha256": "2335b547f799b51b45e4c4c2cd2aba702b1a1427de74409893ab0a85a1e0cd98",
+      "backup": "E:\\Temp\\golfcar-standstill-wait-2026-11-03\\phone-before-v23-20261104T042023Z-cfc254f0.apk",
+      "connectionPreferencesPreserved": true,
+      "controlLease": {
+        "event": "locked",
+        "controlIdle": true,
+        "serialIdle": true,
+        "bothControlLocksHeld": true,
+        "guardSha256": "7e537b8147e73246fcad974c2c84bec9b485692296fa6c7c6640e51d695abf6e",
+        "leaseSeconds": 60
+      },
+      "realMotorWritesSent": false,
+      "controlLeaseRelease": {
+        "event": "unlocked",
+        "reason": "released"
+      }
+    }
   },
   "board": {
     "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
     "sha256": "fef016e2d71911b639f4776451ddfb66a38c8063a9d719845282595046d987b8",
     "safetyVersion": 2,
-    "deployedThisRevision": false,
-    "lastVerifiedDeployedSha256": "e3da7324aac2ede6c0938e91891136ae1f21d1c4f4735342a283393e679617e9"
+    "deployedThisRevision": true,
+    "lastVerifiedDeployedSha256": "e3da7324aac2ede6c0938e91891136ae1f21d1c4f4735342a283393e679617e9",
+    "deployment": {
+      "alreadyDeployed": false,
+      "oldSha256": "e3da7324aac2ede6c0938e91891136ae1f21d1c4f4735342a283393e679617e9",
+      "newSha256": "fef016e2d71911b639f4776451ddfb66a38c8063a9d719845282595046d987b8",
+      "backup": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py.bak.standstill-wait-20261104T042046Z",
+      "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+      "controlIdle": true,
+      "serialIdle": true,
+      "hardwareCommandsSent": false,
+      "guardSha256": "7e537b8147e73246fcad974c2c84bec9b485692296fa6c7c6640e51d695abf6e",
+      "bothControlLocksHeld": true
+    },
+    "postDeploymentVerification": {
+      "checkedAtUtc": "2026-11-04T04:23:49.617880+00:00",
+      "allExpectedHashesMatch": true,
+      "originalBridgeBackupVerified": true,
+      "ownerAndModePreserved": true,
+      "files": [
+        {
+          "path": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+          "sha256": "fef016e2d71911b639f4776451ddfb66a38c8063a9d719845282595046d987b8",
+          "uid": 1000,
+          "gid": 1000,
+          "mode": "0o755"
+        },
+        {
+          "path": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py.bak.standstill-wait-20261104T042046Z",
+          "sha256": "e3da7324aac2ede6c0938e91891136ae1f21d1c4f4735342a283393e679617e9",
+          "uid": 1000,
+          "gid": 1000,
+          "mode": "0o755"
+        },
+        {
+          "path": "/home/topeet/lianzhan/scripts/app_control_guard.py",
+          "sha256": "7e537b8147e73246fcad974c2c84bec9b485692296fa6c7c6640e51d695abf6e",
+          "uid": 1000,
+          "gid": 1000,
+          "mode": "0o755"
+        },
+        {
+          "path": "/home/topeet/lianzhan/scripts/app_motor_config_bridge.py",
+          "sha256": "1a32fb8c71a78128c3e78ee093ca12f2c61032e6f728f4d9ae45e6880a0717bf",
+          "uid": 1000,
+          "gid": 1000,
+          "mode": "0o755"
+        },
+        {
+          "path": "/home/topeet/lianzhan/scripts/motor_register_catalog.py",
+          "sha256": "94366d11759ec1a5ac4e350a90bbeb34c061841297dbd52c0322a70a8e49070b",
+          "uid": 1000,
+          "gid": 1000,
+          "mode": "0o755"
+        }
+      ]
+    }
   },
   "incident": {
     "runId": "664c7632636388e4beaa9fb9e41f3e33",
@@ -87,18 +167,39 @@
     },
     "emulatorUniqueCases": 79,
     "realHardwareDriveOrParkingTestsPerformed": false,
-    "stagedBoardSshProbe": {
+    "previousStagedProbeAttempt": {
       "completed": false,
       "reason": "LAN SSH connection timed out before staging or running any code"
+    },
+    "emulatorDeployedBridgeSsh": {
+      "tests": 3,
+      "passed": 3,
+      "realBoardSsh": true,
+      "allControlSessionsDryRun": true,
+      "realSerialOpened": false,
+      "realMotorCommandsSent": false
+    },
+    "phoneConnectionVerification": {
+      "checkedAtUtc": "2026-11-04T04:23:48.406280+00:00",
+      "phoneSshConnected": true,
+      "connectionRoute": "LAN",
+      "appLaunchedByAgent": true,
+      "drivingEnabledByAgent": false,
+      "parkingSwitchOperatedByAgent": false
     }
   },
   "deployment": {
-    "deferredByUser": true,
+    "deferredByUser": false,
     "pairingRequired": "Install compatible App 1.8.13 first; then back up and replace the board bridge while controls and serial ports are idle. Verify hashes and run SSH dry-run after deployment.",
     "reasonForPairing": "App 1.8.12 rejects automatic parking release in a normal ACK; the new pending response needs the compatible App parser.",
-    "phoneInstalled": false,
-    "liveBoardFileReplaced": false,
+    "phoneInstalled": true,
+    "liveBoardFileReplaced": true,
     "motorConfigurationWritten": false,
-    "networkOrFollowRuntimeChanged": false
-  }
+    "networkOrFollowRuntimeChanged": false,
+    "initiallyDeferredByUser": true,
+    "backupVerified": true,
+    "ownerAndModePreserved": true
+  },
+  "updatedAtUtc": "2026-11-04T04:24:22.210346+00:00",
+  "releaseSourceCommit": "3bac266e5598408961dedb58b0ae798855d5efc2"
 }
