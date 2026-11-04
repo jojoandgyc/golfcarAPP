@@ -1,4 +1,8 @@
-"""Parking/standstill regression tests: fake serial and virtual time only, never hardware."""
+"""Stop-policy/standstill tests: fake serial and virtual time only, never hardware.
+
+Direct set_parking calls select a historical private stop-policy fixture. They do
+not represent a supported parking switch command or the current-based UI.
+"""
 from contextlib import ExitStack, redirect_stderr
 from io import StringIO
 import copy
@@ -63,7 +67,7 @@ class ParkingFeedbackTests(unittest.TestCase):
         self.assertTrue(self.motors.stopped_confirmed)
         self.assert_no_parameter_writes()
 
-    def test_both_parking_transitions_issue_stop_mode_and_preserve_all_currents(self):
+    def test_internal_stop_policy_transitions_preserve_all_currents(self):
         self.initialize()
         self.motors.set_parking(True)
         self.assertIn(("left", "stop", 0), self.client.calls)
@@ -627,14 +631,14 @@ class ParkingFeedbackTests(unittest.TestCase):
         self.assert_emergency_attempted()
         self.assert_no_parameter_writes()
 
-    def test_terminal_and_parking_ack_reuse_completed_confirmation_without_a_third_read(self):
-        for command, enabled in (("close", False), ("estop", False), ("parking", True), ("parking", False)):
-            with self.subTest(command=command, enabled=enabled):
+    def test_terminal_ack_reuses_completed_confirmation_without_a_third_read(self):
+        for command in ("close", "estop"):
+            with self.subTest(command=command):
                 client = FakeClient()
                 motors = bridge.Motors(client)
                 session = bridge.ProtocolSession(motors, port="fake", dry_run=False)
                 session.ready()
-                method = "set_parking" if command == "parking" else "shutdown"
+                method = "shutdown"
                 original = getattr(motors, method)
                 reads_when_confirmed = []
 
@@ -648,8 +652,6 @@ class ParkingFeedbackTests(unittest.TestCase):
 
                 request = {"seq": session.next_seq, "token": session.token,
                            "cmd": command, "left": 0, "right": 0}
-                if command == "parking":
-                    request["parkingEnabled"] = enabled
                 with patch.object(motors, method, side_effect=confirmed):
                     ack, closing = session.accept(request)
                 self.assertTrue(ack["stopped"])
@@ -660,14 +662,14 @@ class ParkingFeedbackTests(unittest.TestCase):
                 self.assertEqual(len(client.feedback_samples), 1)
                 self.assertFalse(any(call[0] == "write" for call in client.calls))
 
-    def test_terminal_and_parking_cannot_ack_when_completed_confirmation_is_stale(self):
-        for command in ("close", "estop", "parking"):
+    def test_terminal_cannot_ack_when_completed_confirmation_is_stale(self):
+        for command in ("close", "estop"):
             with self.subTest(command=command):
                 client = FakeClient()
                 motors = bridge.Motors(client)
                 session = bridge.ProtocolSession(motors, port="fake", dry_run=False)
                 session.ready()
-                method = "set_parking" if command == "parking" else "shutdown"
+                method = "shutdown"
                 original = getattr(motors, method)
 
                 def stale(*args, **kwargs):
@@ -676,8 +678,6 @@ class ParkingFeedbackTests(unittest.TestCase):
 
                 seq, token = session.next_seq, session.token
                 request = {"seq": seq, "token": token, "cmd": command, "left": 0, "right": 0}
-                if command == "parking":
-                    request["parkingEnabled"] = True
                 with patch.object(motors, method, side_effect=stale):
                     with self.assertRaisesRegex(bridge.SessionError, "standstill confirmation"):
                         session.accept(request)

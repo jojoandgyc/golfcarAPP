@@ -7,19 +7,18 @@ import org.json.JSONTokener
 
 internal const val BOARD_PARKING_COMMAND =
     "sudo -n /usr/bin/python3 -B /home/topeet/lianzhan/scripts/app_parking_bridge.py --request"
+internal const val PARKING_CURRENT_SEMANTICS = "current_zero_disables"
 
-internal data class ParkingRequest(val op: String, val enabled: Boolean? = null,
+internal data class ParkingRequest(val op: String,
     val leftRaw: Int? = null, val rightRaw: Int? = null) {
     init {
-        require(op in setOf("read", "mode", "currents"))
-        require((op == "mode") == (enabled != null))
+        require(op in setOf("read", "currents"))
         require((op == "currents") == (leftRaw != null && rightRaw != null))
         require(op == "currents" || leftRaw == null && rightRaw == null)
         require(leftRaw == null || leftRaw in 0..6000)
         require(rightRaw == null || rightRaw in 0..6000)
     }
     fun addTo(json: JSONObject): JSONObject = json.put("op", op).apply {
-        enabled?.let { put("enabled", it) }
         leftRaw?.let { put("leftRaw", it) }
         rightRaw?.let { put("rightRaw", it) }
     }
@@ -45,9 +44,17 @@ internal fun parkingDraftRaw(text: String): Int? = runCatching {
 
 internal fun parkingRawText(raw: Int): String = BigDecimal(raw).movePointLeft(2).stripTrailingZeros().toPlainString()
 
+/** Mixed sides are deliberately neither fully enabled nor fully disabled. */
+internal fun parkingCurrentMode(left: Int?, right: Int?): Boolean? = when {
+    left == null || right == null -> null
+    left == 0 && right == 0 -> false
+    left > 0 && right > 0 -> true
+    else -> null
+}
+
 internal fun parkingRequestBytes(requestId: String, request: ParkingRequest): ByteArray {
     require(requestId.matches(Regex("[A-Za-z0-9-]{1,80}")))
-    return (request.addTo(JSONObject().put("schemaVersion", 1).put("requestId", requestId)).toString() + "\n")
+    return (request.addTo(JSONObject().put("schemaVersion", 2).put("requestId", requestId)).toString() + "\n")
         .toByteArray(Charsets.UTF_8)
 }
 
@@ -84,7 +91,8 @@ internal fun parseParkingReply(json: JSONObject, requestId: String, request: Par
         return json.get(name).takeUnless { it == JSONObject.NULL }?.let { integer(it, min, max) }
     }
     fun bool(name: String) = (json.get(name) as? Boolean) ?: throw IOException("驻车布尔字段无效")
-    require(json.opt("type") == "parking" && integer(json.opt("schemaVersion"), 1, 1) == 1)
+    require(json.opt("type") == "parking" && integer(json.opt("schemaVersion"), 2, 2) == 2 &&
+        json.opt("parkingSemantics") == PARKING_CURRENT_SEMANTICS) { "请更新开发板驻车电流协议" }
     require(json.opt("requestId") == requestId && json.opt("op") == request.op) { "驻车响应与请求不匹配" }
     val ok = bool("ok")
     require(bool("simulation") == simulation) { "驻车模拟模式不匹配" }
@@ -93,11 +101,14 @@ internal fun parseParkingReply(json: JSONObject, requestId: String, request: Par
     require(modeValue == JSONObject.NULL || modeValue is Boolean)
     val mode = modeValue as? Boolean
     val source = json.get("modeSource")
-    require(source in setOf("unknown", "command_ack", "manual_session"))
-    require((mode == null) == (source == "unknown")) { "驻车模式来源不一致" }
+    require(source in setOf("unknown", "current_readback"))
     val left = optionalInt("leftRaw", 0, 6000)
     val right = optionalInt("rightRaw", 0, 6000)
     val maximum = optionalInt("maxRaw", 0, 6000)
+    require(source == if (left != null && right != null) "current_readback" else "unknown") {
+        "驻车电流状态来源不一致"
+    }
+    require(mode == parkingCurrentMode(left, right)) { "驻车状态与左右电流不一致" }
     val leftRpm = optionalInt("leftRpm", Int.MIN_VALUE, Int.MAX_VALUE)
     val rightRpm = optionalInt("rightRpm", Int.MIN_VALUE, Int.MAX_VALUE)
     val leftError = optionalInt("leftError", 0, 65535)
@@ -125,7 +136,6 @@ internal fun parseParkingReply(json: JSONObject, requestId: String, request: Par
         ParkingWriteResult(side as String, status as String, wanted, actual)
     }
     require(results.map { it.side }.distinct().size == results.size)
-    if (ok && request.op == "mode") require(mode == request.enabled)
     if (ok && request.op == "currents") require(results.size == 2 && results.all { it.status == "verified" } &&
         left == request.leftRaw && right == request.rightRaw)
     return ParkingReply(ok, mode, source as String, left, right, maximum, leftRpm, rightRpm,

@@ -102,7 +102,7 @@ class AppInfraredTests(unittest.TestCase):
                 "infraredBlocked": True, "infraredDirections": ["forward", "right"]})
 
     def test_non_drive_acks_never_present_old_ir_latch_as_an_override(self):
-        for command in ("stop", "estop", "close", "parking"):
+        for command in ("stop", "estop", "close"):
             with self.subTest(command=command):
                 motors, _client = self.motors()
                 session = bridge.ProtocolSession(motors, port="fake", dry_run=True)
@@ -110,12 +110,25 @@ class AppInfraredTests(unittest.TestCase):
                 self.write(3, 0)
                 session.accept(self.request(session, 50, -50))
                 request = self.request(session, 0, 0, command)
-                if command == "parking":
-                    motors.await_standstill()
-                    request.update(parkingEnabled=True)
                 ack, _ = session.accept(request)
                 self.assertFalse(ack["infraredBlocked"])
                 self.assertEqual(ack["infraredDirections"], [])
+
+    def test_retired_parking_command_does_not_write_or_release_infrared_latch(self):
+        motors, client = self.motors()
+        session = bridge.ProtocolSession(motors, port="fake", dry_run=True)
+        session.ready()
+        self.write(3, 0)
+        session.accept(self.request(session, 50, -50))
+        latch = set(motors.ir_latched_directions)
+        client.calls.clear(); client.feedback_reads.clear()
+        request = self.request(session, 0, 0, "parking")
+        request.update(parkingEnabled=True)
+        with self.assertRaisesRegex(bridge.SessionError, "Legacy parking mode is unsupported"):
+            session.accept(request)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(client.feedback_reads, [])
+        self.assertEqual(motors.ir_latched_directions, latch)
 
     def test_slow_ir_poll_cannot_renew_lease_from_buffered_input(self):
         pump = self.make_pump(self.motors()[0])
@@ -314,7 +327,8 @@ class AppInfraredTests(unittest.TestCase):
         self.assertEqual(client.calls, self.emergency_calls())
         self.assertTrue(motors.parking_enabled)
 
-    def test_parking_mode_changes_preserve_ir_latch_and_current_configuration(self):
+    def test_internal_stop_policy_changes_preserve_ir_latch_and_current_configuration(self):
+        # Direct private setup for IR protection, never a wire-level parking switch.
         for parking_already_enabled in (False, True):
             with self.subTest(parking_already_enabled=parking_already_enabled):
                 motors, client = self.motors()

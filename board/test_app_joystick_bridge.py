@@ -92,8 +92,27 @@ class FakeClient:
 
 
 def parking_request(session, enabled=True, **extra):
+    """Retired wire format, retained only for rejection regressions."""
     return {"seq": session.next_seq, "token": session.token, "cmd": "parking",
             "left": 0, "right": 0, "parkingEnabled": enabled, **extra}
+
+
+class ParkingReadFakeClient(FakeClient):
+    """Extra read-only registers for testing owner reads during network recovery."""
+    def read_holding_registers(self, address, count):
+        if (address, count) == (0, 3): return [0x30EA, 256, 6000]
+        names = {0x58: "max_output_current", 0x76: "left_parking_current", 0x6D: "right_parking_current"}
+        if address in names and count == 1: return [round(self.registers[names[address]] * 100)]
+        if (address, count) == (0x1C, 5): return [24, 1, 0x38, 0, 0]
+        if (address, count) in ((8, 6), (0x12, 6)):
+            rpm = self.feedback[1 if address == 8 else 0]
+            error = self.feedback[3 if address == 8 else 2]
+            return [100, (rpm >> 16) & 65535, rpm & 65535, error, 100, 25]
+        return super().read_holding_registers(address, count)
+
+
+def current_read_fields():
+    return dict(schemaVersion=2, parkingSemantics="current_zero_disables", op="read")
 
 
 class BridgeTests(unittest.TestCase):
@@ -140,7 +159,8 @@ class BridgeTests(unittest.TestCase):
             with self.subTest(neutral=neutral):
                 client, session, _ = self.hardware_session()
                 motors = session.motors
-                session.accept(parking_request(session))
+                # Historical stop-policy fixture, never a wire-level parking switch.
+                motors.set_parking(True)
                 motors.drive(30, -30)
                 motors.ir_latched_directions.add("forward")
                 client.calls.clear()
@@ -192,27 +212,25 @@ class BridgeTests(unittest.TestCase):
                 self.assertTrue(session.recovery_required)
                 self.assertEqual(session.next_seq, 1)
 
-    def test_parking_engages_normal_stop_and_neutral_keeps_saved_configuration(self):
+    def test_internal_normal_stop_policy_and_neutral_preserve_saved_configuration(self):
         client, session, _ = self.hardware_session()
         client.calls.clear()
-        ack, closing = session.accept(parking_request(session))
-        self.assertTrue(ack["parkingEnabled"])
-        self.assertFalse(closing)
+        session.motors.set_parking(True)  # Private historical stop-policy fixture only.
         self.assertIn(("left", "stop", 0), client.calls)
         self.assertIn(("right", "stop", 0), client.calls)
-        session.accept({"seq": 2, "token": ack["token"], "cmd": "drive", "left": 30, "right": -30})
-        ack, _ = session.accept({"seq": 3, "token": session.token, "cmd": "stop", "left": 0, "right": 0})
+        session.accept({"seq": session.next_seq, "token": session.token, "cmd": "drive", "left": 30, "right": -30})
+        ack, _ = session.accept({"seq": session.next_seq, "token": session.token, "cmd": "stop", "left": 0, "right": 0})
         self.assertTrue(ack["parkingEnabled"])
         self.assertTrue(ack["targetStopped"])
         self.assert_no_configuration_writes(client)
 
-    def test_parking_off_reissues_emergency_instead_of_only_changing_a_cache(self):
+    def test_internal_emergency_policy_reissues_stop_without_changing_currents(self):
         client, session, _ = self.hardware_session()
-        session.accept(parking_request(session))
+        session.motors.set_parking(True)  # Private historical stop-policy fixture only.
         client.calls.clear()
-        ack, _ = session.accept(parking_request(session, enabled=False))
-        self.assertFalse(ack["parkingEnabled"])
-        self.assertTrue(ack["stopped"])
+        session.motors.set_parking(False)
+        self.assertFalse(session.motors.parking_enabled)
+        self.assertTrue(session.motors.stopped_confirmed)
         self.assertIn(("left", "stop", 1), client.calls)
         self.assertIn(("right", "stop", 1), client.calls)
         self.assert_no_configuration_writes(client)
@@ -226,6 +244,19 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(SessionError, "zero"):
             session.accept(parking_request(session, left=1))
         self.assertEqual(client.calls, [])
+
+    def test_legacy_switch_is_rejected_before_all_io_without_advancing_session(self):
+        client, session, _ = self.hardware_session()
+        for enabled in (True, False):
+            client.calls.clear(); client.feedback_reads.clear()
+            seq, token = session.next_seq, session.token
+            original = dict(client.registers)
+            with self.subTest(enabled=enabled), self.assertRaisesRegex(SessionError, "Legacy parking mode is unsupported"):
+                session.accept(parking_request(session, enabled))
+            self.assertEqual(client.calls, [])
+            self.assertEqual(client.feedback_reads, [])
+            self.assertEqual(client.registers, original)
+            self.assertEqual((session.next_seq, session.token), (seq, token))
         session.motors.drive(10, -10)
         client.calls.clear()
         with self.assertRaises(SessionError):
@@ -246,12 +277,12 @@ class BridgeTests(unittest.TestCase):
             strict_message(b'{"seq":1,"token":"x","cmd":"parking","left":0,"right":0,'
                            b'"parkingEnabled":true,"parkingEnabled":false}')
 
-    def test_parking_stop_write_failure_attempts_both_sides_without_success_ack(self):
+    def test_internal_normal_stop_failure_attempts_both_sides_without_success(self):
         client, session, _ = self.hardware_session()
         client.calls.clear()
         client.fail_left = True
         with self.assertRaises(SessionError):
-            session.accept(parking_request(session))
+            session.motors.set_parking(True)  # Test the stop primitive, not a supported wire command.
         self.assertIn(("right", "stop", 0), client.calls)
         self.assertIn(("right", "stop", 1), client.calls)
         self.assertFalse(session.motors.stopped_confirmed)
@@ -262,7 +293,7 @@ class BridgeTests(unittest.TestCase):
         for command in ("estop", "close"):
             with self.subTest(command=command):
                 client, session, _ = self.hardware_session()
-                session.accept(parking_request(session))
+                session.motors.set_parking(True)  # Private historical stop-policy fixture only.
                 client.calls.clear()
                 ack, closing = session.accept({"seq": session.next_seq, "token": session.token,
                                                "cmd": command, "left": 0, "right": 0})
@@ -304,7 +335,7 @@ class BridgeTests(unittest.TestCase):
         self.assertIn(("right", "stop", 1), client.calls)
         self.assert_no_configuration_writes(client)
 
-    def test_feedback_failure_during_parking_never_acks_and_cleanup_preserves_settings(self):
+    def test_feedback_failure_during_neutral_never_acks_and_cleanup_preserves_settings(self):
         client, messages = FakeClient(), []
         class Output:
             def __init__(self, _fd): pass
@@ -313,8 +344,8 @@ class BridgeTests(unittest.TestCase):
             def __init__(self, _fd): pass
             def line(self, _deadline, _stopped):
                 client.feedback_failure = TimeoutError("feedback unavailable")
-                return json.dumps({"seq": 1, "token": messages[0]["token"], "cmd": "parking",
-                                   "left": 0, "right": 0, "parkingEnabled": True}).encode()
+                return json.dumps({"seq": 1, "token": messages[0]["token"], "cmd": "stop",
+                                   "left": 0, "right": 0}).encode()
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input):
             self.assertEqual(bridge.run_session(Motors(client), "fake", False, threading.Event()), 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "error"])
@@ -322,7 +353,7 @@ class BridgeTests(unittest.TestCase):
         self.assertIn(("right", "stop", 1), client.calls)
         self.assert_no_configuration_writes(client)
 
-    def test_eof_after_parking_emergency_stops_without_clearing_saved_currents(self):
+    def test_eof_after_normal_stop_policy_emergency_stops_without_clearing_saved_currents(self):
         client, messages = FakeClient(), []
         motors = Motors(client)
         class Output:
@@ -333,8 +364,9 @@ class BridgeTests(unittest.TestCase):
             def line(self, _deadline, _stopped):
                 if self.requested: raise SessionError("Control input closed")
                 self.requested = True
-                return json.dumps({"seq": 1, "token": messages[0]["token"], "cmd": "parking",
-                                   "left": 0, "right": 0, "parkingEnabled": True}).encode()
+                motors.set_parking(True)  # Private historical stop-policy fixture only.
+                return json.dumps({"seq": 1, "token": messages[0]["token"], "cmd": "stop",
+                                   "left": 0, "right": 0}).encode()
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input):
             self.assertEqual(bridge.run_session(motors, "fake", False, threading.Event()), 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "ack", "error"])
@@ -523,20 +555,21 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertIn("watchdog", error["error"])
         self.finish(process)
 
-    def test_dry_run_parking_roundtrip_and_terminal_preserves_configuration(self):
+    def test_dry_run_current_read_and_terminal_preserve_configuration(self):
         process, ready = self.start()
         self.assertTrue(ready["parkingSupported"])
         self.assertEqual(ready["parkingLeftCurrentAmps"], 5.0)
         self.assertFalse(ready["parkingEnabled"])
-        parking = self.exchange(process, ready, cmd="parking", left=0, right=0,
-                                parkingEnabled=True)
+        parking = self.exchange(process, ready, cmd="parking_settings", left=0, right=0,
+                                **current_read_fields())
         self.assertEqual(parking["type"], "ack")
-        self.assertTrue(parking["parkingEnabled"])
+        self.assertTrue(parking["parkingResult"]["ok"])
+        self.assertTrue(parking["parkingMode"])
         self.assertEqual(parking["parkingLeftCurrentAmps"], 5.0)
         drive = self.exchange(process, parking, seq=2)
-        self.assertTrue(drive["parkingEnabled"])
+        self.assertTrue(drive["parkingMode"])
         stop = self.exchange(process, drive, seq=3, cmd="stop", left=0, right=0)
-        self.assertTrue(stop["parkingEnabled"])
+        self.assertTrue(stop["parkingMode"])
         close = self.exchange(process, stop, seq=4, cmd="close", left=0, right=0)
         self.assertFalse(close["parkingEnabled"])
         self.assertEqual(close["parkingLeftCurrentAmps"], 5.0)
@@ -548,11 +581,11 @@ class BridgeProtocolTests(unittest.TestCase):
         messages, deadlines = [], []
 
         class TimedMotors(Motors):
-            def set_parking(self, enabled):
+            def unified_parking(self, request):
                 # Delay the operation, then let its real final confirmation run.
                 # Delaying after return models stale evidence rather than slow I/O.
                 clock[0] += duration
-                super().set_parking(enabled)
+                return super().unified_parking(request)
 
             def drive(self, left, right):
                 target = super().drive(left, right)
@@ -576,8 +609,8 @@ class BridgeProtocolTests(unittest.TestCase):
                 cmd = command if self.seq == 1 else "close"
                 request = {"seq": self.seq, "token": messages[-1]["token"], "cmd": cmd,
                            "left": 10 if cmd == "drive" else 0, "right": 0}
-                if cmd == "parking":
-                    request.update(parkingEnabled=True)
+                if cmd == "parking_settings":
+                    request.update(current_read_fields())
                 return json.dumps(request).encode()
 
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input), \
@@ -585,8 +618,8 @@ class BridgeProtocolTests(unittest.TestCase):
             result = bridge.run_session(TimedMotors(), "fake", True, threading.Event())
         return result, messages, deadlines
 
-    def test_only_parking_can_extend_transaction_and_refresh_lease_after_completion(self):
-        result, messages, deadlines = self.run_fake_timed_session("parking", 0.8)
+    def test_only_settings_read_can_extend_transaction_and_refresh_lease_after_completion(self):
+        result, messages, deadlines = self.run_fake_timed_session("parking_settings", 0.8)
         self.assertEqual(result, 0)
         self.assertEqual([message["type"] for message in messages], ["ready", "ack", "ack"])
         self.assertAlmostEqual(deadlines[1], 1.4)
@@ -595,8 +628,8 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(messages[-1]["type"], "error")
         self.assertIn("watchdog", messages[-1]["error"])
 
-    def test_parking_transaction_over_two_seconds_has_no_success_ack(self):
-        result, messages, _ = self.run_fake_timed_session("parking", 2.01)
+    def test_settings_transaction_over_its_hard_budget_has_no_success_ack(self):
+        result, messages, _ = self.run_fake_timed_session("parking_settings", bridge.UNIFIED_PARKING_TRANSACTION_SECONDS + .01)
         self.assertEqual(result, 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "error"])
         self.assertIn("Parking transaction exceeded timeout", messages[-1]["error"])
@@ -606,15 +639,15 @@ class BridgeProtocolTests(unittest.TestCase):
         clock = [0.0]
         messages, deadlines, events = [], [], []
         epoch = [0.0]
-        client = FakeClient()
+        client = ParkingReadFakeClient()
         remaining = iter(actions)
 
         class TimedMotors(Motors):
             polls = 0
 
-            def set_parking(self, enabled):
+            def unified_parking(self, request):
                 clock[0] += parking_seconds
-                super().set_parking(enabled)
+                return super().unified_parking(request)
 
             def check_infrared(self):
                 self.polls += 1
@@ -675,8 +708,8 @@ class BridgeProtocolTests(unittest.TestCase):
                 left, right = targets or ((30, -30) if command == "drive" else (0, 0))
                 request = {"seq": self.seq, "token": messages[-1]["token"],
                            "cmd": command, "left": left, "right": right}
-                if command == "parking":
-                    request.update(parkingEnabled=True)
+                if command == "parking_settings":
+                    request.update(current_read_fields())
                 return json.dumps(request).encode()
 
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input), \
@@ -717,20 +750,21 @@ class BridgeProtocolTests(unittest.TestCase):
                          "network_grace_expired")
         self.assertGreaterEqual(motors.polls, 5, "IR polling remains active during grace")
 
-    def test_parking_during_recovery_does_not_release_latch_or_extend_grace(self):
+    def test_current_read_during_recovery_does_not_release_latch_or_extend_grace(self):
         result, messages, deadlines, events, elapsed, _motors, _client = self.run_scripted_grace([
-            (0.1, "drive"), "deadline", (2.0, "parking"), "deadline"], parking_seconds=0.8)
+            (0.1, "drive"), "deadline", (2.0, "parking_settings"), "deadline"], parking_seconds=0.8)
         self.assertEqual(result, 1)
         self.assert_deadlines(deadlines, [0.6, 0.7, 5.1, 5.1])
         self.assertAlmostEqual(elapsed, 5.1)
         self.assertTrue(messages[2]["recoveryRequired"])
-        self.assertTrue(messages[2]["parkingEnabled"])
+        self.assertTrue(messages[2]["parkingResult"]["ok"])
+        self.assertTrue(messages[2]["parkingMode"])
         recovery = next(row for row in events if row["event"] == "drive.network_recovery_ack")
         self.assertFalse(recovery["neutralAccepted"])
 
-    def test_recovery_parking_completion_cannot_outlive_fixed_grace(self):
+    def test_recovery_current_read_completion_cannot_outlive_fixed_grace(self):
         result, messages, _deadlines, events, _elapsed, _motors, _client = self.run_scripted_grace([
-            (0.1, "drive"), "deadline", (4.9, "parking")], parking_seconds=0.3)
+            (0.1, "drive"), "deadline", (4.9, "parking_settings")], parking_seconds=0.3)
         self.assertEqual(result, 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "ack", "error"])
         self.assertIn("network grace expired", messages[-1]["error"])

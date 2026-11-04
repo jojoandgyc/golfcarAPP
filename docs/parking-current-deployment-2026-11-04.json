@@ -1,0 +1,140 @@
+{
+  "recordedAtUtc": "2026-11-04T06:09:22.829085+00:00",
+  "sourceBaseCommit": "e50996a3e2a1f10cfc50003da7eb3513ebdae0f8",
+  "status": "app_installed_board_deployed_and_memory_tests_passed",
+  "release": {
+    "appVersion": "1.8.15-parking-current",
+    "versionCode": 26,
+    "apkSha256": "e16b1c9f1c86b69162ef1b8dcda8fcd777a2ccd1f5469e3b0efbb49591fc984f",
+    "boardSources": {
+      "app_joystick_bridge.py": "259e3f7f6718f2cbed823899e178449fd84c2a19c8d7681b1f0e783a23b8e8b4",
+      "app_parking_settings.py": "4b58ec90db11648db7a121a1bbcfcc29d649976e4bdd99ecb28253df2cb15a42",
+      "app_parking_bridge.py": "f6e686bc04aeaf1e8afda895085cf92e2af908ea730af5b39ece50a0229470b5"
+    }
+  },
+  "phoneInstallation": {
+    "installedAtUtc": "2026-11-04T05:51:41.995047+00:00",
+    "versionCode": 26,
+    "versionName": "1.8.15-parking-current",
+    "apkSha256": "e16b1c9f1c86b69162ef1b8dcda8fcd777a2ccd1f5469e3b0efbb49591fc984f",
+    "previousVersionCode": 25,
+    "previousApkSha256": "070329ba076ab3c925fee3884df0ff2f7e61081f9d9f15ee33df35d3af3fb064",
+    "backup": "E:\\Temp\\golfcar-parking-current-2026-11-04\\phone-before-v25-20261104T055139Z-3e9c090e.apk",
+    "connectionPreferencesPreserved": true,
+    "userExplicitlyConfirmedControlsDisabledAndCarIdle": true,
+    "boardControlLeaseAcquired": false,
+    "boardUnavailableAtInstallation": true,
+    "realMotorWritesSent": false
+  },
+  "boardDeployment": {
+    "deployedAtUtc": "2026-11-04T05:55:01.023793+00:00",
+    "files": [
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_parking_settings.py",
+        "sha256": "4b58ec90db11648db7a121a1bbcfcc29d649976e4bdd99ecb28253df2cb15a42",
+        "oldSha256": "8b9cc82fbdbfa82ac4ab8828f8dc874ebdbfddd67d17dac0be7996b1a25dba3b",
+        "backup": "/home/topeet/lianzhan/scripts/app_parking_settings.py.bak.unified-parking-20261104T055501Z"
+      },
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_parking_bridge.py",
+        "sha256": "f6e686bc04aeaf1e8afda895085cf92e2af908ea730af5b39ece50a0229470b5",
+        "alreadyDeployed": true
+      },
+      {
+        "target": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py",
+        "sha256": "259e3f7f6718f2cbed823899e178449fd84c2a19c8d7681b1f0e783a23b8e8b4",
+        "oldSha256": "1f6d17a099982edaac5eca435e1ba6c9ea8704f619a2345005dd6ce59f2f7fcc",
+        "backup": "/home/topeet/lianzhan/scripts/app_joystick_bridge.py.bak.unified-parking-20261104T055501Z"
+      }
+    ],
+    "bothControlLocksHeld": true,
+    "controlIdle": true,
+    "serialIdle": true,
+    "realMotorWritesSent": false,
+    "stagedSimulationPassed": true
+  },
+  "realBoardReadOnlyVerification": {
+    "checkedAtUtc": "2026-11-04T05:55:00.020754+00:00",
+    "readOnly": true,
+    "reply": {
+      "type": "parking",
+      "schemaVersion": 2,
+      "parkingSemantics": "current_zero_disables",
+      "requestId": "7776193d-a3d2-41ac-a4f5-acd3abae4969",
+      "op": "read",
+      "ok": true,
+      "simulation": false,
+      "mode": false,
+      "modeSource": "current_readback",
+      "leftRaw": 0,
+      "rightRaw": 0,
+      "maxRaw": 1500,
+      "leftRpm": 0,
+      "rightRpm": 0,
+      "leftError": 0,
+      "rightError": 0,
+      "writeMayHaveOccurred": false,
+      "errorCode": null,
+      "results": []
+    },
+    "deployedSourceDigestsMatch": true,
+    "realMotorWritesSentByAgent": false
+  },
+  "behavior": {
+    "parkingState": "Each side: 0 A disabled, positive enabled; mixed sides are not a single bool.",
+    "ui": "Single current page, no mode switch; set-zero fills drafts only, save submits exact explicit currents.",
+    "writeScope": "Only 0x0076 left and 0x006D right, after neutral targets, serialized through idle guard or existing owner.",
+    "readScope": "Read-only, no stop or configuration writes; unknown sides are never replaced by cached ACK numbers.",
+    "compatibility": "schemaVersion 2 with parkingSemantics current_zero_disables; legacy mode commands rejected without parking I/O.",
+    "existingRules": "Emergency stop, heartbeat and network grace unchanged; no invented current defaults or restore history."
+  },
+  "validation": {
+    "jvm": {
+      "tests": 269,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorProtocolUiAndCrossLanguage": {
+      "tests": 110,
+      "passed": 110
+    },
+    "finalAppStateAndUiRetest": {
+      "tests": 34,
+      "passed": 34
+    },
+    "boardOffline": {
+      "tests": 235,
+      "passed": 235,
+      "skipped": 0
+    },
+    "deployedSshMemorySimulation": {
+      "tests": 5,
+      "passed": 5,
+      "realBoardSsh": true,
+      "allControlSessionsDryRun": true,
+      "realSerialOpened": false,
+      "realMotorCommandsSent": false
+    }
+  },
+  "constraints": {
+    "realMotorCurrentWritesSentByAgent": false,
+    "realMotorDriveTestPerformedByAgent": false,
+    "boardWifiOrRoutesChangedByAgent": false,
+    "followRuntimeChangedByAgent": false,
+    "oldApkAndChangedBoardSourcesBackedUp": true,
+    "phoneCurrentWifiReconnectedByAgent": true
+  },
+  "phoneUi": {
+    "layoutInspected": true,
+    "independentModeSwitchAbsent": true,
+    "readOnlyHotspotRecoveryCompleted": true,
+    "manualDriveNotEnabledByAgent": true,
+    "currentSaveNotSubmittedByAgent": true,
+    "realPhoneParkingReadCompleted": false,
+    "networkLimitation": {
+      "lan": "TCP refused before SSH; phone resolves 172.16.16.82 to ae:44:65:8e:05:5a while the authenticated board and PC use 88:49:2d:14:07:60. Persisted after phone Wi-Fi reconnection; stale neighbor or IP conflict remains unresolved.",
+      "remote": "Actual App connection completed TLS but backend closed before the SSH banner; a repeat reproduced connection is closed by foreign host."
+    }
+  }
+}

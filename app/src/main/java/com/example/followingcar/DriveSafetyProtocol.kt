@@ -1,5 +1,7 @@
 package com.example.followingcar
 
+import java.math.BigDecimal
+
 /** Board measurements, separate from accepted motor targets. Values may report continued motion. */
 data class DriveFeedback(
     val leftRpm: Int,
@@ -92,6 +94,28 @@ internal fun validatedParkingSettings(values: Map<String, Any?>, commandModeOnly
         amps("parkingMaxCurrentAmps"))
     require(commandModeOnly || !settings.enabled || settings.canEnable) { "开发板已启用驻车但电流配置无效" }
     return settings
+}
+
+/** Current-derived configuration state is independent of the motor's emergency stop mode. */
+internal fun validateParkingCurrentReadback(mode: Boolean?, source: String?, settings: ParkingSettings) {
+    fun raw(value: Double): Int = BigDecimal.valueOf(value).movePointRight(2).intValueExact().also {
+        require(it in 0..6000) { "开发板驻车电流超出范围" }
+    }
+    val left = raw(settings.leftCurrentAmps)
+    val right = raw(settings.rightCurrentAmps)
+    raw(settings.maxCurrentAmps)
+    // After an unconfirmed write the owner can retain cached numbers, explicitly
+    // marked unknown. They must not be promoted to fresh configuration evidence.
+    if (source == "unknown") {
+        require(mode == null) { "未知驻车电流不能声明已开启或关闭" }
+        return
+    }
+    val expected = when {
+        left == 0 && right == 0 -> false
+        left > 0 && right > 0 -> true
+        else -> null
+    }
+    require(source == "current_readback" && mode == expected) { "开发板驻车状态与电流回读不一致" }
 }
 
 private fun safetyInteger(raw: Any?, label: String): Int {

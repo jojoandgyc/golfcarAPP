@@ -606,7 +606,6 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                     onLeftChange = viewModel::editParkingLeft,
                     onRightChange = viewModel::editParkingRight,
                     onSave = viewModel::saveParkingCurrents,
-                    onEnabledChange = viewModel::requestParkingMode,
                     modifier = Modifier.fillMaxWidth().weight(1f))
             } else {
                 Column(Modifier.fillMaxWidth().weight(1f),

@@ -4,6 +4,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DriveSafetyProtocolTest {
+    @Test fun currentDerivedParkingIsIndependentOfEmergencyModeAndDistinguishesMixedSides() {
+        for (legacyStopMode in listOf(false, true)) {
+            validateParkingCurrentReadback(true, "current_readback", ParkingSettings(legacyStopMode, 4.25, 5.5, 20.0))
+            validateParkingCurrentReadback(false, "current_readback", ParkingSettings(legacyStopMode, 0.0, 0.0, 20.0))
+            validateParkingCurrentReadback(null, "current_readback", ParkingSettings(legacyStopMode, 0.0, 5.0, 20.0))
+            validateParkingCurrentReadback(null, "current_readback", ParkingSettings(legacyStopMode, 5.0, 0.0, 20.0))
+        }
+        for (source in listOf(null, "unknown", "command_ack", "manual_session"))
+            rejects { validateParkingCurrentReadback(true, source, ParkingSettings(false, 5.0, 5.0, 20.0)) }
+        validateParkingCurrentReadback(null, "unknown", ParkingSettings(false, 5.0, 5.0, 20.0))
+        rejects { validateParkingCurrentReadback(false, "unknown", ParkingSettings(false, 0.0, 0.0, 20.0)) }
+        rejects { validateParkingCurrentReadback(false, "current_readback", ParkingSettings(false, 5.0, 5.0, 20.0)) }
+        rejects { validateParkingCurrentReadback(true, "current_readback", ParkingSettings(false, 0.0, 5.0, 20.0)) }
+        rejects { validateParkingCurrentReadback(false, "current_readback", ParkingSettings(false, 0.0, 5.0, 20.0)) }
+        rejects { validateParkingCurrentReadback(null, "current_readback", ParkingSettings(false, 0.0, 0.0, 20.0)) }
+    }
     private fun feedback(stopped: Boolean = true, targetStopped: Boolean = true) = mapOf<String, Any?>(
         "targetStopped" to targetStopped, "stopped" to stopped,
         "feedbackLeftRpm" to 0, "feedbackRightRpm" to 0,

@@ -1,4 +1,8 @@
-"""Dedicated parking operations. No arbitrary registers, retries, rollback or mode readback."""
+"""Parking is the two saved currents: zero disables that side, positive enables it.
+
+There is no independent parking mode register. Only explicit currents requests
+write configuration; reads never actuate, and stop modes are not parking switches.
+"""
 from __future__ import annotations
 import re
 import time
@@ -6,6 +10,8 @@ import time
 CURRENT_REGISTERS = {'left': 0x76, 'right': 0x6D}
 MAX_CURRENT_RAW = 6000
 TRANSACTION_SECONDS = 2.0
+SCHEMA_VERSION = 2
+PARKING_SEMANTICS = 'current_zero_disables'
 
 class ParkingError(Exception):
     def __init__(self, code):
@@ -19,7 +25,7 @@ def error_code(error):
 def response(request):
     ident=request.get('requestId')
     op=request.get('op')
-    return dict(type='parking', schemaVersion=1,
+    return dict(type='parking', schemaVersion=SCHEMA_VERSION, parkingSemantics=PARKING_SEMANTICS,
         requestId=ident if type(ident) is str and len(ident)<=64 else None,
         op=op if op in ('read','mode','currents') else None,
         ok=False, simulation=False, mode=None, modeSource='unknown', leftRaw=None, rightRaw=None, maxRaw=None,
@@ -32,16 +38,24 @@ def validate_request(request, allow_sequence_id=False):
     extra = {'enabled'} if op == 'mode' else {'leftRaw', 'rightRaw'} if op == 'currents' else set()
     if op not in ('read', 'mode', 'currents') or set(request) != {'schemaVersion','requestId','op'} | extra:
         raise ParkingError('invalid_request_fields')
-    if type(request['schemaVersion']) is not int or request['schemaVersion'] != 1:
+    if type(request['schemaVersion']) is not int or request['schemaVersion'] != SCHEMA_VERSION:
         raise ParkingError('unsupported_schema_version')
     ident = request['requestId']
     if type(ident) is not str or not (re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', ident)
             or allow_sequence_id and re.fullmatch(r'[1-9][0-9]{0,18}', ident)):
         raise ParkingError('invalid_request_id')
     if op == 'mode' and type(request['enabled']) is not bool: raise ParkingError('invalid_mode')
+    if op == 'mode': raise ParkingError('parking_mode_requires_currents')
     if op == 'currents' and any(type(request[k]) is not int or not 0 <= request[k] <= MAX_CURRENT_RAW for k in ('leftRaw','rightRaw')):
         raise ParkingError('invalid_current')
     return request
+
+def current_state(left, right):
+    """Mixed is known but has no single boolean; partial observations stay unknown."""
+    if any(type(value) is not int or not 0 <= value <= MAX_CURRENT_RAW for value in (left,right)):
+        return dict(mode=None,modeSource='unknown')
+    mode = True if left > 0 and right > 0 else False if left == 0 and right == 0 else None
+    return dict(mode=mode,modeSource='current_readback')
 
 def words(io, address, count):
     value = io.read(address, count)
@@ -60,7 +74,7 @@ def observe(io, result):
                   leftError=left[3], rightError=right[3])
     return bus[2]
 
-def execute(request, io, mode=None, mode_source='unknown', *, allow_sequence_id=False):
+def execute(request, io, *, allow_sequence_id=False):
     result = response(request if isinstance(request,dict) else {})
     deadline = time.monotonic() + TRANSACTION_SECONDS
     def check():
@@ -71,8 +85,6 @@ def execute(request, io, mode=None, mode_source='unknown', *, allow_sequence_id=
             check(); value=backend.read(address,count); check(); return value
         def zero_targets(self):
             check(); backend.zero_targets(); check()
-        def stop(self,enabled):
-            check(); backend.stop(enabled); check()
         def write_current(self,side,raw):
             check(); backend.write_current(side,raw); check()
     io=BoundedIO()
@@ -84,7 +96,6 @@ def execute(request, io, mode=None, mode_source='unknown', *, allow_sequence_id=
         return control
     try:
         validate_request(request, allow_sequence_id)
-        result.update(mode=mode, modeSource=mode_source if type(mode) is bool else 'unknown')
         if request['op'] == 'currents':
             result['results'] = [dict(side=side,status='not_attempted',requestedRaw=request[side+'Raw'],actualRaw=None) for side in ('left','right')]
         # Stop existing motion before any potentially slow configuration reads.
@@ -101,18 +112,12 @@ def execute(request, io, mode=None, mode_source='unknown', *, allow_sequence_id=
         if any(not 0 <= result[k] <= MAX_CURRENT_RAW for k in ('leftRaw','rightRaw')): raise ParkingError('invalid_saved_current')
         if request['op'] == 'read':
             result['ok'] = True
+            result.update(current_state(result['leftRaw'],result['rightRaw']))
             return result
         if result['leftError'] or result['rightError']: raise ParkingError('motor_fault')
         if control & 7: raise ParkingError('external_control_source')
         if request['op'] == 'currents' and any(request[k] > result['maxRaw'] for k in ('leftRaw','rightRaw')):
             raise ParkingError('current_limit_exceeded')
-        if request['op'] == 'mode' and request['enabled'] and any(result[k] > result['maxRaw'] for k in ('leftRaw','rightRaw')):
-            raise ParkingError('current_limit_exceeded')
-        if request['op'] == 'mode':
-            result.update(mode=None,modeSource='unknown')
-            io.stop(request['enabled']); check()
-            result.update(mode=request['enabled'],modeSource='command_ack',ok=True)
-            return result
         for entry in result['results']:
             check()
             side = entry['side']; address=CURRENT_REGISTERS[side]
@@ -133,6 +138,7 @@ def execute(request, io, mode=None, mode_source='unknown', *, allow_sequence_id=
         result['ok']=True
     except Exception as error:
         result['errorCode']=error_code(error)
+    result.update(current_state(result['leftRaw'],result['rightRaw']))
     return result
 
 class DriverIO:
@@ -145,12 +151,6 @@ class DriverIO:
             try: method(0)
             except Exception as e: errors.append(e)
         if errors: raise ParkingError('zero_target_unconfirmed')
-    def stop(self,enabled):
-        errors=[]
-        for side in ('left','right'):
-            try:self.client.stop(side,0 if enabled else 2)
-            except Exception as e:errors.append(e)
-        if errors:raise ParkingError('mode_write_unconfirmed')
     def write_current(self,side,raw): self.client.write_multiple_registers(CURRENT_REGISTERS[side],[raw])
     def close(self):pass
 
@@ -164,12 +164,6 @@ class ModbusIO:
             try:self.client.write(address,[0,0],action=True)
             except Exception as e:errors.append(e)
         if errors:raise ParkingError('zero_target_unconfirmed')
-    def stop(self,enabled):
-        errors=[]
-        for address in (0x44,0x40):
-            try:self.client.write(address,[0 if enabled else 2],action=True)
-            except Exception as e:errors.append(e)
-        if errors:raise ParkingError('mode_write_unconfirmed')
     def write_current(self,side,raw):self.client.write(CURRENT_REGISTERS[side],[raw],mode='persistent')
     def close(self):self.transport.close()
 
@@ -182,7 +176,6 @@ class SimulatedIO:
     def read(self,address,count):return [self.registers[address+i] for i in range(count)]
     def zero_targets(self):
         self.trace.extend([(16,0x45,[0,0]),(16,0x41,[0,0])])
-    def stop(self,enabled):self.trace.extend([(6,0x44,[0 if enabled else 2]),(6,0x40,[0 if enabled else 2])])
     def write_current(self,side,raw):
         address=CURRENT_REGISTERS[side];self.trace.append((16,address,[raw]));self.registers[address]=raw
     def close(self):pass

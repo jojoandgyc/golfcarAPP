@@ -28,20 +28,18 @@ class ParkingUnifiedSimulationTest {
         } finally { link.disconnect() }
     }
 
-    @Test fun readDoesNotInventAReleasedModeAndModeCommandsPreserveCurrents() {
+    @Test fun readDerivesParkingFromCurrentAndZeroDisablesBothSides() {
         val read = query(ParkingRequest("read"))
         assertTrue(read.errorCode, read.ok)
-        assertNull(read.mode)
-        assertEquals("unknown", read.modeSource)
+        assertEquals(true, read.mode)
+        assertEquals("current_readback", read.modeSource)
         assertEquals(800, read.leftRaw); assertEquals(800, read.rightRaw)
-        for (enabled in listOf(true, false)) {
-            val changed = query(ParkingRequest("mode", enabled = enabled))
-            assertTrue(changed.errorCode, changed.ok)
-            assertEquals(enabled, changed.mode)
-            assertEquals("command_ack", changed.modeSource)
-            assertEquals(800, changed.leftRaw); assertEquals(800, changed.rightRaw)
-            assertTrue(changed.results.isEmpty())
-        }
+        val disabled = query(ParkingRequest("currents", leftRaw = 0, rightRaw = 0))
+        assertTrue(disabled.errorCode, disabled.ok)
+        assertEquals(false, disabled.mode)
+        assertEquals("current_readback", disabled.modeSource)
+        assertEquals(0, disabled.leftRaw); assertEquals(0, disabled.rightRaw)
+        assertTrue(disabled.results.all { it.status == "verified" && it.actualRaw == 0 })
     }
 
     @Test fun saveReadsItsOwnBaselineWithoutASeparateReadOrFullMotorSnapshot() {
@@ -51,7 +49,15 @@ class ParkingUnifiedSimulationTest {
         assertEquals(1500, saved.maxRaw)
         assertEquals(setOf("left", "right"), saved.results.map { it.side }.toSet())
         assertTrue(saved.results.all { it.status == "verified" && it.actualRaw == it.requestedRaw })
-        assertNull(saved.mode)
+        assertEquals(true, saved.mode)
+    }
+
+    @Test fun aZeroSideAndAPositiveSideAreNotReportedAsBothEnabledOrBothDisabled() {
+        val mixed = query(ParkingRequest("currents", leftRaw = 0, rightRaw = 600))
+        assertTrue(mixed.errorCode, mixed.ok)
+        assertNull(mixed.mode)
+        assertEquals("current_readback", mixed.modeSource)
+        assertEquals(0, mixed.leftRaw); assertEquals(600, mixed.rightRaw)
     }
 
     @Test fun limitErrorIsAnOperationResultWithNoCurrentWriteInsteadOfAProtocolCrash() {

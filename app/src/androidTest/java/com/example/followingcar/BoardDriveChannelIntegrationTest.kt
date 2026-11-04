@@ -17,7 +17,7 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class BoardDriveChannelIntegrationTest {
     @Test
-    fun parkingModeChangesPreserveReadOnlyCurrentAndEmergencyReleasesModeInDryRun() = runBlocking {
+    fun currentZeroDisablesParkingAndEmergencyPreservesItsConfigurationInDryRun() = runBlocking {
         val client = connectedClient()
         var drive: BoardDriveChannel? = null
         try {
@@ -27,15 +27,23 @@ class BoardDriveChannelIntegrationTest {
                 assertTrue("Update the board bridge before running parking tests", control.ready.parkingSupported)
                 assertEquals(2, control.ready.safetyVersion)
                 assertTrue(control.ready.parkingCurrentReadOnly)
+                assertEquals(PARKING_CURRENT_SEMANTICS, control.ready.parkingSemantics)
                 assertEquals(ParkingSettings(false, 5.0, 5.0, 60.0), control.ready.parking)
                 val parked = requireNotNull(control.ready.parking).copy(enabled = true)
                 assertTrue(runCatching { client.configureParking(control, parked.copy(leftCurrentAmps = 6.0)) }.isFailure)
-                assertEquals(parked, client.configureParking(control, parked).parking)
+                assertTrue(runCatching { client.configureParking(control, parked) }.isFailure)
+                val disabled = control.parkingSettings(ParkingRequest("currents", leftRaw = 0, rightRaw = 0))
+                assertEquals(false, disabled.parkingMode)
+                assertEquals(0.0, disabled.parking!!.leftCurrentAmps, 0.0)
+                val configured = control.parkingSettings(ParkingRequest("currents", leftRaw = 425, rightRaw = 550))
+                assertEquals(true, configured.parkingMode)
                 assertFalse(control.exchange(30, -30).stopped)
                 val stopped = awaitSimulatedDriveStop(control)
                 assertTrue(stopped.stopped)
-                assertEquals(parked, stopped.parking)
-                assertEquals(parked.copy(enabled = false), control.exchange(0, 0, emergency = true).parking)
+                assertEquals(configured.parking, stopped.parking)
+                val emergency = control.exchange(0, 0, emergency = true)
+                assertEquals(configured.parking, emergency.parking)
+                assertEquals(true, emergency.parkingMode)
                 assertFalse(control.isOpen)
                 assertTrue(client.isConnected)
             }

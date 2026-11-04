@@ -263,9 +263,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     val stale = !current.connected || current.driveStarting || current.driveStopping ||
                         current.followBlocksControl || current.motorActionUnconfirmed || parkingObservationConnectionId != null &&
                         parkingObservationConnectionId != connectionId
-                    parking.copy(connected = current.connected, mode = if (stale) null else parking.mode,
+                    parking.copy(connected = current.connected, valuesCurrent = !stale && parking.valuesCurrent,
                         feedbackText = if (stale) null else parking.feedbackText,
-                        message = if (stale && parking.mode != null) "连接或控制占用已变化，驻车模式待确认；电流为上次读值" else parking.message)
+                        message = if (stale && parking.valuesCurrent) "连接或控制占用已变化，显示上次读数；请重新读取确认" else parking.message)
                 }
                 if (!current.connected || current.manualActive || current.followBlocksControl) {
                     mutableMotorConfiguration.update { motor ->
@@ -818,8 +818,6 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     internal fun refreshParking() = submitParkingRequest(ParkingRequest("read"))
 
-    internal fun requestParkingMode(enabled: Boolean) = submitParkingRequest(ParkingRequest("mode", enabled = enabled))
-
     internal fun saveParkingCurrents() {
         val draft = parkingPage.value
         val left = parkingDraftRaw(draft.draftLeft)
@@ -842,7 +840,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             current.pairingBusy || current.pairingUnconfirmed -> "无线配网尚未结束，请先完成连接确认"
             current.driveStarting || current.driveStopping -> "手动控制正在启动或停用，请等待完成后重试"
             current.busy || current.videoServiceBusy || current.parkingUpdating -> "其他操作正在进行，请稍后重试"
-            current.driveEnabled && driveChannel?.ready?.unifiedParkingSupported != true -> "开发板尚未支持统一驻车接口，请更新桥接程序"
+            current.driveEnabled && driveChannel?.ready?.parkingSemantics != PARKING_CURRENT_SEMANTICS ->
+                "开发板尚未支持新版驻车电流接口，请更新桥接程序"
             else -> null
         }
         if (blocked != null) {
@@ -850,7 +849,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         mutableParkingPage.update { it.copy(busy = true, error = null,
-            message = when (request.op) { "read" -> "正在读取驻车信息…"; "mode" -> "正在发送停止模式指令…"; else -> "正在读取当前上限并保存驻车电流…" }) }
+            message = if (request.op == "read") "正在读取驻车电流…" else "正在读取当前上限并保存驻车电流…") }
         Diagnostics.event("parking.operation_requested", activeDiagnostic(),
             fields = mapOf("op" to request.op, "route" to if (current.driveEnabled) "manual_owner" else "idle"), critical = true)
         if (current.driveEnabled) {
@@ -912,6 +911,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         mutableParkingPage.update { page -> page.copy(mode = reply.mode,
+            valuesCurrent = reply.leftRaw != null && reply.rightRaw != null,
             leftCurrentAmps = reply.leftRaw?.div(100.0) ?: page.leftCurrentAmps.takeUnless {
                 request.op == "currents" && reply.writeMayHaveOccurred },
             rightCurrentAmps = reply.rightRaw?.div(100.0) ?: page.rightCurrentAmps.takeUnless {
@@ -922,12 +922,9 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             feedbackText = if (reply.leftRpm != null && reply.rightRpm != null)
                 "轮速：左 ${reply.leftRpm} / 右 ${reply.rightRpm} RPM" else null,
             message = when {
-                resultText.isNotBlank() -> resultText + if (reply.leftRaw == 0 || reply.rightRaw == 0) "；0 A 的一侧不能提供驻车电流" else ""
-                reply.ok && request.op == "mode" ->
-                    (if (reply.mode == true) "开启驻车" else "自由停止") + "指令已确认"
+                resultText.isNotBlank() -> resultText
                 !reply.ok -> "本次操作未完成，请查看错误信息"
-                reply.mode == null -> "电流已读取"
-                else -> "驻车信息已更新"
+                else -> "驻车电流已读取；0 A 关闭对应侧，正电流开启对应侧"
             }, error = if (reply.ok) null else parkingReplyError(reply)) }
         if (request.op == "currents" && (reply.ok || reply.writeMayHaveOccurred)) {
             mutableMotorConfiguration.update { it.copy(requiresRead = true,
@@ -938,11 +935,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 reply.leftRaw / 100.0, reply.rightRaw / 100.0, reply.maxRaw / 100.0)) }
         Diagnostics.event("parking.operation_completed", activeDiagnostic(), fields = mapOf("op" to request.op,
             "ok" to reply.ok, "modeSource" to reply.modeSource, "writeMayHaveOccurred" to reply.writeMayHaveOccurred,
-            "results" to reply.results.map { "${it.side}:${it.status}" }), critical = true)
+            "results" to reply.results.joinToString(",") { "${it.side}:${it.status}" }), critical = true)
     }
 
     private fun parkingOperationUnknown(request: ParkingRequest?) {
-        mutableParkingPage.update { it.copy(mode = null, busy = false, feedbackText = null,
+        mutableParkingPage.update { it.copy(mode = null, busy = false, valuesCurrent = false, feedbackText = null,
             leftCurrentAmps = if (request?.op == "currents") null else it.leftCurrentAmps,
             rightCurrentAmps = if (request?.op == "currents") null else it.rightCurrentAmps,
             error = if (request?.op == "read") "驻车读取未完成，请重新连接后重试"
@@ -952,8 +949,17 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private fun observeDriveParking(ack: DriveAck) {
         val settings = ack.parking ?: return
         parkingObservationConnectionId = client.diagnosticConnectionId
+        if (ack.parkingModeSource == "unknown") {
+            // The wire may retain old numeric caches after a partial write. Keep
+            // known history/unknown sides separate until an actual read succeeds.
+            mutableParkingPage.update { it.copy(mode = null, valuesCurrent = false,
+                feedbackText = ack.feedback?.let { sample ->
+                    "轮速：左 ${sample.leftRpm} / 右 ${sample.rightRpm} RPM" }) }
+            return
+        }
         mutableParkingPage.update { page -> page.copy(
             mode = ack.parkingMode,
+            valuesCurrent = ack.parkingModeSource == "current_readback",
             leftCurrentAmps = settings.leftCurrentAmps, rightCurrentAmps = settings.rightCurrentAmps,
             maxCurrentAmps = settings.maxCurrentAmps,
             draftLeft = if (!parkingLeftEdited) parkingRawText((settings.leftCurrentAmps * 100).toInt()) else page.draftLeft,
@@ -1086,6 +1092,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private fun executeMotorConfigurationWrite(plan: MotorConfigurationWritePlan, preserveDrafts: Boolean) {
         val connection = motorConfiguration.value.connection
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
+        if (plan.changes.any { it.field in setOf(MotorConfigurationField.LEFT_PARKING_CURRENT,
+                MotorConfigurationField.RIGHT_PARKING_CURRENT, MotorConfigurationField.MAX_OUTPUT_CURRENT) }) {
+            mutableParkingPage.update { it.copy(valuesCurrent = false,
+                message = "电机配置可能更新驻车电流，请刷新核对") }
+        }
         mutableState.update { it.copy(busy = true, status = "正在保存电机配置…") }
         mutableMotorConfiguration.update { it.copy(applying = true, requiresRead = true,
             writeResults = emptyList(), error = null, message = "正在写入并核对回读，请等待结果") }
@@ -1610,8 +1621,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 pendingParking = null
                 if (pendingUnifiedParking != null) parkingOperationUnknown(pendingUnifiedParking)
                 pendingUnifiedParking = null
-                mutableParkingPage.update { it.copy(mode = null, busy = false,
-                    message = if (it.error != null) it.message else "手动控制已结束，驻车模式待确认；电流为上次读值") }
+                mutableParkingPage.update { it.copy(busy = false, valuesCurrent = false,
+                    message = if (it.error != null) it.message else "手动控制已结束，显示上次驻车电流读数") }
                 // Motor stop/close always precedes service cleanup. Retain manual ownership
                 // until cleanup finishes so follow cannot race a late camera-service start.
                 mutableState.update { it.copy(driveStarting = false, driveEnabled = false,

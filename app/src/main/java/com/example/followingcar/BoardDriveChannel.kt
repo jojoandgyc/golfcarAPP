@@ -32,6 +32,7 @@ data class DriveReady(
     val parkingCurrentReadOnly: Boolean = false,
     val feedback: DriveFeedback? = null,
     val unifiedParkingSupported: Boolean = false,
+    val parkingSemantics: String? = null,
 )
 data class DriveAck(
     val left: Int, val right: Int, val stopped: Boolean,
@@ -125,6 +126,9 @@ class BoardDriveChannel private constructor(
 
     /** Serialized by the same caller as the heartbeat; the board also requires a stopped target. */
     suspend fun configureParking(settings: ParkingSettings): DriveAck {
+        check(ready.parkingSemantics != PARKING_CURRENT_SEMANTICS) {
+            "驻车开关已合并到电流设置：0 A 关闭，正电流开启，请在驻车页保存电流"
+        }
         check(ready.parkingSupported) { "开发板脚本不支持驻车设置，请更新 app_joystick_bridge.py" }
         check(ready.parkingCurrentReadOnly && confirmedParking != null &&
             settings.copy(enabled = confirmedParking!!.enabled) == confirmedParking) {
@@ -136,7 +140,9 @@ class BoardDriveChannel private constructor(
 
     /** Uses the existing owner and request sequence; never opens a competing motor bridge. */
     internal suspend fun parkingSettings(request: ParkingRequest): DriveAck {
-        check(ready.unifiedParkingSupported) { "开发板尚未支持统一驻车接口，请更新桥接程序" }
+        check(ready.unifiedParkingSupported && ready.parkingSemantics == PARKING_CURRENT_SEMANTICS) {
+            "开发板尚未支持新版驻车电流接口，请更新桥接程序"
+        }
         return transact("parking_settings", 0, 0, parkingRequest = request)
     }
 
@@ -189,7 +195,8 @@ class BoardDriveChannel private constructor(
                     if (parking != null) {
                         request.put("parkingEnabled", parking.enabled)
                     }
-                    parkingRequest?.addTo(request)
+                    parkingRequest?.addTo(request)?.put("schemaVersion", 2)
+                        ?.put("parkingSemantics", PARKING_CURRENT_SEMANTICS)
                     phase = "write"
                     val sendingNanos = System.nanoTime()
                     sendGapMs = if (lastSendNanos == 0L) null else
@@ -259,7 +266,15 @@ class BoardDriveChannel private constructor(
                     val actualParking = if (ready.parkingSupported) readParking(reply) else null
                     val modeSource = if (ready.unifiedParkingSupported) reply.opt("parkingModeSource") else null
                     val rawMode = if (ready.unifiedParkingSupported) reply.opt("parkingMode") else null
-                    if (ready.unifiedParkingSupported) {
+                    if (ready.parkingSemantics == PARKING_CURRENT_SEMANTICS) {
+                        requireMessage(reply.opt("parkingSemantics") == PARKING_CURRENT_SEMANTICS &&
+                            reply.has("parkingMode") && (rawMode == JSONObject.NULL || rawMode is Boolean),
+                            "开发板驻车电流协议字段无效")
+                        readSafety { validateParkingCurrentReadback(rawMode as? Boolean, modeSource as? String,
+                            requireNotNull(actualParking)) }
+                        requireMessage(parkingResult == null || !parkingResult.ok || parkingResult.mode == rawMode as? Boolean,
+                            "驻车操作结果与电流状态不一致")
+                    } else if (ready.unifiedParkingSupported) {
                         requireMessage(reply.has("parkingMode") && (rawMode == JSONObject.NULL || rawMode is Boolean) &&
                             modeSource in setOf("unknown", "manual_session"), "开发板驻车模式来源字段无效")
                         requireMessage((rawMode == JSONObject.NULL) == (modeSource == "unknown"), "开发板驻车模式来源不一致")
@@ -287,11 +302,9 @@ class BoardDriveChannel private constructor(
                                 "右驻车电流回读不一致")
                             requireMessage(parkingResult.maxRaw == null || parkingResult.maxRaw / 100.0 == actual.maxCurrentAmps,
                                 "最大输出电流回读不一致")
-                            requireMessage(parkingResult.mode == null || parkingResult.mode == actual.enabled,
-                                "驻车模式回读不一致")
                             requireMessage(parkingRequest?.op == "currents" ||
                                 actual.copy(enabled = previous.enabled) == previous,
-                                "模式和读取操作不能修改驻车电流")
+                                "读取操作不能修改驻车电流")
                             requireMessage(parkingRequest?.op != "read" || actual == previous || safeParkingRelease,
                                 "读取操作不能修改驻车模式")
                         } else requireMessage(actualParking == expectedParking || safeParkingRelease,
@@ -590,6 +603,17 @@ class BoardDriveChannel private constructor(
                         val rawUnifiedParking = reply.opt("unifiedParkingSupported")
                         control.requireMessage(!reply.has("unifiedParkingSupported") || rawUnifiedParking is Boolean,
                             "开发板统一驻车能力字段无效")
+                        val rawParkingSemantics = reply.opt("parkingSemantics")
+                        control.requireMessage(!reply.has("parkingSemantics") ||
+                            rawParkingSemantics == PARKING_CURRENT_SEMANTICS && rawUnifiedParking == true,
+                            "开发板驻车电流协议未匹配")
+                        if (rawParkingSemantics == PARKING_CURRENT_SEMANTICS) {
+                            val rawMode = reply.opt("parkingMode")
+                            control.requireMessage(reply.has("parkingMode") && (rawMode == JSONObject.NULL || rawMode is Boolean),
+                                "开发板初始驻车电流状态无效")
+                            control.readSafety { validateParkingCurrentReadback(rawMode as? Boolean,
+                                reply.opt("parkingModeSource") as? String, parking) }
+                        }
                         val rawRunId = reply.opt("runId")
                         val rawGrace = reply.opt("networkGraceMs")
                         control.requireMessage(!reply.has("networkGraceMs") ||
@@ -607,6 +631,7 @@ class BoardDriveChannel private constructor(
                             safetyVersion = REQUIRED_DRIVE_SAFETY_VERSION, parkingCurrentReadOnly = true,
                             feedback = initialFeedback.feedback,
                             unifiedParkingSupported = rawUnifiedParking == true,
+                            parkingSemantics = rawParkingSemantics as? String,
                         )
                         control.requireMessage(ready.dryRun == dryRun, "开发板控制模式不匹配")
                         control.requireMessage(ready.maxRpm in 1..100 && ready.watchdogMs == 600, "开发板限速或超时参数不匹配")

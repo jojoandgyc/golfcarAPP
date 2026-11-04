@@ -467,19 +467,19 @@ class DriveStartupStateTest {
         assertNull(fixture.vm.state.value.driveFirstFailure)
     }
 
-    @Test fun unifiedModeAcceptsUnconfirmedPhysicalStopAndSoftFailureDoesNotExitDrive() = runBlocking {
+    @Test fun unifiedReadAcceptsUnconfirmedPhysicalStopAndSoftFailureDoesNotExitDrive() = runBlocking {
         val fixture = startFixture(networkGrace = true, holdSequence = 2, unifiedParking = true,
             transformAck = { request, ack ->
                 if (request.getLong("seq") >= 2 && request.getString("cmd") !in setOf("close", "estop")) {
                     ack.put("stopped", false).put("feedbackLeftRpm", 2).put("feedbackRightRpm", -1).put("feedbackSamples", 0)
                 }
-                if (request.optString("op") == "mode") ack.getJSONObject("parkingResult")
+                if (request.optString("op") == "read") ack.getJSONObject("parkingResult")
                     .put("ok", false).put("errorCode", "external_control_source")
             })
         withTimeout(3_000) { fixture.bridge.heldRequest.await() }
         fixture.bridge.releaseInitialAckIfPending()
         withTimeout(3_000) { fixture.vm.state.first { it.driveEnabled && !it.driveConfirmedStopped } }
-        withContext(Dispatchers.Main) { fixture.vm.requestParkingMode(true) }
+        withContext(Dispatchers.Main) { fixture.vm.refreshParking() }
         withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy && it.error != null } }
         assertTrue(fixture.vm.parkingPage.value.error!!.contains("通讯控制"))
         assertTrue(fixture.vm.state.value.driveEnabled)
@@ -488,23 +488,87 @@ class DriveStartupStateTest {
         assertEquals(listOf(true), fixture.videoActions.toList())
     }
 
-    @Test fun unifiedReadDoesNotRestoreClearedDraftAndDisconnectedModeBecomesUnknown() = runBlocking {
+    @Test fun unifiedReadPreservesClearedDraftAndFinishedSessionKeepsExplicitlyStaleLastRead() = runBlocking {
         val fixture = startFixture(networkGrace = true, holdSequence = 2, unifiedParking = true)
         withTimeout(3_000) { fixture.bridge.heldRequest.await() }
         withContext(Dispatchers.Main) {
             fixture.vm.editParkingLeft("")
-            fixture.vm.requestParkingMode(false)
+            fixture.vm.refreshParking()
         }
         fixture.bridge.releaseInitialAckIfPending()
-        withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy && it.mode == false } }
+        withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy && it.valuesCurrent } }
         withContext(Dispatchers.Main) { fixture.vm.refreshParking() }
         withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy } }
         assertEquals("", fixture.vm.parkingPage.value.draftLeft)
         withContext(Dispatchers.Main) { fixture.vm.disableDrive("test") }
         awaitFinished(fixture)
-        assertNull(fixture.vm.parkingPage.value.mode)
+        assertFalse(fixture.vm.parkingPage.value.valuesCurrent)
+        assertEquals(5.0, fixture.vm.parkingPage.value.leftCurrentAmps)
+        assertEquals(5.0, fixture.vm.parkingPage.value.rightCurrentAmps)
         assertEquals("", fixture.vm.parkingPage.value.draftLeft)
         assertEquals(listOf(true, false), fixture.videoActions.toList())
+    }
+
+    @Test fun zeroDraftDoesNotWriteUntilSaveAndSavedZerosDisableBothSidesWithoutModeCommand() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, unifiedParking = true)
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            fixture.vm.editParkingLeft("0")
+            fixture.vm.editParkingRight("0")
+            assertFalse(fixture.vm.parkingPage.value.busy)
+            assertTrue(fixture.bridge.requests.none { it.optString("cmd") == "parking_settings" })
+            fixture.vm.saveParkingCurrents()
+            assertTrue(fixture.vm.parkingPage.value.busy)
+        }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { fixture.vm.parkingPage.first {
+            !it.busy && it.valuesCurrent && it.leftCurrentAmps == 0.0 && it.rightCurrentAmps == 0.0
+        } }
+        assertEquals(false, fixture.vm.parkingPage.value.mode)
+        assertNull(fixture.vm.parkingPage.value.error)
+        assertTrue(fixture.vm.state.value.driveEnabled)
+        val owner = fixture.bridge.requests.filter { it.optString("cmd") == "parking_settings" }
+        assertEquals(listOf("read", "currents"), owner.map { it.getString("op") })
+        assertTrue(owner.all { it.getInt("schemaVersion") == 2 && it.getString("parkingSemantics") == PARKING_CURRENT_SEMANTICS })
+        assertEquals(0, owner.last().getInt("leftRaw"))
+        assertEquals(0, owner.last().getInt("rightRaw"))
+        assertTrue(fixture.bridge.requests.none { it.optString("op") == "mode" })
+    }
+
+    @Test fun unknownCurrentReadbackIsNotReplacedByLaterCachedHeartbeatNumbers() = runBlocking {
+        var unknownFromSequence = Long.MAX_VALUE
+        val fixture = startFixture(networkGrace = true, holdSequence = 2, unifiedParking = true,
+            transformAck = { request, ack ->
+                if (request.optString("op") == "currents") {
+                    unknownFromSequence = request.getLong("seq")
+                    ack.getJSONObject("parkingResult").put("ok", false).put("errorCode", "readback_mismatch")
+                        .put("leftRaw", JSONObject.NULL).put("rightRaw", 500)
+                        .put("mode", JSONObject.NULL).put("modeSource", "unknown")
+                        .put("results", JSONArray()
+                            .put(JSONObject().put("side", "left").put("status", "unknown")
+                                .put("requestedRaw", 800).put("actualRaw", JSONObject.NULL))
+                            .put(JSONObject().put("side", "right").put("status", "not_attempted")
+                                .put("requestedRaw", 900).put("actualRaw", 500)))
+                }
+                if (request.getLong("seq") >= unknownFromSequence) ack
+                    .put("parkingLeftCurrentAmps", 5.0).put("parkingRightCurrentAmps", 5.0)
+                    .put("parkingMode", JSONObject.NULL).put("parkingModeSource", "unknown")
+            })
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            fixture.vm.editParkingLeft("8"); fixture.vm.editParkingRight("9"); fixture.vm.saveParkingCurrents()
+        }
+        fixture.bridge.releaseInitialAckIfPending()
+        withTimeout(3_000) { fixture.vm.parkingPage.first { !it.busy && it.error != null } }
+        withTimeout(3_000) {
+            while (fixture.bridge.requests.none { it.getLong("seq") >= unknownFromSequence + 2 }) delay(10)
+        }
+        assertNull(fixture.vm.parkingPage.value.leftCurrentAmps)
+        assertEquals(5.0, fixture.vm.parkingPage.value.rightCurrentAmps)
+        assertFalse(fixture.vm.parkingPage.value.valuesCurrent)
+        assertEquals("8", fixture.vm.parkingPage.value.draftLeft)
+        assertTrue(fixture.vm.state.value.driveEnabled)
+        assertNull(fixture.vm.state.value.driveFirstFailure)
     }
 
     private suspend fun startFixture(networkGrace: Boolean = false, blockWrite: Boolean = false,
@@ -601,7 +665,6 @@ class DriveStartupStateTest {
         private var expectedSequence = 1L
         private var token = tokenFor(1)
         private var parkingEnabled = false
-        private var parkingMode: Boolean? = null
         private var leftCurrentRaw = 500
         private var rightCurrentRaw = 500
         @Volatile private var connected = false
@@ -622,6 +685,8 @@ class DriveStartupStateTest {
                 .withDriveSafetyFixture()
             if (networkGrace) ready.put("networkGraceMs", 5_000)
             if (unifiedParking) ready.put("unifiedParkingSupported", true)
+                .put("parkingSemantics", PARKING_CURRENT_SEMANTICS).put("parkingMode", true)
+                .put("parkingModeSource", "current_readback")
             replies.append(ready)
         }
         override fun getInputStream(): InputStream = replies
@@ -655,10 +720,9 @@ class DriveStartupStateTest {
         }
         private fun acknowledge(request: JSONObject) {
             when (request.getString("cmd")) {
-                "parking" -> { parkingEnabled = request.getBoolean("parkingEnabled"); parkingMode = if (parkingEnabled) true else null }
-                "close", "estop" -> { parkingEnabled = false; parkingMode = null }
+                "parking" -> { parkingEnabled = request.getBoolean("parkingEnabled") }
+                "close", "estop" -> { parkingEnabled = false }
                 "parking_settings" -> when (request.getString("op")) {
-                    "mode" -> { parkingEnabled = request.getBoolean("enabled"); parkingMode = parkingEnabled }
                     "currents" -> { leftCurrentRaw = request.getInt("leftRaw"); rightCurrentRaw = request.getInt("rightRaw") }
                 }
             }
@@ -670,14 +734,17 @@ class DriveStartupStateTest {
                 .put("parkingLeftCurrentAmps", leftCurrentRaw / 100.0)
                 .put("parkingRightCurrentAmps", rightCurrentRaw / 100.0)
             if (networkGrace) ack.put("recoveryRequired", false)
+            val parkingMode = parkingCurrentMode(leftCurrentRaw, rightCurrentRaw)
             if (unifiedParking) ack.put("parkingMode", parkingMode ?: JSONObject.NULL)
-                .put("parkingModeSource", if (parkingMode == null) "unknown" else "manual_session")
+                .put("parkingSemantics", PARKING_CURRENT_SEMANTICS).put("parkingModeSource", "current_readback")
             if (request.getString("cmd") == "parking_settings") {
                 val op = request.getString("op")
-                val result = JSONObject().put("type", "parking").put("schemaVersion", 1)
+                check(request.getInt("schemaVersion") == 2 && request.getString("parkingSemantics") == PARKING_CURRENT_SEMANTICS)
+                val result = JSONObject().put("type", "parking").put("schemaVersion", 2)
+                    .put("parkingSemantics", PARKING_CURRENT_SEMANTICS)
                     .put("requestId", request.getLong("seq").toString()).put("op", op).put("ok", true)
                     .put("simulation", true).put("mode", parkingMode ?: JSONObject.NULL)
-                    .put("modeSource", if (parkingMode == null) "unknown" else "manual_session")
+                    .put("modeSource", "current_readback")
                     .put("leftRaw", leftCurrentRaw).put("rightRaw", rightCurrentRaw).put("maxRaw", 6000)
                     .put("leftRpm", 0).put("rightRpm", 0).put("leftError", 0).put("rightError", 0)
                     .put("writeMayHaveOccurred", op != "read").put("errorCode", JSONObject.NULL)

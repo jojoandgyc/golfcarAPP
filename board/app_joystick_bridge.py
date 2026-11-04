@@ -23,7 +23,8 @@ import threading
 import time
 from typing import Any
 
-from app_parking_settings import DriverIO, SimulatedIO, execute as execute_parking, validate_request as validate_parking_request, response as parking_response
+from app_parking_settings import (DriverIO, SimulatedIO, PARKING_SEMANTICS,
+    current_state, execute as execute_parking, response as parking_response)
 
 try:
     from app_diagnostic_log import DiagnosticLog, NullDiagnosticLog
@@ -132,8 +133,7 @@ class Motors:
         self.ir_latched_directions: set[str] = set()
         self.parking_enabled = False
         self.emergency_hold = True
-        self.parking_mode_override: int | None = None
-        self.parking_command_state: bool | None = None
+        self.parking_left_current_known = self.parking_right_current_known = client is None
         self.parking_input_release_required = False
         self.parking_hardware_failure: str | None = None
         self.parking_simulation = None
@@ -163,10 +163,7 @@ class Motors:
         previous = self.last_target
         if emergency:
             self.emergency_hold = True
-            self.parking_mode_override = None
-            self.parking_command_state = None
-        mode = (1 if emergency else self.parking_mode_override if self.parking_mode_override is not None
-                else 0 if self.parking_enabled else 1)
+        mode = 1 if emergency or not self.parking_enabled else 0
         errors = []
         if self.client is not None:
             for name, operation in (
@@ -391,6 +388,7 @@ class Motors:
                        for value in values) or values[2] <= 0:
                     raise SessionError("Invalid saved parking/current-limit configuration")
                 self.parking_left_current, self.parking_right_current, self.parking_max_current = map(float, values)
+                self.parking_left_current_known = self.parking_right_current_known = True
             except Exception as error:
                 self._trip(f"Parking configuration read failed: {type(error).__name__}: {error}")
         # Config reads may consume a few transactions; READY still needs fresh feedback.
@@ -469,7 +467,7 @@ class Motors:
         if release_interlock:
             self.requested_target = (0, 0)
             self.ir_latched_directions.clear()
-            self.emergency_hold = emergency or (self.standstill_pending and self.parking_mode_override is None)
+            self.emergency_hold = emergency or self.standstill_pending
         if refresh:
             try:
                 self._write_stop(emergency=emergency or self.emergency_hold)
@@ -486,6 +484,10 @@ class Motors:
             self.stop(release_interlock=False)
 
     def set_parking(self, enabled: bool) -> None:
+        """Deprecated internal stop-policy fixture; no protocol command exposes it.
+
+        This legacy mode selection is not the saved-current parking state.
+        """
         self._require_healthy()
         transaction_deadline = time.monotonic() + PARKING_TRANSACTION_SECONDS
         if type(enabled) is not bool:
@@ -502,8 +504,6 @@ class Motors:
             raise SessionError("Parking current must be configured for both motors within the output-current limit")
         self.diagnostic.event("parking.mode_requested", critical=True, enabled=enabled,
                               **self.parking_state(), **self.feedback_state())
-        self.parking_mode_override = None
-        self.parking_command_state = True if enabled else None
         self.parking_enabled = enabled
         self.emergency_hold = not enabled
         # Both ON and OFF reissue zero speed and stop; never modify current parameters.
@@ -530,9 +530,9 @@ class Motors:
             # Normal App callers enqueue a separate neutral command before this read.
             result = parking_response(request)
             result.update(simulation=self.client is None, errorCode='motion_targets_active',
-                mode=self.parking_command_state,
-                modeSource='manual_session' if self.parking_command_state is not None else 'unknown',
-                leftRaw=round(self.parking_left_current*100), rightRaw=round(self.parking_right_current*100),
+                **self.parking_current_state(),
+                leftRaw=round(self.parking_left_current*100) if self.parking_left_current_known else None,
+                rightRaw=round(self.parking_right_current*100) if self.parking_right_current_known else None,
                 maxRaw=round(self.parking_max_current*100), leftRpm=self.feedback[0],rightRpm=self.feedback[1],
                 leftError=self.feedback[2],rightError=self.feedback[3])
             return result
@@ -549,8 +549,7 @@ class Motors:
                                  0x58: round(self.parking_max_current * 100)})
         else:
             io = DriverIO(self.client)
-        result = execute_parking(request, io, self.parking_command_state,
-            'manual_session', allow_sequence_id=True)
+        result = execute_parking(request, io, allow_sequence_id=True)
         result['simulation'] = self.client is None
         if request['op'] == 'read' and self.last_target != (0, 0):
             result.update(ok=False, errorCode='motion_targets_active')
@@ -558,6 +557,13 @@ class Motors:
                                ('maxRaw', 'parking_max_current')):
             if result[key] is not None:
                 setattr(self, attribute, result[key] / 100.0)
+                if key != 'maxRaw':
+                    setattr(self, attribute + '_known', True)
+            elif key != 'maxRaw' and any(entry['side'] + 'Raw' == key and entry['status'] == 'unknown'
+                                        for entry in result['results']):
+                # A timed-out write may have changed the register. Do not label its
+                # stale legacy numeric cache as a current observation.
+                setattr(self, attribute + '_known', False)
         if request['op'] != 'read' and result['writeMayHaveOccurred']:
             self.last_target = (0, 0)
             self.requested_target = (0, 0)
@@ -567,18 +573,13 @@ class Motors:
             if previous_target != (0, 0) or self.stop_requested_at is None:
                 self.stop_requested_at = started
             self.zero_samples, self.last_zero_at = 0, None
-        if result['ok'] and request['op'] == 'mode':
-            self.parking_enabled = request['enabled']
-            self.parking_mode_override = 0 if request['enabled'] else 2
-            self.parking_command_state = request['enabled']
-            self.emergency_hold = False
         if all(result[k] is not None for k in ('leftRpm','rightRpm','leftError','rightError')):
             self.feedback = (result['leftRpm'],result['rightRpm'],result['leftError'],result['rightError'])
             self.feedback_at = getattr(io, 'feedback_observed_at', None)
             # These observations are not the spaced zero pair used by physical-stop confirmation.
             self.zero_samples, self.last_zero_at = 0, None
         hard_codes = {'parking_io_failed', 'invalid_feedback', 'zero_target_unconfirmed',
-                      'mode_write_unconfirmed', 'motor_fault', 'readback_mismatch', 'parking_transaction_timeout'}
+                      'motor_fault', 'readback_mismatch', 'parking_transaction_timeout'}
         code = result['errorCode']
         if code in hard_codes:
             self.parking_hardware_failure = code
@@ -588,16 +589,24 @@ class Motors:
                 self._write_stop(emergency=True)
             except Exception:
                 pass
-            result.update(mode=None,modeSource='unknown')
         self.diagnostic.event('parking.settings_result', critical=True, op=request['op'],
             ok=result['ok'], errorCode=result['errorCode'], writeMayHaveOccurred=result['writeMayHaveOccurred'],
             mode=result['mode'], modeSource=result['modeSource'], results=result['results'])
         return result
 
+    def parking_current_state(self) -> dict[str, Any]:
+        return current_state(
+            round(self.parking_left_current * 100) if self.parking_left_current_known else None,
+            round(self.parking_right_current * 100) if self.parking_right_current_known else None)
+
     def parking_state(self) -> dict[str, Any]:
+        observed = self.parking_current_state()
+        # parkingEnabled is the legacy stop-policy flag for old protocol readers.
+        # New clients use parkingMode plus the actual per-side currents exclusively.
         return {"parkingEnabled": self.parking_enabled,
-                "parkingMode": self.parking_command_state,
-                "parkingModeSource": "manual_session" if self.parking_command_state is not None else "unknown",
+                "parkingSemantics": PARKING_SEMANTICS,
+                "parkingMode": observed["mode"],
+                "parkingModeSource": observed["modeSource"],
                 "parkingLeftCurrentAmps": self.parking_left_current,
                 "parkingRightCurrentAmps": self.parking_right_current,
                 "parkingMaxCurrentAmps": self.parking_max_current, "parkingCurrentReadOnly": True}
@@ -608,7 +617,7 @@ def validate_request_keys(message: Any) -> None:
         raise SessionError("Request must be a JSON object")
     if message.get("cmd") == "parking_settings":
         extra = {"enabled"} if message.get("op") == "mode" else {"leftRaw", "rightRaw"} if message.get("op") == "currents" else set()
-        expected = REQUEST_KEYS | {"op"} | extra
+        expected = REQUEST_KEYS | {"op", "schemaVersion", "parkingSemantics"} | extra
     else:
         expected = PARKING_REQUEST_KEYS if message.get("cmd") == "parking" else REQUEST_KEYS
     if set(message) != expected:
@@ -700,15 +709,17 @@ class ProtocolSession:
         neutral = command == "stop" or (command == "drive" and (left, right) == (0, 0))
         parking_result = None
         if command == "parking_settings":
-            parking_request = {"schemaVersion": 1, "requestId": str(seq),
-                **{key: value for key, value in message.items() if key not in REQUEST_KEYS}}
-            validate_parking_request(parking_request, allow_sequence_id=True)
+            if message["parkingSemantics"] != PARKING_SEMANTICS:
+                raise SessionError("Unsupported parking semantics")
+            parking_request = {"requestId": str(seq),
+                **{key: value for key, value in message.items()
+                   if key not in REQUEST_KEYS | {"parkingSemantics"}}}
             parking_result = self.motors.unified_parking(parking_request)
             if self.motors.last_target is None:
                 raise SessionError("Unified parking zero target could not be confirmed")
             left, right = self.motors.last_target
         elif command == "parking":
-            self.motors.set_parking(message["parkingEnabled"])
+            raise SessionError("Legacy parking mode is unsupported; set explicit currents")
         elif closing:
             self.motors.shutdown()
         elif recovering:
@@ -992,8 +1003,10 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             standstill_heartbeat = response["standstillPending"] and (
                 message["cmd"] == "stop" or
                 message["cmd"] == "drive" and (message["left"], message["right"]) == (0, 0))
-            denied_moving_read = (response.get("parkingResult", {}).get("errorCode") == "motion_targets_active")
-            if not denied_moving_read and (not session.recovery_active or standstill_heartbeat):
+            parking_result = response.get("parkingResult", {})
+            denied_without_stop = bool(parking_result) and (not parking_result["ok"] and
+                not parking_result["writeMayHaveOccurred"])
+            if not denied_without_stop and (not session.recovery_active or standstill_heartbeat):
                 deadline = (completed if parking else received) + WATCHDOG_SECONDS
                 session_deadline = (completed if parking else received) + NETWORK_GRACE_SECONDS
                 motion_expired = False

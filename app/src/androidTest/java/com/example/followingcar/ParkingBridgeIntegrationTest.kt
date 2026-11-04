@@ -29,17 +29,19 @@ class ParkingBridgeIntegrationTest {
             withTimeout(30_000) {
                 val initial = client.parkingRequest(ParkingRequest("read"), simulation = true)
                 assertTrue(initial.ok && initial.simulation)
-                assertNull(initial.mode)
+                assertEquals(true, initial.mode)
+                assertEquals("current_readback", initial.modeSource)
                 val changed = client.parkingRequest(ParkingRequest("currents", leftRaw = 500, rightRaw = 600), simulation = true)
                 assertTrue(changed.errorCode, changed.ok)
                 assertEquals(500, changed.leftRaw); assertEquals(600, changed.rightRaw)
                 assertTrue(changed.results.all { it.status == "verified" })
-                for (on in listOf(true, false)) {
-                    val result = client.parkingRequest(ParkingRequest("mode", enabled = on), simulation = true)
-                    assertTrue(result.errorCode, result.ok)
-                    assertEquals(on, result.mode)
-                    assertEquals("command_ack", result.modeSource)
-                }
+                val disabled = client.parkingRequest(ParkingRequest("currents", leftRaw = 0, rightRaw = 0), simulation = true)
+                assertTrue(disabled.errorCode, disabled.ok)
+                assertEquals(false, disabled.mode)
+                assertEquals(0, disabled.leftRaw); assertEquals(0, disabled.rightRaw)
+                val mixed = client.parkingRequest(ParkingRequest("currents", leftRaw = 0, rightRaw = 600), simulation = true)
+                assertTrue(mixed.ok)
+                assertNull(mixed.mode)
                 assertTrue(client.isConnected)
             }
         } finally { client.disconnect() }
@@ -58,12 +60,16 @@ class ParkingBridgeIntegrationTest {
                 val changed = control.parkingSettings(ParkingRequest("currents", leftRaw = 500, rightRaw = 600))
                 assertTrue(changed.parkingResult!!.ok)
                 assertEquals(600, changed.parkingResult!!.rightRaw)
-                for (on in listOf(true, false)) {
-                    val mode = control.parkingSettings(ParkingRequest("mode", enabled = on))
-                    assertTrue(mode.parkingResult!!.ok)
-                    assertEquals(on, mode.parkingMode)
-                    assertEquals(on, control.exchange(0, 0).parkingMode)
-                }
+                val disabled = control.parkingSettings(ParkingRequest("currents", leftRaw = 0, rightRaw = 0))
+                assertTrue(disabled.parkingResult!!.ok)
+                assertEquals(false, disabled.parkingMode)
+                assertEquals(false, control.exchange(0, 0).parkingMode)
+                val mixed = control.parkingSettings(ParkingRequest("currents", leftRaw = 0, rightRaw = 600))
+                assertTrue(mixed.parkingResult!!.ok)
+                assertNull(mixed.parkingMode)
+                val readAgain = control.parkingSettings(ParkingRequest("read")).parkingResult!!
+                assertEquals(0, readAgain.leftRaw); assertEquals(600, readAgain.rightRaw)
+                assertNull(readAgain.mode)
                 assertTrue(control.stopAndClose().stopped)
                 assertTrue(client.isConnected)
             }

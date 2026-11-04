@@ -21,12 +21,12 @@ class BoardParkingProtocolTest {
     private val channels = mutableListOf<BoardDriveChannel>()
     @After fun close() { channels.forEach { it.close("parking_protocol_test") } }
 
-    @Test fun idleReadKeepsUnknownModeAndSigned32BitSpeed() {
+    @Test fun idleReadDerivesEnabledFromCurrentsAndPreservesSigned32BitSpeed() {
         val request = ParkingRequest("read")
         val json = result("id", request).put("leftRpm", -110000).put("rightRpm", 110000)
         val reply = parseParkingReply(json, "id", request, simulation = true)
-        assertNull(reply.mode)
-        assertEquals("unknown", reply.modeSource)
+        assertEquals(true, reply.mode)
+        assertEquals("current_readback", reply.modeSource)
         assertEquals(-110000, reply.leftRpm)
         assertEquals(110000, reply.rightRpm)
         assertFalse(reply.writeMayHaveOccurred)
@@ -46,13 +46,16 @@ class BoardParkingProtocolTest {
     }
 
     @Test fun simulationIdentityTypesAndUnmatchedReadbackAreRejected() {
-        val request = ParkingRequest("mode", enabled = true)
+        val request = ParkingRequest("read")
         val invalid = listOf(result("id", request).put("simulation", false),
             result("id", request).put("simulation", "true"),
             result("id", request).put("requestId", "other"),
             result("id", request).put("mode", false),
             result("id", request).put("leftRaw", 1.5),
-            result("id", request).put("modeSource", "unknown"))
+            result("id", request).put("modeSource", "unknown"),
+            result("id", request).put("schemaVersion", 1),
+            result("id", request).put("parkingSemantics", "stop_mode"),
+            result("id", request).put("modeSource", "command_ack"))
         invalid.forEach { assertTrue(runCatching { parseParkingReply(it, "id", request, true) }.isFailure) }
         val read = ParkingRequest("read")
         assertTrue(runCatching { parseParkingReply(result("id", read).put("writeMayHaveOccurred", true), "id", read, true) }.isFailure)
@@ -63,6 +66,7 @@ class BoardParkingProtocolTest {
         val unavailable = result("id", read).put("ok", false).put("errorCode", "control_busy")
         listOf("leftRaw", "rightRaw", "maxRaw", "leftRpm", "rightRpm", "leftError", "rightError")
             .forEach { unavailable.put(it, JSONObject.NULL) }
+        unavailable.put("mode", JSONObject.NULL).put("modeSource", "unknown")
         assertNull(parseParkingReply(unavailable, "id", read, true).leftRaw)
         val request = ParkingRequest("currents", leftRaw = 800, rightRaw = 900)
         val partial = result("id", request).put("ok", false).put("errorCode", "readback_mismatch")
@@ -75,9 +79,9 @@ class BoardParkingProtocolTest {
         assertTrue(parkingReplyError(reply).contains("回读"))
     }
 
-    @Test fun modeCommandConfirmsWhileMovingWithoutClaimingStandstill() = runBlocking {
-        val request = ParkingRequest("mode", enabled = true)
-        val response = ack(1).put("parkingEnabled", true).put("parkingMode", true).put("parkingModeSource", "manual_session").put("stopped", false)
+    @Test fun currentWriteConfirmsWhileMovingWithoutClaimingStandstill() = runBlocking {
+        val request = ParkingRequest("currents", leftRaw = 425, rightRaw = 550)
+        val response = ack(1).put("parkingLeftCurrentAmps", 4.25).put("parkingRightCurrentAmps", 5.5).put("stopped", false)
             .put("feedbackLeftRpm", 7).put("feedbackRightRpm", -3).put("feedbackSamples", 0)
             .put("parkingResult", result("1", request).put("leftRpm", 7).put("rightRpm", -3))
         val control = open(ready(), response)
@@ -88,28 +92,26 @@ class BoardParkingProtocolTest {
         assertTrue(control.isOpen)
     }
 
-    @Test fun negotiatedPendingModeAndZeroCurrentPersistWithoutDiscardingRecoveryLock() = runBlocking {
-        val on = ParkingRequest("mode", enabled = true)
+    @Test fun mixedCurrentAndEmergencyModePreserveRecoveryLockWithoutClaimingBothSidesEnabled() = runBlocking {
         val currents = ParkingRequest("currents", leftRaw = 0, rightRaw = 500)
-        fun pending(json: JSONObject) = json.put("parkingEnabled", true).put("parkingMode", true)
-            .put("parkingModeSource", "manual_session").put("recoveryRequired", true)
+        fun pending(json: JSONObject) = json.put("parkingMode", JSONObject.NULL)
+            .put("parkingLeftCurrentAmps", 0.0).put("recoveryRequired", true)
             .put("feedbackRecheck", true).put("standstillPending", true)
-        val control = open(ready(), pending(ack(1)).put("parkingResult", result("1", on)),
-            pending(ack(2)).put("parkingLeftCurrentAmps", 0.0)
-                .put("parkingResult", result("2", currents).put("mode", true).put("modeSource", "manual_session")),
-            pending(ack(3)).put("parkingLeftCurrentAmps", 0.0))
-        assertTrue(control.parkingSettings(on).standstillPending)
+        val control = open(ready(), pending(ack(1)).put("parkingResult", result("1", currents)),
+            pending(ack(2)))
         assertEquals(0.0, control.parkingSettings(currents).parking?.leftCurrentAmps)
         val heartbeat = control.exchange(0, 0)
         assertTrue(heartbeat.standstillPending && heartbeat.recoveryRequired)
-        assertTrue(heartbeat.parking?.enabled == true)
+        assertNull(heartbeat.parkingMode)
+        assertEquals("current_readback", heartbeat.parkingModeSource)
+        assertFalse(heartbeat.parking!!.enabled) // Legacy emergency selection is a separate fact.
         assertTrue(control.isOpen)
     }
 
     @Test fun softOperationRefusalKeepsOwnerSessionAndNextHeartbeatUsable() = runBlocking {
-        val request = ParkingRequest("mode", enabled = true)
+        val request = ParkingRequest("read")
         val refused = result("1", request).put("ok", false).put("errorCode", "external_control_source")
-            .put("mode", false).put("modeSource", "manual_session").put("writeMayHaveOccurred", false)
+            .put("writeMayHaveOccurred", false)
         val control = open(ready(), ack(1).put("parkingResult", refused), ack(2))
         assertFalse(requireNotNull(control.parkingSettings(request).parkingResult).ok)
         assertTrue(control.exchange(0, 0).stopped)
@@ -119,7 +121,6 @@ class BoardParkingProtocolTest {
     @Test fun movingReadRefusalReportsRealTargetInsteadOfPretendingToStop() = runBlocking {
         val request = ParkingRequest("read")
         val refused = result("1", request).put("ok", false).put("errorCode", "motion_targets_active")
-            .put("mode", false).put("modeSource", "manual_session")
         val control = open(ready(), ack(1).put("left", 10).put("right", 10).put("targetStopped", false)
             .put("stopped", false).put("parkingResult", refused), ack(2))
         val received = control.parkingSettings(request)
@@ -130,13 +131,37 @@ class BoardParkingProtocolTest {
 
     @Test fun changingMaxCurrentOrUnnegotiatedCapabilityIsRejected() = runBlocking {
         val request = ParkingRequest("read")
-        val old = open(ready().put("unifiedParkingSupported", false))
+        val oldReady = ready().apply { remove("parkingSemantics") }
+        val old = open(oldReady)
         assertTrue(runCatching { old.parkingSettings(request) }.isFailure)
         assertTrue(old.isOpen)
         val bad = open(ready(), ack(1).put("parkingMaxCurrentAmps", 50.0)
             .put("parkingResult", result("1", request).put("maxRaw", 5000)))
         assertTrue(runCatching { bad.parkingSettings(request) }.isFailure)
         assertFalse(bad.isOpen)
+    }
+
+    @Test fun zeroMixedAndPositiveReadbacksCannotBeConfusedWithLegacyStopMode() {
+        val read = ParkingRequest("read")
+        for ((left, right, expected) in listOf(Triple(0, 0, false), Triple(0, 500, null),
+            Triple(500, 0, null), Triple(425, 550, true))) {
+            val json = result("id", read).put("leftRaw", left).put("rightRaw", right)
+                .put("mode", expected ?: JSONObject.NULL)
+            assertEquals(expected, parseParkingReply(json, "id", read, true).mode)
+            assertTrue(runCatching { parseParkingReply(json.put("mode", expected != true), "id", read, true) }.isFailure)
+        }
+        assertTrue(runCatching { ParkingRequest("mode") }.isFailure)
+    }
+
+    @Test fun emergencyDoesNotReportPositiveParkingConfigurationAsDisabled() = runBlocking {
+        val control = open(ready(), ack(1))
+        assertTrue(runCatching { control.configureParking(ParkingSettings(true, 5.0, 5.0, 60.0)) }.isFailure)
+        assertTrue(control.isOpen)
+        val stopped = control.exchange(0, 0, emergency = true)
+        assertTrue(stopped.stopped)
+        assertEquals(true, stopped.parkingMode)
+        assertFalse(stopped.parking!!.enabled)
+        assertEquals(5.0, stopped.parking.leftCurrentAmps, 0.0)
     }
 
     @Test fun partialWriteResultSurvivesAHardMotorFaultWithoutKeepingControlAlive() = runBlocking {
@@ -154,10 +179,29 @@ class BoardParkingProtocolTest {
         assertFalse(control.isOpen)
     }
 
+    @Test fun partialUnknownCurrentDoesNotTurnCachedNumbersIntoConfirmedStateOrCloseHealthyOwner() = runBlocking {
+        val request = ParkingRequest("currents", leftRaw = 800, rightRaw = 900)
+        val partial = result("1", request).put("ok", false).put("errorCode", "readback_mismatch")
+            .put("leftRaw", JSONObject.NULL).put("rightRaw", 500)
+            .put("mode", JSONObject.NULL).put("modeSource", "unknown")
+            .put("results", JSONArray().put(row("left", "unknown", 800, null))
+                .put(row("right", "not_attempted", 900, 500)))
+        fun unknown(json: JSONObject) = json.put("parkingMode", JSONObject.NULL).put("parkingModeSource", "unknown")
+        val control = open(ready(), unknown(ack(1)).put("parkingResult", partial), unknown(ack(2)))
+        val received = control.parkingSettings(request)
+        assertFalse(requireNotNull(received.parkingResult).ok)
+        assertNull(received.parkingResult.leftRaw)
+        assertNull(received.parkingMode)
+        assertEquals("unknown", control.exchange(0, 0).parkingModeSource)
+        assertTrue(control.isOpen)
+    }
+
     private fun result(id: String, request: ParkingRequest) = JSONObject()
-        .put("type", "parking").put("schemaVersion", 1).put("requestId", id).put("op", request.op)
-        .put("ok", true).put("simulation", true).put("mode", request.enabled ?: JSONObject.NULL)
-        .put("modeSource", if (request.enabled == null) "unknown" else "command_ack")
+        .put("type", "parking").put("schemaVersion", 2).put("requestId", id).put("op", request.op)
+        .put("parkingSemantics", PARKING_CURRENT_SEMANTICS)
+        .put("ok", true).put("simulation", true)
+        .put("mode", parkingCurrentMode(request.leftRaw ?: 500, request.rightRaw ?: 500) ?: JSONObject.NULL)
+        .put("modeSource", "current_readback")
         .put("leftRaw", request.leftRaw ?: 500).put("rightRaw", request.rightRaw ?: 500).put("maxRaw", 6000)
         .put("leftRpm", 0).put("rightRpm", 0).put("leftError", 0).put("rightError", 0)
         .put("writeMayHaveOccurred", request.op != "read").put("errorCode", JSONObject.NULL)
@@ -170,10 +214,12 @@ class BoardParkingProtocolTest {
     private fun ready() = JSONObject().put("type", "ready").put("token", token(1))
         .put("port", "synthetic-only").put("dryRun", true).put("watchdogMs", 600).put("maxRpm", 100)
         .put("networkGraceMs", 5000).put("unifiedParkingSupported", true).withDriveSafetyFixture()
+        .put("parkingSemantics", PARKING_CURRENT_SEMANTICS).put("parkingMode", true).put("parkingModeSource", "current_readback")
     private fun ack(sequence: Int) = JSONObject().put("type", "ack").put("seq", sequence)
         .put("token", token(sequence + 1)).put("left", 0).put("right", 0)
-        .put("recoveryRequired", false).put("parkingMode", JSONObject.NULL)
-        .put("parkingModeSource", "unknown").withDriveSafetyFixture()
+        .put("recoveryRequired", false).put("parkingMode", true)
+        .put("parkingSemantics", PARKING_CURRENT_SEMANTICS)
+        .put("parkingModeSource", "current_readback").withDriveSafetyFixture()
     private fun token(value: Int) = value.toString(16).padStart(32, '0')
     private suspend fun open(vararg responses: JSONObject): BoardDriveChannel {
         val channel = object : ChannelExec() {

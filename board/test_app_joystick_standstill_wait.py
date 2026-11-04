@@ -45,7 +45,9 @@ class StandstillWaitTests(unittest.TestCase):
 
     def begin_normal_stop(self):
         self.session.ready()
-        self.session.accept(parking_request(self.session, True))
+        # Select the historical normal-stop policy directly for this safety fixture.
+        # There is no supported wire-level parking mode switch.
+        self.motors.set_parking(True)
         self.request("drive", 20, -20)
         self.client.feedback = (53, -34, 0, 0)
         self.request()
@@ -198,14 +200,14 @@ class StandstillWaitTests(unittest.TestCase):
             self.motors.poll_safety()
         self.assertIsNotNone(self.motors.fault_reason)
 
-    def test_parking_cannot_cancel_emergency_before_neutral_even_after_two_zeros(self):
+    def test_retired_mode_command_cannot_cancel_emergency_or_pending_recovery(self):
         self.enter_wait()
         self.client.feedback = (0, 0, 0, 0)
         for _ in range(2):
             self.clock.sleep(.11)
             self.request("drive", 40, -40)
         self.client.calls.clear()
-        with self.assertRaisesRegex(bridge.SessionError, "standstill recovery"):
+        with self.assertRaisesRegex(bridge.SessionError, "Legacy parking mode is unsupported"):
             self.session.accept(parking_request(self.session, True))
         self.assertFalse(self.motors.parking_enabled)
         self.assertTrue(self.motors.emergency_hold)
@@ -295,7 +297,7 @@ class SessionWaitTests(unittest.TestCase):
         client = CoastClient()
         client.registers.update(left_parking_current=2.0, right_parking_current=2.0)
         original = copy.deepcopy(client.registers)
-        actions = [dict(at=.05, cmd="parking"), dict(at=.2, cmd="drive", left=20, right=-20),
+        actions = [dict(at=.05, cmd="stop", normal_policy_fixture=True), dict(at=.2, cmd="drive", left=20, right=-20),
                    dict(at=.3, cmd="stop")]
         actions += [dict(at=n / 10, cmd="stop") for n in range(4, 20)]
         if held_after_wait:
@@ -334,11 +336,12 @@ class SessionWaitTests(unittest.TestCase):
                 self.advance(epoch[0] + action["at"])
                 if "feedback" in action:
                     client.feedback = action["feedback"]
+                if action.get("normal_policy_fixture"):
+                    # Offline state setup only; no legacy mode command is submitted.
+                    motors.set_parking(True)
                 self.index += 1
                 request = dict(seq=self.index, token=messages[-1]["token"], cmd=action["cmd"],
                                left=action.get("left", 0), right=action.get("right", 0))
-                if action["cmd"] == "parking":
-                    request["parkingEnabled"] = True
                 return json.dumps(request).encode()
 
         motors = bridge.Motors(client)
