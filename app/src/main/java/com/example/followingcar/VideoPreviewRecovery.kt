@@ -1,9 +1,12 @@
 package com.example.followingcar
 
+/** Scoped IPv6 rescue sockets are usable for SSH; WebView scoped URLs use the public video route. */
+internal val BoardUiState.usesRemoteVideo: Boolean get() = remoteMode || ':' in host
+
 /** Receiving an already-requested remote stream never grants permission to control the car. */
 internal fun BoardUiState.canPreviewVideo(remoteEndpointAvailable: Boolean): Boolean =
     videoPreviewWanted && !followBlocksControl && videoServiceState != VideoServiceState.STOPPED &&
-        (if (remoteMode) remoteEndpointAvailable else connected)
+        (if (usesRemoteVideo) remoteEndpointAvailable else connected)
 
 /** Only fixed codes reach diagnostics; never store browser messages, URLs, SDP or credentials. */
 internal fun remoteVideoFailureCode(title: String?): String? {

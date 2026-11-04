@@ -1,12 +1,16 @@
 package com.example.followingcar
 
 import android.app.Application
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.io.IOException
 import java.net.SocketTimeoutException
+import java.net.InetAddress
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,6 +46,8 @@ data class BoardUiState(
     val pairingUnconfirmed: Boolean = false,
     val pairingHotspotActive: Boolean = false,
     val status: String = "尚未连接",
+    val connectionRecoveryMessage: String? = null,
+    val connectionEndpointLabel: String? = null,
     val error: String? = null,
     val result: CommandResult? = null,
     val videoServiceState: VideoServiceState = VideoServiceState.UNKNOWN,
@@ -146,8 +152,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     internal val remoteVideo = mutableRemoteVideo.asStateFlow()
     private var followRecovery = FollowRecoverySnapshot.restore(recoveryPreferences.all)
     private val client = BoardSshClient()
+    private var authenticatedEndpoint: Pair<String, Int>? = null
     private val networkMonitor = BoardNetworkMonitor(application)
     private val reachabilityProbe = BoardReachabilityProbe()
+    private val localDiscovery by lazy { BoardLocalDiscovery(application) }
     private val localPresenceDiagnostic = Diagnostics.newContext()
     private val remotePresenceDiagnostic = Diagnostics.newContext()
     private val networkStatus = BoardNetworkStatusStore(SystemClock::elapsedRealtime)
@@ -373,9 +381,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 if (settings != currentSettings) {
                     settings = currentSettings
                     cancelNetworkProbe()
-                    networkStatus.update { it.copy(local = RouteHealth(), remote = RouteHealth(
-                        status = if (current.remoteProfile == null && !current.remoteProfileLoading)
-                            Reachability.NOT_CONFIGURED else Reachability.UNKNOWN)) }
+                    val authenticatedRoute = if (current.connected && client.isConnected && authenticatedEndpoint ==
+                            (current.connectionHost to current.connectionPort.toIntOrNull())) {
+                        if (current.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL
+                    } else null
+                    networkStatus.update { health -> health.copy(
+                        local = if (authenticatedRoute == BoardRoute.LOCAL) health.local else RouteHealth(),
+                        remote = if (authenticatedRoute == BoardRoute.REMOTE) health.remote else RouteHealth(
+                            status = if (current.remoteProfile == null && !current.remoteProfileLoading)
+                                Reachability.NOT_CONFIGURED else Reachability.UNKNOWN)) }
                     nextNetworkProbeAt = 0L
                 }
                 if (previous.connected && !current.connected && !disconnecting && !intentionalConnectionClose) {
@@ -661,7 +675,21 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update { it.copy(error = "请允许访问本地网络，App 才能连接开发板。") }
     }
 
-    fun connect(viaWifiDirect: Boolean = false) {
+    fun discoverAndConnect() {
+        if (setRemoteMode(false)) connect(discoverFirst = true)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentLocalNetwork(): Network? {
+        val manager = getApplication<Application>().getSystemService(ConnectivityManager::class.java) ?: return null
+        return manager.allNetworks.firstOrNull { network ->
+            manager.getNetworkCapabilities(network)?.let {
+                it.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && !it.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            } == true
+        }
+    }
+
+    fun connect(viaWifiDirect: Boolean = false, discoverFirst: Boolean = false) {
         val input = state.value
         val wireless = wifiDirect.state.value
         val method = when {
@@ -685,10 +713,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
         val host = input.connectionHost.trim()
         val username = input.username.trim()
-        val port = input.connectionPort.toIntOrNull()
-        if (host.isBlank() || host.any(Char::isWhitespace) || username.isBlank() ||
-            port == null || port !in 1..65535 || input.password.isEmpty()
-        ) {
+        val suppliedPort = input.connectionPort.toIntOrNull()
+        val oldEndpointValid = host.isNotBlank() && host.none(Char::isWhitespace) && suppliedPort in 1..65535
+        val port = suppliedPort?.takeIf { it in 1..65535 } ?: 22
+        if (username.isBlank() || input.password.isEmpty() || method != ConnectionMethod.LAN && !oldEndpointValid) {
             mutableState.update { it.copy(error = "请填写开发板 IP、用户名、密码，以及 1–65535 范围内的端口。") }
             return
         }
@@ -707,6 +735,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update {
             it.copy(host = if (input.remoteMode) it.host else host, username = username, busy = true, error = null, result = null,
                 followConfiguration = null, followConfigurationError = null, status = "正在连接…",
+                connectionRecoveryMessage = null, connectionEndpointLabel = null,
                 lastReadParkingSettings = null,
                 videoServiceState = VideoServiceState.UNKNOWN, videoServiceError = null)
         }
@@ -714,33 +743,96 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             var connectionAttempts = 1
             var sshEstablished = false
             try {
-                val remoteTls = if (input.remoteMode) withContext(Dispatchers.IO) {
-                    remoteCredentials.createTlsConfig()
-                } else null
-                // DHCP confirmation can precede reachability/SSH readiness. Retry connection
-                // establishment only; never repeat a remote command or resume driving.
-                val retryDelays = if (pairedAddress != null) listOf(750L, 1_500L) else listOf(300L)
-                withInitialConnectionRetry(retryDelaysMillis = retryDelays, onRetry = { attempt ->
-                    connectionAttempts = attempt
-                    Diagnostics.event("connection.retry", diagnostic, fields = mapOf("attempt" to attempt,
-                        "maxAttempts" to retryDelays.size + 1, "pairedHotspot" to (pairedAddress != null)))
-                    mutableState.update { it.copy(status = "正在重新连接（$attempt/${retryDelays.size + 1}）…") }
-                }) {
-                    ensureDirectConnectionGroup(directGroup)
-                    ensurePairingNetwork(pairedAddress)
-                    client.connect(BoardConnection(host, port, username, input.password, tls = remoteTls), diagnostic)
-                    ensureDirectConnectionGroup(directGroup)
-                    ensurePairingNetwork(pairedAddress)
+                var selectedRemote = input.remoteMode
+                var selectedHost = host
+                var selectedPort = port
+                var discovered = false
+                val canRecoverLocal = !input.remoteMode && directGroup == null && pairedAddress == null
+                if (canRecoverLocal) {
+                    val profile = input.remoteProfile?.takeIf { input.remoteProfileError == null }
+                    val recovery = recoverLocalConnection(
+                        // Re-check IPv4 after an IPv6 rescue, so local video can return to its direct path.
+                        initialEndpoint = if (discoverFirst || !oldEndpointValid || ':' in host) null
+                            else LocalBoardEndpoint(host, port, "saved", currentLocalNetwork()),
+                        discover = {
+                            localDiscovery.discover() + if (oldEndpointValid && ':' in host)
+                                listOf(LocalBoardEndpoint(host, port, "saved_ipv6", currentLocalNetwork())) else emptyList()
+                        },
+                        connectLocal = { endpoint ->
+                            client.connect(BoardConnection(endpoint.host, endpoint.port, username, input.password,
+                                localNetwork = endpoint.network), diagnostic)
+                            selectedHost = endpoint.host
+                            selectedPort = endpoint.port
+                            discovered = endpoint.source != "saved"
+                        },
+                        connectRemote = profile?.let { remote -> suspend {
+                            val tls = withContext(Dispatchers.IO) { remoteCredentials.createTlsConfig() }
+                            client.connect(BoardConnection(remote.host, remote.controlPort, username, input.password, tls), diagnostic)
+                            selectedHost = remote.host
+                            selectedPort = remote.controlPort
+                        } },
+                        onProgress = { stage, endpoint ->
+                            connectionAttempts += if (stage == LocalRecoveryStage.CANDIDATE || stage == LocalRecoveryStage.REMOTE) 1 else 0
+                            val message = when (stage) {
+                                LocalRecoveryStage.INITIAL -> "正在验证上次的小车地址…"
+                                LocalRecoveryStage.DISCOVERING -> "原地址未连接，正在同一 Wi-Fi 内寻找小车…"
+                                LocalRecoveryStage.CANDIDATE -> "正在验证发现的小车地址…"
+                                LocalRecoveryStage.REMOTE -> "局域网未连接，正在尝试公网兜底…"
+                            }
+                            mutableState.update { it.copy(status = message, connectionRecoveryMessage = message) }
+                            Diagnostics.event("connection.recovery_stage", diagnostic, fields = mapOf(
+                                "stage" to stage.name, "source" to endpoint?.source, "host" to endpoint?.host,
+                                "port" to endpoint?.port), critical = true)
+                        })
+                    selectedRemote = recovery.route == BoardRoute.REMOTE
+                    if (!selectedRemote) recovery.endpoint?.let { endpoint ->
+                        val preferred = preferLocalIpv4(endpoint, username, input.password, diagnostic)
+                        selectedHost = preferred.host
+                        selectedPort = preferred.port
+                    }
+                } else {
+                    val remoteTls = if (input.remoteMode) withContext(Dispatchers.IO) {
+                        remoteCredentials.createTlsConfig()
+                    } else null
+                    // Pairing/Direct retains its existing verified wireless lease and retry rules.
+                    val retryDelays = if (pairedAddress != null) listOf(750L, 1_500L) else listOf(300L)
+                    withInitialConnectionRetry(retryDelaysMillis = retryDelays, onRetry = { attempt ->
+                        connectionAttempts = attempt
+                        Diagnostics.event("connection.retry", diagnostic, fields = mapOf("attempt" to attempt,
+                            "maxAttempts" to retryDelays.size + 1, "pairedHotspot" to (pairedAddress != null)))
+                        mutableState.update { it.copy(status = "正在重新连接（$attempt/${retryDelays.size + 1}）…") }
+                    }) {
+                        ensureDirectConnectionGroup(directGroup)
+                        ensurePairingNetwork(pairedAddress)
+                        client.connect(BoardConnection(host, port, username, input.password, tls = remoteTls), diagnostic)
+                        ensureDirectConnectionGroup(directGroup)
+                        ensurePairingNetwork(pairedAddress)
+                    }
                 }
+                currentCoroutineContext().ensureActive()
                 sshEstablished = true
-                markBoardReachable(if (input.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
+                authenticatedEndpoint = selectedHost to selectedPort
+                markBoardReachable(if (selectedRemote) BoardRoute.REMOTE else BoardRoute.LOCAL)
                 preferences.edit().apply {
-                    if (!input.remoteMode && directGroup == null && pairedAddress == null)
-                        putString("host", host).putString("port", port.toString())
+                    if (!selectedRemote && directGroup == null && pairedAddress == null)
+                        putString("host", selectedHost).putString("port", selectedPort.toString())
+                    putBoolean("remote_mode", selectedRemote)
                     putString("username", username)
                 }.apply()
                 credentialPreferences.edit().putString("password", input.password).apply()
-                mutableState.update { it.copy(connected = true, status = "正在读取开发板信息…") }
+                val endpointLabel = (if (selectedRemote) {
+                    if (!input.remoteMode) "公网兜底" else "公网"
+                } else if (selectedHost.contains(':')) "局域网 IPv6" else "局域网") +
+                    " · ${if (':' in selectedHost) "[$selectedHost]" else selectedHost}:$selectedPort"
+                mutableState.update { it.copy(connected = true, remoteMode = selectedRemote,
+                    host = if (selectedRemote) it.host else selectedHost,
+                    port = if (selectedRemote) it.port else selectedPort.toString(),
+                    connectionEndpointLabel = endpointLabel,
+                    connectionRecoveryMessage = when {
+                        selectedRemote && !input.remoteMode -> "已自动切换公网；行驶仍需手动启用"
+                        discovered -> "已发现并验证小车，地址已更新；行驶仍需手动启用"
+                        else -> null
+                    }, status = "正在读取开发板信息…") }
                 val result = client.execute(BOARD_STATUS_COMMAND, kind = "board_status", diagnostic = diagnostic)
                 mutableState.update { it.copy(result = result, status = "已连接") }
                 refreshVideoServiceState()
@@ -760,7 +852,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     mapOf("sshEstablished" to sshEstablished, "attempts" to connectionAttempts))
                 withContext(Dispatchers.IO) { client.disconnect("connection_failed", diagnostic) }
                 mutableState.update {
-                    it.withTransportState(false).copy(status = "连接失败",
+                    it.withTransportState(false).copy(status = "连接失败", connectionRecoveryMessage = "小车连接未恢复；可重新查找或检查公网配置",
                         error = describeFailure(failure, connecting = !sshEstablished, attempts = connectionAttempts) +
                             if (pairedAddress != null && pairing.state.value.hotspotActive)
                                 " 热点已保留，可在配对卡片中核对并重新连接。" else "")
@@ -771,6 +863,58 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 if (!disconnecting) mutableState.update { it.copy(busy = false) }
             }
         }
+    }
+
+    /** Query addresses only after pinned authentication; IPv6 remains the rescue if IPv4 fails. */
+    private suspend fun preferLocalIpv4(endpoint: LocalBoardEndpoint, username: String, password: String,
+        diagnostic: DiagnosticContext): LocalBoardEndpoint {
+        if (':' !in endpoint.host) return endpoint
+        val manager = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
+        val network = endpoint.network ?: currentLocalNetwork() ?: return endpoint
+        val prefixes = manager?.getLinkProperties(network)?.linkAddresses.orEmpty()
+            .map { LocalAddressPrefix(it.address, it.prefixLength) }
+        mutableState.update { it.copy(connectionRecoveryMessage = "已验证小车，正在核对当前直连地址…") }
+        try {
+            val read = withTimeoutOrNull(6_000L) {
+                client.execute(BOARD_LAN_ADDRESSES_COMMAND, timeoutMillis = 5_000L, kind = "network_addresses",
+                    diagnostic = diagnostic, outputLimitBytes = 8192)
+            }
+            val addresses = if (read != null && !read.truncated && read.exitCode == 0)
+                parseBoardLanAddresses(read.stdout) else emptyList()
+            for (host in addresses.filter { address ->
+                    isOnLocalDiscoveryLink(InetAddress.getByName(address), prefixes) }.take(2)) {
+                try {
+                    val connected = withTimeoutOrNull(4_000L) {
+                        client.connect(BoardConnection(host, endpoint.port, username, password,
+                            localNetwork = network), diagnostic)
+                        true
+                    } == true
+                    if (connected) {
+                        Diagnostics.event("connection.local_ipv4_preferred", diagnostic,
+                            fields = mapOf("host" to host, "source" to "authenticated_network_query"), critical = true)
+                        return LocalBoardEndpoint(host, endpoint.port, "authenticated_network_query", network)
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (failure: Exception) {
+                    Diagnostics.event("connection.local_ipv4_rejected", diagnostic,
+                        fields = mapOf("exceptionType" to failure.javaClass.simpleName), critical = true)
+                }
+            }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) {
+            Diagnostics.event("connection.address_read_unavailable", diagnostic,
+                fields = mapOf("exceptionType" to failure.javaClass.simpleName), critical = true)
+        }
+        currentCoroutineContext().ensureActive()
+        if (!client.isConnected) {
+            val restored = withTimeoutOrNull(4_000L) {
+                client.connect(BoardConnection(endpoint.host, endpoint.port, username, password,
+                    localNetwork = network), diagnostic)
+                true
+            } == true
+            if (!restored) throw SocketTimeoutException("已验证的局域网救援连接暂不可用")
+        }
+        return endpoint
     }
 
     private fun ensureDirectConnectionGroup(expected: DirectNetworkLease?) {

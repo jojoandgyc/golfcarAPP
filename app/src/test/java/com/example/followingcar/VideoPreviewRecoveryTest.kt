@@ -8,6 +8,17 @@ import org.junit.Test
 
 /** Pure viewing policy. No SSH, video-service commands, credentials or Android network APIs. */
 class VideoPreviewRecoveryTest {
+    @Test fun scopedIpv6RescueUsesPublicVideoWithoutGrantingControlOrStartingVideo() {
+        val rescue = BoardUiState(host = "fe80::1234%wlan0", connected = true)
+        assertTrue(rescue.usesRemoteVideo)
+        assertFalse(rescue.canPreviewVideo(remoteEndpointAvailable = true))
+        val watching = rescue.copy(videoPreviewWanted = true, videoServiceState = VideoServiceState.RUNNING)
+        assertFalse(watching.canPreviewVideo(remoteEndpointAvailable = false))
+        assertTrue(watching.canPreviewVideo(remoteEndpointAvailable = true))
+        assertFalse(watching.manualActive)
+        assertFalse(watching.followActive)
+    }
+
     private fun remoteViewing() = BoardUiState(
         connected = true, remoteMode = true, videoServiceState = VideoServiceState.RUNNING,
         videoPreviewWanted = true,

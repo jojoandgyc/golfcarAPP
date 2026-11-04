@@ -1,5 +1,6 @@
 package com.example.followingcar
 
+import android.net.Network
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -52,6 +53,7 @@ internal fun openBoardSocket(
     port: Int,
     timeoutMillis: Int,
     tls: RemoteTlsConfig?,
+    localNetwork: Network? = null,
 ): Socket {
     if (tls != null) {
         require(requireRemoteHost(host) == requireRemoteHost(tls.serverName)) {
@@ -59,6 +61,8 @@ internal fun openBoardSocket(
         }
     }
     rawSocket.tcpNoDelay = true
+    // Bind this socket only. A local-only Wi-Fi must not be replaced by cellular/VPN routing.
+    localNetwork?.bindSocket(rawSocket)
     rawSocket.connect(InetSocketAddress(host, port), timeoutMillis)
     if (tls == null) return rawSocket
 

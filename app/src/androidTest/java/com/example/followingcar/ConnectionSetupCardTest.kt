@@ -111,6 +111,72 @@ class ConnectionSetupCardTest {
         }
     }
 
+    @Test fun discoveringRequiresAnExplicitClickAndRespectsBusyConnectionAndSelectionLocks() {
+        val actions = Actions()
+        val state = mutableStateOf(savedState())
+        val method = mutableStateOf(ConnectionMethod.LAN)
+        val blocked = mutableStateOf<String?>(null)
+        compose.setContent { FollowingCarTheme {
+            Setup(state.value, method.value, actions, selectionReason = blocked.value)
+        } }
+        compose.onNodeWithTag("connectionMethodHelp")
+            .assertTextEquals("自动发现同一Wi-Fi内的小车；地址变化时无需手动修改。")
+        compose.runOnIdle { assertEquals(0, actions.discoveries + actions.connections) }
+        compose.onNodeWithTag("connectionDiscover").assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(1, actions.discoveries); assertEquals(0, actions.connections) }
+        compose.runOnIdle { state.value = savedState().copy(busy = true) }
+        compose.onNodeWithTag("connectionDiscover").assertIsNotEnabled().performClick()
+        compose.onNodeWithTag("cancel").assertIsEnabled()
+        compose.runOnIdle { state.value = savedState().copy(connected = true) }
+        compose.onNodeWithTag("connectionDiscover").assertIsNotEnabled().performClick()
+        compose.runOnIdle { state.value = savedState(); blocked.value = "控制正在退出，请稍候。" }
+        compose.onNodeWithTag("connectionDiscover").assertIsNotEnabled().performClick()
+        compose.runOnIdle { blocked.value = null; method.value = ConnectionMethod.WIFI_DIRECT }
+        compose.onNodeWithTag("connectionDiscover").assertDoesNotExist()
+        compose.runOnIdle { method.value = ConnectionMethod.REMOTE }
+        compose.onNodeWithTag("connectionDiscover").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(1, actions.discoveries); assertEquals(0, actions.connections) }
+    }
+
+    @Test fun recoveryProgressRemainsCancellableAndSuccessShowsOnlyVerifiedEndpoint() {
+        val actions = Actions()
+        val state = mutableStateOf(savedState().copy(busy = true,
+            connectionRecoveryMessage = "正在寻找小车", connectionEndpointLabel = "局域网 · 旧地址"))
+        val method = mutableStateOf(ConnectionMethod.LAN)
+        compose.setContent { FollowingCarTheme { Setup(state.value, method.value, actions) } }
+        compose.onNodeWithTag("connectionRecoveryMessage").assertTextEquals("正在寻找小车")
+        compose.onNodeWithTag("connectionEndpoint").assertDoesNotExist()
+        compose.onNodeWithTag("cancel").assertIsEnabled().performClick()
+        compose.runOnIdle { state.value = state.value.copy(connectionRecoveryMessage = "验证备用地址") }
+        compose.onNodeWithTag("connectionRecoveryMessage").assertTextEquals("验证备用地址")
+        compose.runOnIdle {
+            method.value = ConnectionMethod.REMOTE
+            state.value = state.value.copy(busy = false, connected = true, remoteMode = true,
+                connectionRecoveryMessage = "已自动切换公网",
+                connectionEndpointLabel = "公网 · verified.example.com:2443")
+        }
+        compose.onNodeWithTag("connectionRecoveryMessage").assertDoesNotExist()
+        compose.onNodeWithTag("connectionStatus").assertTextEquals("SSH 已连接")
+        compose.onNodeWithTag("connectionTarget").assertTextEquals("公网 · verified.example.com:2443")
+        compose.onNodeWithTag("disconnect").assertIsEnabled()
+        compose.runOnIdle {
+            assertEquals(1, actions.cancels)
+            assertEquals(0, actions.discoveries + actions.connections + actions.imports + actions.disconnects)
+        }
+    }
+
+    @Test fun connectedWithoutEndpointEvidenceDoesNotInventRouteFromSelectedProfile() {
+        val actions = Actions()
+        compose.setContent { FollowingCarTheme {
+            Setup(savedState().copy(connected = true, connectionRecoveryMessage = "已自动切换公网"),
+                ConnectionMethod.REMOTE, actions)
+        } }
+        compose.onNodeWithTag("connectionTarget").assertTextEquals("连接端点待确认")
+        compose.onNodeWithTag("connectionRecoveryMessage").assertDoesNotExist()
+        compose.onNodeWithTag("connectionStatus").assertTextEquals("SSH 已连接")
+        compose.runOnIdle { assertEquals(0, actions.discoveries + actions.connections) }
+    }
+
     @Test fun blockedConnectionShowsReasonWhileMethodSelectionRemainsAvailable() {
         val actions = Actions()
         compose.setContent { FollowingCarTheme {
@@ -191,6 +257,8 @@ class ConnectionSetupCardTest {
         compose.onNodeWithTag("host").assertExists()
         compose.onNodeWithTag("username").assertExists()
         compose.onNodeWithTag("password").assertExists()
+        compose.onNodeWithTag("connectionManualAddressHelp")
+            .assertTextEquals("也可手动填写小车 IP 地址；用户名和密码仍用于登录。")
         compose.onNodeWithTag("connect").assertIsDisplayed()
         val button = compose.onNodeWithTag("connect").fetchSemanticsNode().boundsInRoot
         val host = compose.onNodeWithTag("host").fetchSemanticsNode().boundsInRoot
@@ -232,9 +300,10 @@ class ConnectionSetupCardTest {
         }
         compose.runOnIdle { state.value = savedState().copy(remoteProfile = null) }
         compose.onNodeWithTag("importRemoteProfile").assertIsDisplayed()
-        compose.runOnIdle { state.value = savedState().copy(busy = true) }
+        compose.runOnIdle { state.value = savedState().copy(busy = true, connectionRecoveryMessage = "正在寻找小车") }
         compose.onNodeWithTag("cancel").assertIsDisplayed()
-        compose.runOnIdle { state.value = savedState().copy(connected = true) }
+        compose.runOnIdle { state.value = savedState().copy(connected = true,
+            connectionEndpointLabel = "公网 · verified.example.com:2443") }
         compose.onNodeWithTag("disconnect").assertIsDisplayed()
         compose.runOnIdle {
             method.value = ConnectionMethod.LAN
@@ -257,7 +326,7 @@ class ConnectionSetupCardTest {
             onMethodChange = onMethod, onConnect = { actions.connections++ },
             onDisconnect = { actions.disconnects++ }, onCancel = { actions.cancels++ },
             onImport = { actions.imports++ }, onHostChange = {}, onPortChange = {},
-            onUsernameChange = {}, onPasswordChange = {})
+            onUsernameChange = {}, onPasswordChange = {}, onDiscover = { actions.discoveries++ })
     }
 
     private class Actions {
@@ -266,6 +335,7 @@ class ConnectionSetupCardTest {
         var disconnects = 0
         var cancels = 0
         var imports = 0
+        var discoveries = 0
     }
 
     private fun savedState() = BoardUiState(password = "test-only-password", remoteProfile = RemoteProfile(

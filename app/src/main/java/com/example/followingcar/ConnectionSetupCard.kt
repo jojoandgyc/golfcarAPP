@@ -49,6 +49,7 @@ internal fun ConnectionSetupCard(
     onPortChange: (String) -> Unit,
     onUsernameChange: (String) -> Unit,
     onPasswordChange: (String) -> Unit,
+    onDiscover: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val profile = state.remoteProfile
@@ -56,6 +57,9 @@ internal fun ConnectionSetupCard(
     val needsImport = remote && (profile == null || state.remoteProfileError != null)
     val selectionReason = selectionBlockedReason ?: state.connectionSelectionBlockReason()
     val canSelect = selectionReason == null
+    val canDiscover = canSelect && !state.connected && !state.busy
+    val actualEndpoint = state.connectionEndpointLabel?.takeIf { it.isNotBlank() }
+    val showConnectionEndpoint = state.connected && !state.busy
     val needsLoginDetails = state.username.isBlank() || state.password.isEmpty() ||
         (!remote && (state.host.isBlank() || state.port.toIntOrNull()?.let { it in 1..65535 } != true))
     var settingsExpanded by rememberSaveable(method) { mutableStateOf(needsLoginDetails) }
@@ -90,7 +94,7 @@ internal fun ConnectionSetupCard(
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.testTag("connectionStatus"),
             )
-            Text(
+            if (!showConnectionEndpoint) Text(
                 when {
                     remote && profile != null -> "${profile.host}:${profile.controlPort}"
                     remote -> "尚未导入远程配置"
@@ -129,11 +133,28 @@ internal fun ConnectionSetupCard(
                 ) { Text(if (remote) "远程连接小车" else "连接小车") }
             }
 
+            if (showConnectionEndpoint) {
+                Column(Modifier.testTag("connectionEndpoint")) {
+                    Text(actualEndpoint ?: "连接端点待确认", style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.testTag("connectionTarget"))
+                }
+            } else if (state.busy || !state.connected) {
+                state.connectionRecoveryMessage?.takeIf { it.isNotBlank() }?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.testTag("connectionRecoveryMessage"))
+                }
+            }
+            if (method == ConnectionMethod.LAN) {
+                OutlinedButton(onClick = { if (canDiscover) onDiscover() }, enabled = canDiscover,
+                    modifier = Modifier.fillMaxWidth().testTag("connectionDiscover")) {
+                    Text("重新查找小车")
+                }
+            }
             Text(when (method) {
-                ConnectionMethod.LAN -> "手机与小车接入同一路由器或手机热点。"
+                ConnectionMethod.LAN -> "自动发现同一Wi-Fi内的小车；地址变化时无需手动修改。"
                 ConnectionMethod.WIFI_DIRECT -> "由手机创建无线组，等待小车加入后连接。"
                 ConnectionMethod.REMOTE -> "手机和小车联网，经中转服务器连接。"
-            }, style = MaterialTheme.typography.bodySmall)
+            }, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("connectionMethodHelp"))
             if (state.remoteProfileLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
             selectionReason?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall,
@@ -154,6 +175,8 @@ internal fun ConnectionSetupCard(
                 Text(if (settingsExpanded) "收起登录设置" else "登录设置")
             }
             if (settingsExpanded) {
+                if (method == ConnectionMethod.LAN) Text("也可手动填写小车 IP 地址；用户名和密码仍用于登录。",
+                    style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("connectionManualAddressHelp"))
                 if (!remote) Row(horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(value = state.host, onValueChange = onHostChange,

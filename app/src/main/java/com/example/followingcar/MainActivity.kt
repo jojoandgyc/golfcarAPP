@@ -154,8 +154,13 @@ private fun BoardScreen(viewModel: BoardViewModel) {
         onDispose { view.keepScreenOn = false }
     }
     val networkPermission = "android.permission.ACCESS_LOCAL_NETWORK"
+    var pendingLocalDiscovery by rememberSaveable { mutableStateOf(false) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
-        if (allowed) viewModel.connect(viaWifiDirect = useWifiDirect && !viewModel.state.value.remoteMode) else viewModel.permissionDenied()
+        if (allowed) {
+            if (pendingLocalDiscovery) viewModel.discoverAndConnect()
+            else viewModel.connect(viaWifiDirect = useWifiDirect && !viewModel.state.value.remoteMode)
+        } else viewModel.permissionDenied()
+        pendingLocalDiscovery = false
     }
     val remoteImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(viewModel::importRemoteConfiguration)
@@ -220,6 +225,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
             useWifiDirect = false
     }
     val connect: () -> Unit = {
+        pendingLocalDiscovery = false
         val current = viewModel.state.value
         val currentWireless = viewModel.wifiDirect.state.value
         val method = if (current.remoteMode) ConnectionMethod.REMOTE else if (useWifiDirect)
@@ -397,7 +403,18 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                 onImport = { if (viewModel.state.value.canSelectRemoteMode && !viewModel.wifiDirect.mutationPending)
                                     remoteImportLauncher.launch(arrayOf("application/json", "application/octet-stream", "*/*")) },
                                 onHostChange = viewModel::updateHost, onPortChange = viewModel::updatePort,
-                                onUsernameChange = viewModel::updateUsername, onPasswordChange = viewModel::updatePassword)
+                                onUsernameChange = viewModel::updateUsername, onPasswordChange = viewModel::updatePassword,
+                                onDiscover = {
+                                    if (viewModel.setRemoteMode(false)) {
+                                        useWifiDirect = false
+                                        keyboard?.hide()
+                                        if (Build.VERSION.SDK_INT >= 37 && ContextCompat.checkSelfPermission(context,
+                                                networkPermission) != PackageManager.PERMISSION_GRANTED) {
+                                            pendingLocalDiscovery = true
+                                            permissionLauncher.launch(networkPermission)
+                                        } else viewModel.discoverAndConnect()
+                                    }
+                                })
                             state.error?.let { error ->
                                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                                     Text(error, Modifier.padding(12.dp).testTag("error"),
@@ -616,7 +633,7 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                         val panelHeight = maxWidth * 3 / 8 + 48.dp
                         BoardCameraPreview(state = state,
                             onVideoServiceEnabledChange = viewModel::setVideoServiceEnabled,
-                            remoteVideo = if (state.remoteMode) remoteVideo else null,
+                            remoteVideo = if (state.usesRemoteVideo) remoteVideo else null,
                             phoneNetwork = networkSnapshot.health.phone,
                             modifier = Modifier.fillMaxWidth().height(panelHeight))
                     }

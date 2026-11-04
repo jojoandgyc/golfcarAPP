@@ -74,7 +74,7 @@ internal fun BoardCameraPreview(
     val running = state.videoServiceState == VideoServiceState.RUNNING
     val canPreview = state.canPreviewVideo(remoteVideo != null)
     val status = when {
-        state.remoteMode && remoteVideo == null -> "远程视频凭据不可用，请检查连接配置"
+        state.usesRemoteVideo && remoteVideo == null -> "公网视频未配置；当前控制连接可继续使用"
         !state.connected && canPreview -> "控制未连接 · $playerStatus"
         !state.connected -> "连接开发板后可开启视频"
         state.videoServiceBusy -> state.videoServiceMessage
@@ -118,7 +118,7 @@ internal fun BoardCameraPreview(
                 }
             } else {
                 val message = when {
-                    state.remoteMode && remoteVideo == null -> "远程视频凭据不可用，请检查连接配置"
+                    state.usesRemoteVideo && remoteVideo == null -> "公网视频未配置；当前控制连接可继续使用"
                     !state.connected -> "连接开发板后显示实时画面"
                     state.videoServiceBusy -> state.videoServiceMessage
                     state.videoServiceError != null -> "视频操作失败：${state.videoServiceError}\n可重试；详细原因见“故障”"

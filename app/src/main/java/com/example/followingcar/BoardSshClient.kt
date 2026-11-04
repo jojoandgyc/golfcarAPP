@@ -1,5 +1,6 @@
 package com.example.followingcar
 
+import android.net.Network
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
@@ -31,6 +32,7 @@ data class BoardConnection(
     val username: String,
     val password: String,
     val tls: RemoteTlsConfig? = null,
+    val localNetwork: Network? = null,
 ) {
     // Avoid accidentally including credentials in logs or exception messages.
     override fun toString(): String = "BoardConnection(host=$host, port=$port, username=$username)"
@@ -106,7 +108,7 @@ class BoardSshClient {
                 setDaemonThread(true)
                 setSocketFactory(object : SocketFactory {
                     override fun createSocket(host: String, port: Int): Socket {
-                        return openBoardSocket(socket, host, port, CONNECT_TIMEOUT_MS, config.tls)
+                        return openBoardSocket(socket, host, port, CONNECT_TIMEOUT_MS, config.tls, config.localNetwork)
                     }
 
                     override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
@@ -464,7 +466,7 @@ internal class BoundedOutputStream(private val limit: Int) : OutputStream() {
 
 /** Never let caller-provided command labels or terminal exceptions leak command contents. */
 internal fun safeDiagnosticCommandKind(kind: String): String = when (kind) {
-    "board_status", "memory", "disk", "network", "video_inspect", "video_start", "video_stop",
+    "board_status", "memory", "disk", "network", "network_addresses", "video_inspect", "video_start", "video_stop",
     "follow_config", "follow_availability", "motor_config_read", "motor_config_write", "motor_action",
     "parking_read", "parking_mode", "parking_currents" -> kind
     else -> "terminal"

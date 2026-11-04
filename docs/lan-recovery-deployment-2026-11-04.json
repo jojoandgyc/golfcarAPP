@@ -1,0 +1,267 @@
+{
+  "recordedAtUtc": "2026-11-04T07:21:11.867335+00:00",
+  "timezone": "Asia/Taipei",
+  "sourceBaseCommit": "e229d1b7af1ab648f059bcd0cfbe66783da6036f",
+  "status": "deployed_phone_lan_recovered",
+  "release": {
+    "versionCode": 27,
+    "versionName": "1.8.16-lan-recovery",
+    "apkSha256": "fa27a00d37c714768338afc1711ea7fe70173b384b0b49d476903f204c168384",
+    "networkHelperSha256": "066cb4bb9b7d57ad70f028843b696f583512a20472181048857edb87ddf07f58"
+  },
+  "phoneInstallation": {
+    "installedAtUtc": "2026-11-04T07:10:55.076080+00:00",
+    "versionCode": 27,
+    "versionName": "1.8.16-lan-recovery",
+    "apkSha256": "fa27a00d37c714768338afc1711ea7fe70173b384b0b49d476903f204c168384",
+    "installedApkSha256": "fa27a00d37c714768338afc1711ea7fe70173b384b0b49d476903f204c168384",
+    "alreadyInstalled": false,
+    "previousVersionCode": 27,
+    "previousApkSha256": "572a3e0d7a10f13dcb598e14940b61ff1f9a514fb25f8f8620e75ba862eeecc9",
+    "backup": "E:\\Temp\\golfcar-lan-fallback-2026-11-04\\phone-before-v27-20261104T071052Z-b35cd05b.apk",
+    "connectionPreferencesPreserved": true,
+    "controlLease": {
+      "event": "locked",
+      "controlIdle": true,
+      "serialIdle": true,
+      "bothControlLocksHeld": true,
+      "guardSha256": "7e537b8147e73246fcad974c2c84bec9b485692296fa6c7c6640e51d695abf6e",
+      "leaseSeconds": 60
+    },
+    "realMotorWritesSent": false,
+    "controlLeaseRelease": {
+      "event": "unlocked",
+      "reason": "released"
+    }
+  },
+  "networkHelperDeployment": {
+    "installedPath": "/opt/followingcar-network/app_lan_recovery.py",
+    "sha256": "066cb4bb9b7d57ad70f028843b696f583512a20472181048857edb87ddf07f58",
+    "backup": "/opt/followingcar-network/app_lan_recovery.py.bak.20261104T065529383399Z",
+    "networkSettingsChanged": false,
+    "path": {
+      "address": "172.16.16.82",
+      "family": "IPv4",
+      "verifiedHostAlias": "172.16.16.82"
+    },
+    "readOnlyPlan": {
+      "ok": true,
+      "changed": false,
+      "boardId": "followingcar-rk-140761",
+      "observation": {
+        "profileUuid": "2f73c1af-5e3c-42f5-8093-e0a7f656e37f",
+        "state": 100,
+        "method": "manual",
+        "addresses": [
+          "172.16.16.82/22"
+        ],
+        "ipv6Addresses": [
+          "fe80::2cdf:2f96:eb21:9e13/64"
+        ],
+        "dadTimeout": -1,
+        "leaseAddress": "",
+        "dhcpServer": "",
+        "sshFingerprint": "SHA256:vRTxsHA9fDeRZQ6YTXKYPyngRhvcAJEIF9+XnfxPx0g"
+      },
+      "changes": [
+        "ipv4.method",
+        "ipv4.addresses",
+        "ipv4.gateway",
+        "ipv4.dad-timeout",
+        "802-11-wireless.mac-address",
+        "802-11-wireless.cloned-mac-address"
+      ]
+    }
+  },
+  "discoveryService": {
+    "ok": true,
+    "changed": true,
+    "sha256": "fc5947cebfc304f2ba4e12ac489c1543ed1d5f79fb98a8aba17385b2e1aedf2a",
+    "path": "/etc/avahi/services/followingcar-rk-140761.service"
+  },
+  "dhcpMigration": {
+    "requestId": "28bf0c2c-b338-4858-a605-326a56ca38c0",
+    "result": {
+      "activation": "same_profile_reconnect",
+      "after": {
+        "addresses": [
+          "172.16.16.116/22"
+        ],
+        "dadTimeout": 3000,
+        "dhcpServer": "172.16.16.1",
+        "ipv6Addresses": [
+          "fe80::2cdf:2f96:eb21:9e13/64"
+        ],
+        "leaseAddress": "172.16.16.116",
+        "method": "auto",
+        "profileUuid": "2f73c1af-5e3c-42f5-8093-e0a7f656e37f",
+        "sshFingerprint": "SHA256:vRTxsHA9fDeRZQ6YTXKYPyngRhvcAJEIF9+XnfxPx0g",
+        "state": 100
+      },
+      "backupSha256": "ed39f3dadb75ecebfa58d65c3b80f1701d715355c13272d9a9ddeadd3a559b49",
+      "before": {
+        "addresses": [
+          "172.16.16.82/22"
+        ],
+        "dadTimeout": -1,
+        "dhcpServer": "",
+        "ipv6Addresses": [
+          "fe80::2cdf:2f96:eb21:9e13/64"
+        ],
+        "leaseAddress": "",
+        "method": "manual",
+        "profileUuid": "2f73c1af-5e3c-42f5-8093-e0a7f656e37f",
+        "sshFingerprint": "SHA256:vRTxsHA9fDeRZQ6YTXKYPyngRhvcAJEIF9+XnfxPx0g",
+        "state": 100
+      },
+      "changed": true,
+      "errorCode": null,
+      "ipv6Retained": true,
+      "ok": true,
+      "phase": "committed",
+      "requestId": "28bf0c2c-b338-4858-a605-326a56ca38c0",
+      "rollback": "not_needed",
+      "schemaVersion": 1,
+      "type": "lan_recovery"
+    },
+    "verifiedSshPath": {
+      "address": "fe80::2cdf:2f96:eb21:9e13%31",
+      "family": "IPv6",
+      "verifiedHostAlias": "172.16.16.82"
+    }
+  },
+  "finalBoardVerification": {
+    "verification": {
+      "current": {
+        "profileUuid": "2f73c1af-5e3c-42f5-8093-e0a7f656e37f",
+        "state": 100,
+        "method": "auto",
+        "addresses": [
+          "172.16.16.116/22"
+        ],
+        "ipv6Addresses": [
+          "fe80::2cdf:2f96:eb21:9e13/64"
+        ],
+        "dadTimeout": 3000,
+        "leaseAddress": "172.16.16.116",
+        "dhcpServer": "172.16.16.1",
+        "sshFingerprint": "SHA256:vRTxsHA9fDeRZQ6YTXKYPyngRhvcAJEIF9+XnfxPx0g"
+      },
+      "mac": "88:49:2d:14:07:60",
+      "nonTargetProfileFieldsPreserved": true,
+      "savedMigrationResult": {
+        "activation": "same_profile_reconnect",
+        "after": {
+          "addresses": [
+            "172.16.16.116/22"
+          ],
+          "dadTimeout": 3000,
+          "dhcpServer": "172.16.16.1",
+          "ipv6Addresses": [
+            "fe80::2cdf:2f96:eb21:9e13/64"
+          ],
+          "leaseAddress": "172.16.16.116",
+          "method": "auto",
+          "profileUuid": "2f73c1af-5e3c-42f5-8093-e0a7f656e37f",
+          "sshFingerprint": "SHA256:vRTxsHA9fDeRZQ6YTXKYPyngRhvcAJEIF9+XnfxPx0g",
+          "state": 100
+        },
+        "backupSha256": "ed39f3dadb75ecebfa58d65c3b80f1701d715355c13272d9a9ddeadd3a559b49",
+        "before": {
+          "addresses": [
+            "172.16.16.82/22"
+          ],
+          "dadTimeout": -1,
+          "dhcpServer": "",
+          "ipv6Addresses": [
+            "fe80::2cdf:2f96:eb21:9e13/64"
+          ],
+          "leaseAddress": "",
+          "method": "manual",
+          "profileUuid": "2f73c1af-5e3c-42f5-8093-e0a7f656e37f",
+          "sshFingerprint": "SHA256:vRTxsHA9fDeRZQ6YTXKYPyngRhvcAJEIF9+XnfxPx0g",
+          "state": 100
+        },
+        "changed": true,
+        "errorCode": null,
+        "ipv6Retained": true,
+        "ok": true,
+        "phase": "committed",
+        "requestId": "28bf0c2c-b338-4858-a605-326a56ca38c0",
+        "rollback": "not_needed",
+        "schemaVersion": 1,
+        "type": "lan_recovery"
+      },
+      "serviceFilePresent": true,
+      "avahiActive": "active"
+    },
+    "verifiedSshPath": {
+      "address": "fe80::2cdf:2f96:eb21:9e13%31",
+      "family": "IPv6",
+      "verifiedHostAlias": "172.16.16.82"
+    },
+    "realMotorWritesSent": false
+  },
+  "validation": {
+    "jvm": {
+      "tests": 301,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorUiAndRecovery": {
+      "tests": 83,
+      "passed": 83
+    },
+    "finalAppEmulatorRetest": {
+      "tests": 32,
+      "passed": 32
+    },
+    "boardNetworkRecoveryAndExistingGuard": {
+      "tests": 39,
+      "passed": 39
+    },
+    "deployedSshDryRun": {
+      "tests": 5,
+      "passed": 5,
+      "realBoardSsh": true,
+      "allControlSessionsDryRun": true,
+      "realSerialOpened": false,
+      "realMotorCommandsSent": false
+    },
+    "realPhone": {
+      "userConfirmedEndpoint": "172.16.16.116:22",
+      "pinnedSshAuthenticated": true,
+      "normalConnectFoundIpv4ThroughNsd": true,
+      "normalConnectAuthenticationTotalMs": 5787,
+      "statusReadTotalMs": 6111,
+      "sshAuthenticationMs": 266,
+      "earlierKnownConflictRecoveredViaIpv6": true,
+      "earlierNormalRecoveryMs": 8120,
+      "finalIpv6ToIpv4ReadbackUpgradeBranchExercisedOnPhone": false,
+      "noControlStartEventsInObservedTimeline": true
+    },
+    "deployedPublicReadOnlyEcho": {
+      "tests": 1,
+      "passed": 1,
+      "opensControlBridge": false,
+      "startsVideoOrMotors": false
+    }
+  },
+  "behavior": {
+    "addressAllocation": "DHCP with 3 s duplicate address detection, existing permanent MAC, unchanged SSID/password/DNS/IPv6.",
+    "discovery": "Bounded Wi-Fi DNS-SD candidates, on-link only; TXT records never replace pinned SSH identity authentication.",
+    "fallback": "Saved address -> discovery -> pinned IPv6 rescue with authenticated IPv4 query -> configured public route once. IPv4 candidates preferred.",
+    "safety": "Connection only; no replay of manual/follow/parking/terminal actions; original uncertain-control locks remain.",
+    "video": "IPv4 uses the existing LAN path; IPv6-only rescue requires the existing public video profile.",
+    "limits": "Discovery/IPv6/public access depend on the network. No connection is claimed if all paths fail."
+  },
+  "constraints": {
+    "realMotorCommandsSentByAgent": false,
+    "motorConfigurationChangedByAgent": false,
+    "followCodeOrServicesChanged": false,
+    "globalNetworkManagerOrSshRestarted": false,
+    "onlyApprovedWifiProfileChanged": true,
+    "originalProfileBackedUpPrivately": true
+  }
+}
