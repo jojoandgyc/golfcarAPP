@@ -6,8 +6,11 @@ import org.junit.Test
 class DriveRecoveryTest {
     @Test fun onlyNegotiatedBoardsUseLongerAckWait() {
         assertEquals(900L, driveAckTimeoutMillis(null))
-        assertEquals(2_500L, driveAckTimeoutMillis(5_000))
-        for (value in listOf(-1, 0, 600, 2_500, 6_000, Int.MAX_VALUE)) {
+        assertEquals(4_250L, driveAckTimeoutMillis(5_000))
+        assertEquals(8_000L, driveAckTimeoutMillis(15_000))
+        assertTrue(DRIVE_ACK_WARNING_MS < driveAckTimeoutMillis(5_000))
+        assertTrue(DRIVE_WRITE_TIMEOUT_MS < driveAckTimeoutMillis(15_000))
+        for (value in listOf(-1, 0, 600, 2_500, 6_000, 15_001, Int.MAX_VALUE)) {
             assertThrows(IllegalArgumentException::class.java) { driveAckTimeoutMillis(value) }
         }
     }

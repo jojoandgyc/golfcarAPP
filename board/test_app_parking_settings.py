@@ -262,7 +262,7 @@ class OwnerTests(unittest.TestCase):
   self.assertEqual([m['type'] for m in messages],['ready','ack','ack','error'])
   self.assertEqual(len(deadlines),4)
   for deadline in deadlines[:3]:self.assertAlmostEqual(deadline,.6)
-  self.assertAlmostEqual(deadlines[-1],5)
+  self.assertAlmostEqual(deadlines[-1],drive.NETWORK_GRACE_SECONDS)
   self.assertIn('network grace expired',messages[-1]['error'])
  def test_nested_reply_4096_bound(self):
   ack=self.send('currents',leftRaw=900,rightRaw=900);self.assertLessEqual(len(json.dumps(ack,separators=(',',':')).encode())+1,4096)

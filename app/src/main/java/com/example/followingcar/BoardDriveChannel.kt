@@ -13,8 +13,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -33,6 +35,8 @@ data class DriveReady(
     val feedback: DriveFeedback? = null,
     val unifiedParkingSupported: Boolean = false,
     val parkingSemantics: String? = null,
+    val stopConfirmationWarningSupported: Boolean = false,
+    val feedbackNoiseMaxRpm: Int = 2,
 )
 data class DriveAck(
     val left: Int, val right: Int, val stopped: Boolean,
@@ -48,6 +52,8 @@ data class DriveAck(
     val parkingResult: ParkingReply? = null,
     val parkingMode: Boolean? = null,
     val parkingModeSource: String? = null,
+    val stopCommandConfirmed: Boolean = false,
+    val communicationDelayed: Boolean = false,
 )
 
 /**
@@ -83,6 +89,7 @@ class BoardDriveChannel private constructor(
     private var summaryRttMax = 0L
     private var recoveryReportState = 0
     private var recoveryReportNanos = 0L
+    private var ackDelayHandler: (suspend (Long) -> Unit)? = null
     lateinit var ready: DriveReady
         private set
 
@@ -90,6 +97,10 @@ class BoardDriveChannel private constructor(
         get() = !closed.get() && channel.isConnected && !channel.isClosed
 
     val hasPendingTransaction: Boolean get() = transaction.isPending()
+
+    internal fun configureAckDelayHandler(handler: suspend (Long) -> Unit) {
+        ackDelayHandler = handler
+    }
 
     /** Network grace never delays an intentional stop. Idle channels may still send close/estop. */
     fun interruptForActiveStop(source: ControlStopSource): Boolean {
@@ -179,6 +190,7 @@ class BoardDriveChannel private constructor(
             currentCommand = command
             phase = "check_open"
             var parkingReplyBeforeFailure: ParkingReply? = null
+            var communicationDelayed = false
             try {
                 check(isOpen) { "摇杆控制通道已关闭，请重新启用" }
                 val closing = command == "estop" || command == "close"
@@ -208,12 +220,31 @@ class BoardDriveChannel private constructor(
                             "leftRpm" to left, "rightRpm" to right,
                             "parkingEnabled" to parking?.enabled, "parkingCurrentReadOnly" to true),
                         critical = important)
-                    blockingCall {
-                        output.write((request.toString() + "\n").toByteArray(Charsets.UTF_8))
-                        output.flush()
+                    withTimeout(DRIVE_WRITE_TIMEOUT_MS) {
+                        blockingCall {
+                            output.write((request.toString() + "\n").toByteArray(Charsets.UTF_8))
+                            output.flush()
+                        }
                     }
                     phase = "ack_wait"
-                    val reply = readMessage()
+                    // Keep one reader, including its partial JSON line, alive across the
+                    // warning boundary. Never resend a request whose board token is unknown.
+                    val reply = if (!closing && parking == null && parkingRequest == null && ready.networkGraceMs != null) {
+                        coroutineScope {
+                            val warning = launch {
+                                delay(DRIVE_ACK_WARNING_MS)
+                                if (phase == "ack_wait" && isOpen) {
+                                    communicationDelayed = true
+                                    val elapsed = elapsedMillis(started)
+                                    Diagnostics.event("drive.ack_delayed", diagnosticContext,
+                                        fields = diagnosticFields() + mapOf("elapsedMs" to elapsed,
+                                            "severity" to "warning", "sessionRetained" to true), critical = true)
+                                    ackDelayHandler?.invoke(elapsed)
+                                }
+                            }
+                            try { readMessage() } finally { warning.cancel() }
+                        }
+                    } else readMessage()
                     phase = "ack_validate"
                     requireMessage(reply.getString("type") == "ack", "开发板返回了未知控制响应")
                     requireMessage(reply.getLong("seq") == sentSequence, "开发板回执序号不匹配")
@@ -233,8 +264,15 @@ class BoardDriveChannel private constructor(
                     parkingReplyBeforeFailure = parkingResult
                     val measured = readFeedback(reply, ready.dryRun, actualLeft, actualRight)
                     val stopped = measured.stopped
-                    requireMessage(!(closing || parking != null) || stopped,
-                        "开发板终止或驻车操作缺少实测停车确认")
+                    val rawStopCommand = reply.opt("stopCommandConfirmed")
+                    requireMessage(!reply.has("stopCommandConfirmed") || rawStopCommand is Boolean,
+                        "开发板停止指令确认字段无效")
+                    val stopCommandConfirmed = rawStopCommand == true
+                    requireMessage(!stopCommandConfirmed || measured.targetStopped,
+                        "停止指令确认与目标不一致")
+                    requireMessage(!closing || stopped || ready.stopConfirmationWarningSupported && stopCommandConfirmed,
+                        "开发板终止操作未确认停止指令")
+                    requireMessage(parking == null || stopped, "开发板驻车操作缺少实测停车确认")
                     val rawRecovery = reply.opt("recoveryRequired")
                     requireMessage(!reply.has("recoveryRequired") || rawRecovery is Boolean, "开发板网络恢复回执格式无效")
                     val recoveryRequired = try {
@@ -364,18 +402,27 @@ class BoardDriveChannel private constructor(
                         summaryRttMax = 0
                     }
                     phase = "idle"
+                    if (communicationDelayed) Diagnostics.event("drive.ack_delay_recovered", diagnosticContext,
+                        fields = diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started),
+                            "neutralRequired" to true), critical = true)
                     DriveAck(actualLeft, actualRight, stopped, actualParking, interlock, recoveryRequired,
                         measured.targetStopped, measured.feedback, lastAckNanos, measured.feedback.ageMs + rtt,
-                        feedbackRecheck, standstillPending, parkingResult, rawMode as? Boolean, modeSource as? String)
+                        feedbackRecheck, standstillPending, parkingResult, rawMode as? Boolean, modeSource as? String,
+                        stopCommandConfirmed, communicationDelayed)
                 }
             } catch (timeout: TimeoutCancellationException) {
                 transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }
-                val failure = SocketTimeoutException("控制回执等待超时，连接已关闭；请先重新连接再启用手动控制")
-                Diagnostics.failure(diagnosticContext, "drive.ack_timeout", failure,
+                val retainTransport = phase == "ack_wait" && !blockingIo.get()
+                val failure = DriveAckTimeoutException(if (retainTransport)
+                    "控制回执持续未恢复，已结束本次控制通道；SSH 保留，确认控制空闲后可重新启用"
+                    else "控制写入超时，连接已关闭，请重新连接", retainTransport)
+                Diagnostics.failure(diagnosticContext, if (retainTransport) "drive.ack_timeout" else "drive.write_timeout", failure,
                     diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started),
-                        "leftRpm" to left, "rightRpm" to right))
-                // A completed write does not prove that a blackholed SSH connection is alive.
-                close("ack_timeout", invalidateTransport = true)
+                        "leftRpm" to left, "rightRpm" to right,
+                        "transportRetained" to retainTransport))
+                // Only an uncancellable/partial write needs to tear down the socket.
+                // A read deadline ends this token stream, while SSH can be probed separately.
+                close(if (retainTransport) "ack_timeout" else "write_timeout", invalidateTransport = !retainTransport)
                 throw failure
             } catch (failure: Exception) {
                 transaction.interruptedStopSource()?.let { throw activeStopCancellation(it) }
@@ -485,7 +532,9 @@ class BoardDriveChannel private constructor(
         "channelEof" to channel.isEOF, "blockingIo" to blockingIo.get(),
         "transactionPending" to hasPendingTransaction,
         "activeStopSource" to transaction.requestedStopSource(),
+        "writeTimeoutMs" to DRIVE_WRITE_TIMEOUT_MS,
         "ackTimeoutMs" to if (currentCommand == "parking_settings") UNIFIED_PARKING_ACK_TIMEOUT_MS
+            else if (currentCommand in setOf("parking", "close", "estop")) PARKING_ACK_TIMEOUT_MS
             else if (::ready.isInitialized) driveAckTimeoutMillis(ready.networkGraceMs) else null,
     )
 
@@ -596,7 +645,20 @@ class BoardDriveChannel private constructor(
                             value is Number && value.toDouble() == 0.0
                         }, "开发板初始目标未归零")
                         val initialFeedback = control.readFeedback(reply, dryRun, 0, 0)
-                        control.requireMessage(initialFeedback.stopped, "开发板初始实测停车未确认")
+                        val rawStopWarning = reply.opt("stopConfirmationWarningSupported")
+                        control.requireMessage(!reply.has("stopConfirmationWarningSupported") || rawStopWarning is Boolean,
+                            "开发板停车告警能力字段无效")
+                        val stopWarningSupported = rawStopWarning == true
+                        control.requireMessage(!reply.has("stopCommandConfirmed") ||
+                            reply.opt("stopCommandConfirmed") is Boolean, "开发板初始停止指令确认字段无效")
+                        control.requireMessage(!stopWarningSupported || reply.opt("stopCommandConfirmed") == true,
+                            "开发板初始停止指令未确认")
+                        control.requireMessage(initialFeedback.stopped || stopWarningSupported &&
+                            reply.opt("stopCommandConfirmed") == true, "开发板初始停止指令未确认")
+                        val rawNoiseMax = reply.opt("feedbackNoiseMaxRpm")
+                        control.requireMessage(!reply.has("feedbackNoiseMaxRpm") || rawNoiseMax is Number &&
+                            rawNoiseMax.toDouble() == rawNoiseMax.toInt().toDouble() && rawNoiseMax.toInt() in 1..80,
+                            "开发板轮速告警范围无效")
                         val rawInfraredSupported = reply.opt("infraredSupported")
                         control.requireMessage(!reply.has("infraredSupported") || rawInfraredSupported is Boolean,
                             "开发板红外保护能力字段无效")
@@ -617,7 +679,7 @@ class BoardDriveChannel private constructor(
                         val rawRunId = reply.opt("runId")
                         val rawGrace = reply.opt("networkGraceMs")
                         control.requireMessage(!reply.has("networkGraceMs") ||
-                            rawGrace is Number && rawGrace.toDouble() == 5_000.0,
+                            rawGrace is Number && rawGrace.toDouble() in setOf(5_000.0, 15_000.0),
                             "开发板网络恢复参数不匹配")
                         control.requireMessage(!reply.has("runId") ||
                             rawRunId is String && rawRunId.matches(Regex("[0-9a-f]{32}")),
@@ -632,6 +694,8 @@ class BoardDriveChannel private constructor(
                             feedback = initialFeedback.feedback,
                             unifiedParkingSupported = rawUnifiedParking == true,
                             parkingSemantics = rawParkingSemantics as? String,
+                            stopConfirmationWarningSupported = stopWarningSupported,
+                            feedbackNoiseMaxRpm = (rawNoiseMax as? Number)?.toInt() ?: 2,
                         )
                         control.requireMessage(ready.dryRun == dryRun, "开发板控制模式不匹配")
                         control.requireMessage(ready.maxRpm in 1..100 && ready.watchdogMs == 600, "开发板限速或超时参数不匹配")

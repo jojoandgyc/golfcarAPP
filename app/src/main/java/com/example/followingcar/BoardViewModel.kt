@@ -63,6 +63,8 @@ data class BoardUiState(
     val driveStatus: String = "手动控制未启用",
     val driveInterlock: DriveInterlock? = null,
     val driveRecoveryNeedsRelease: Boolean = false,
+    val driveCommunicationDelayed: Boolean = false,
+    val driveCleanupUnconfirmed: Boolean = false,
     val driveFeedbackRecheck: Boolean = false,
     val driveStandstillPending: Boolean = false,
     val drivePort: String = "自动检测串口",
@@ -114,7 +116,7 @@ data class BoardUiState(
     val canReconnectViaRemote: Boolean get() = canSelectRemoteMode && remoteProfile != null && remoteProfileError == null
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followStopping || followUncertain
-    val canEnableDrive: Boolean get() = connected && !busy && !motorActionUnconfirmed && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
+    val canEnableDrive: Boolean get() = connected && !busy && !motorActionUnconfirmed && !driveCleanupUnconfirmed && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
     val canToggleVideoService: Boolean
         get() = connected && !busy && !motorActionUnconfirmed && !videoServiceBusy && !driveStarting && !driveStopping && !followBlocksControl
     val canInspectFollow: Boolean get() = connected && !busy && !pairingBusy && !pairingUnconfirmed && !manualActive && !followActive && !followStopping && !videoServiceBusy
@@ -125,13 +127,13 @@ data class BoardUiState(
     val canManagePairing: Boolean get() = canRecoverConnection
     val canManageWifiDirect: Boolean get() = canManagePairing && !pairingBusy && !pairingHotspotActive && !pairingUnconfirmed
     val canStartFollow: Boolean
-        get() = canInspectFollow && !motorActionUnconfirmed && !followUncertain && !followConfigurationLoading &&
+        get() = canInspectFollow && !motorActionUnconfirmed && !driveCleanupUnconfirmed && !followUncertain && !followConfigurationLoading &&
             runCatching { followLaunchOptions.validate(followCamera) }.isSuccess
     val canReadMotorConfiguration: Boolean get() = connected && !busy && !manualActive &&
-        !followBlocksControl && !videoServiceBusy && !parkingUpdating && !pairingBusy && !pairingUnconfirmed
+        !followBlocksControl && !driveCleanupUnconfirmed && !videoServiceBusy && !parkingUpdating && !pairingBusy && !pairingUnconfirmed
     val canConfigureMotor: Boolean get() = canReadMotorConfiguration && !motorActionUnconfirmed
     val canExecuteTerminal: Boolean get() = connected && !busy && !motorActionUnconfirmed &&
-        !videoServiceBusy && !manualActive && !followBlocksControl
+        !videoServiceBusy && !manualActive && !followBlocksControl && !driveCleanupUnconfirmed
     val canEditParking: Boolean get() = canEditParkingAt(System.nanoTime())
     val canConfigureParking: Boolean get() = canEditParking
 }
@@ -186,6 +188,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             }.getOrDefault(true),
             remoteProfileLoading = true,
             followUncertain = followRecovery != null || preferences.getBoolean("follow_unconfirmed", false),
+            driveCleanupUnconfirmed = preferences.getBoolean("drive_cleanup_unconfirmed", false),
             followFirstFailure = followRecovery?.firstFailure,
             followMessage = if (followRecovery != null || preferences.getBoolean("follow_unconfirmed", false))
                 "上次跟随进程退出未确认，连接后将自动检查控制占用" else "尚未启动自动跟随"
@@ -242,6 +245,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private var intentionalConnectionClose = false
     private var driveJob: Job? = null
     private val driveRecoveryGate = DriveRecoveryGate()
+    // Releasing a finger does not acknowledge the neutral request after a delayed ACK.
+    private var driveAckRecovering = false
+    private var driveAvailabilityJob: Job? = null
+    private var driveAvailabilityConnectionId: String? = null
     private var driveChannel: BoardDriveChannel? = null
     private var desiredWheels = WheelSpeeds()
     private var desiredGeneration = 0L
@@ -269,13 +276,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 val connectionId = client.diagnosticConnectionId
                 mutableParkingPage.update { parking ->
                     val stale = !current.connected || current.driveStarting || current.driveStopping ||
-                        current.followBlocksControl || current.motorActionUnconfirmed || parkingObservationConnectionId != null &&
+                        current.followBlocksControl || current.motorActionUnconfirmed || current.driveCleanupUnconfirmed ||
+                        current.driveCommunicationDelayed || parkingObservationConnectionId != null &&
                         parkingObservationConnectionId != connectionId
                     parking.copy(connected = current.connected, valuesCurrent = !stale && parking.valuesCurrent,
                         feedbackText = if (stale) null else parking.feedbackText,
                         message = if (stale && parking.valuesCurrent) "连接或控制占用已变化，显示上次读数；请重新读取确认" else parking.message)
                 }
-                if (!current.connected || current.manualActive || current.followBlocksControl) {
+                if (!current.connected || current.manualActive || current.followBlocksControl || current.driveCleanupUnconfirmed) {
                     mutableMotorConfiguration.update { motor ->
                         if (motor.snapshot == null || motor.requiresRead) motor else motor.copy(requiresRead = true,
                             message = "连接或控制状态已变化，请重新读取电机配置")
@@ -838,6 +846,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 refreshVideoServiceState()
                 currentCoroutineContext().ensureActive()
                 if (!disconnecting && client.isConnected && state.value.followUncertain) inspectFollowAvailability("RECONNECT")
+                if (!disconnecting && client.isConnected && state.value.driveCleanupUnconfirmed)
+                    inspectDriveCleanupAfterExit("RECONNECT")
             } catch (cancelled: CancellationException) {
                 directConnectionGroup = null
                 hotspotConnectionAddress = null
@@ -981,6 +991,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             disconnecting || !current.connected || !client.isConnected -> "请先连接小车；已编辑的电流会保留"
             current.followBlocksControl -> "自动跟随正在占用或退出尚未确认，请先结束跟随并核对占用"
             current.motorActionUnconfirmed -> "上次电机操作尚未确认，请先核对控制占用"
+            current.driveCleanupUnconfirmed -> "上次手动控制退出尚未确认，请先检查控制占用"
+            current.driveCommunicationDelayed -> "正在等待控制回执恢复，请稍后再保存驻车电流"
             current.pairingBusy || current.pairingUnconfirmed -> "无线配网尚未结束，请先完成连接确认"
             current.driveStarting || current.driveStopping -> "手动控制正在启动或停用，请等待完成后重试"
             current.busy || current.videoServiceBusy || current.parkingUpdating -> "其他操作正在进行，请稍后重试"
@@ -1118,12 +1130,14 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         handleDriveRecovery(neutral, neutralRequest = true)
         mutableState.update { it.withDriveFeedback(neutral).copy(driveConfirmedStopped =
             neutral.stopped && neutral.hasFreshFeedback(), parkingSettings = neutral.parking) }
+        if (driveAckRecovering) recoverDriveCommunication(channel)
         if (stopRequest != null) return
         suspend fun exchange(operation: ParkingRequest): ParkingReply {
             val ack = channel.parkingSettings(operation)
             handleDriveRecovery(ack, neutralRequest = true)
             mutableState.update { it.withDriveFeedback(ack).copy(driveConfirmedStopped =
                 ack.stopped && ack.hasFreshFeedback(), parkingSettings = ack.parking) }
+            if (driveAckRecovering) recoverDriveCommunication(channel)
             return requireNotNull(ack.parkingResult)
         }
         val result = if (request.op == "currents") {
@@ -1560,6 +1574,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         preferences.edit().putString("last_drive_operation", driveDiagnostic.operationId).apply()
         firstDriveStopSource = null
         driveRecoveryGate.reset()
+        driveAckRecovering = false
         Diagnostics.event("drive.start_requested", driveDiagnostic, source = "USER_START",
             fields = mapOf("dryRun" to dryRun, "speedLimit" to current.speedLimit), critical = true)
         desiredWheels = WheelSpeeds()
@@ -1572,6 +1587,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 driveLastFeedbackNanos = 0L, driveFeedbackAgeAtReceiptMs = Long.MAX_VALUE,
                 driveInterlock = null,
                 driveStatus = "正在开启视频…", driveRecoveryNeedsRelease = false, driveFeedbackRecheck = false,
+                driveCommunicationDelayed = false,
                 driveStandstillPending = false,
                 parkingSupported = false, parkingSettings = null,
                 parkingUpdating = false, parkingStatus = "正在读取驻车设置…")
@@ -1579,6 +1595,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         driveJob = viewModelScope.launch {
             var channel: BoardDriveChannel? = null
             var parkingModeReleased = false
+            var terminalAcknowledged = false
             try {
                 if (stopRequest == null) changeVideoService(true, driveDiagnostic)
                 if (stopRequest != null) {
@@ -1593,9 +1610,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 channel = activeChannel
                 driveChannel = activeChannel
                 driveDiagnostic = activeChannel.diagnosticContext
+                activeChannel.configureAckDelayHandler { elapsedMs ->
+                    withContext(Dispatchers.Main.immediate) {
+                        if (driveChannel === activeChannel && stopRequest == null)
+                            beginDriveCommunicationRecovery(elapsedMs)
+                    }
+                }
                 mutableState.update { it.copy(lastReadParkingSettings = activeChannel.ready.parking?.copy(enabled = false)) }
                 Diagnostics.event("drive.ready", driveDiagnostic, fields = mapOf("dryRun" to activeChannel.ready.dryRun))
                 while (stopRequest == null) {
+                    if (driveAckRecovering) {
+                        recoverDriveCommunication(activeChannel)
+                        continue
+                    }
                     // READY may have spent time in the network. Confirm a current stopped
                     // request before enabling input; the existing ACK/watchdog deadlines apply.
                     mutableState.update { it.copy(driveStatus = "正在确认实测停车反馈…") }
@@ -1605,7 +1632,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
                     mutableState.update { it.withDriveFeedback(initialAck).copy(
                         driveConfirmedStopped = initialAck.stopped && initialAck.hasFreshFeedback()) }
-                    if (state.value.driveConfirmedStopped && !initialAck.feedbackRecheck) {
+                    val startupWarning = activeChannel.ready.stopConfirmationWarningSupported &&
+                        initialAck.stopCommandConfirmed && initialAck.hasMinorStoppedFeedbackNoise(
+                            maxRpm = activeChannel.ready.feedbackNoiseMaxRpm)
+                    if ((state.value.driveConfirmedStopped || startupWarning) && !initialAck.feedbackRecheck) {
                         Diagnostics.event("drive.initial_stop_acknowledged", driveDiagnostic, critical = true)
                         break
                     }
@@ -1615,9 +1645,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 // A stop arriving during the first ACK must keep input locked.
                 if (stopRequest == null) {
                     mutableState.update {
-                        it.copy(driveStarting = false, driveEnabled = true, driveConfirmedStopped = true,
+                        it.copy(driveStarting = false, driveEnabled = true,
                             drivePort = activeChannel.ready.port,
-                            driveStatus = if (activeChannel.ready.dryRun) "模拟控制 · 不驱动电机" else "手动控制已就绪 · 松手停车",
+                            driveStatus = if (!it.driveConfirmedStopped) "手动控制已就绪 · 轮速反馈告警已记录"
+                                else if (activeChannel.ready.dryRun) "模拟控制 · 不驱动电机" else "手动控制已就绪 · 松手停车",
                             parkingSupported = activeChannel.ready.parkingSupported,
                             parkingSettings = activeChannel.ready.parking,
                             parkingStatus = if (activeChannel.ready.parkingSupported) "驻车电流已读取 · 本页只切换停止模式"
@@ -1632,12 +1663,20 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         val stopAck = if (requestedStop == "estop") activeChannel.exchange(0, 0, emergency = true)
                         else activeChannel.stopAndClose()
                         val measuredStopped = stopAck.stopped && stopAck.hasFreshFeedback()
+                        terminalAcknowledged = true
                         Diagnostics.event("drive.stop_acknowledged", driveDiagnostic,
-                            fields = mapOf("physicalStopped" to measuredStopped), critical = true)
+                            fields = mapOf("physicalStopped" to measuredStopped,
+                                "stopCommandConfirmed" to stopAck.stopCommandConfirmed), critical = true)
                         parkingModeReleased = activeChannel.ready.parkingSupported && stopAck.parking?.enabled == false
                         mutableState.update { it.withDriveFeedback(stopAck).copy(driveConfirmedStopped = measuredStopped,
                             driveStatus = if (measuredStopped) stopReason else "$stopReason · 实测停车尚未确认") }
                         break
+                    }
+                    // The delayed reply only supplies the next token. A fresh neutral ACK
+                    // must precede every queued setting and every newly sampled movement.
+                    if (driveAckRecovering) {
+                        recoverDriveCommunication(activeChannel)
+                        continue
                     }
                     // All configuration shares this loop with heartbeats; a UI callback never
                     // starts a competing channel transaction or queues a movement behind it.
@@ -1707,21 +1746,27 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                             driveInterlock = interlock,
                             parkingSettings = ack.parking,
                             parkingStatus = when {
-                                it.driveStandstillPending && !ack.hasFreshFeedback() -> "停车等待中 · 轮速反馈待更新，电子驻车已暂停"
-                                it.driveStandstillPending && !ack.stopped -> "正在减速，等待停车确认 · 电子驻车已暂停"
-                                it.driveStandstillPending -> "车轮已停稳，松手后可重新开启电子驻车"
-                                wasStandstillPending ->
-                                    "停车已确认，电子驻车保持关闭；需要时请重新开启"
+                                it.driveStandstillPending && !ack.hasFreshFeedback() -> "停车反馈待确认 · 会话保持，等待新鲜轮速反馈"
+                                it.driveStandstillPending && !ack.stopped -> "停车反馈待确认 · 会话保持"
+                                it.driveStandstillPending -> "停车反馈已确认 · 松手后再操作，电流配置未修改"
+                                wasStandstillPending && ack.stopped && ack.hasFreshFeedback() ->
+                                    "停车反馈已确认 · 电流配置未修改"
+                                wasStandstillPending -> "停车反馈待确认 · 会话保持"
                                 else -> it.parkingStatus
                             },
                             driveStatus = when {
+                                it.driveCommunicationDelayed -> "控制回执延迟 · 目标已回零，正在等待通信恢复"
+                                it.driveStandstillPending && !ack.hasFreshFeedback() -> "停车反馈待确认 · 会话保持，轮速反馈待更新"
                                 !ack.hasFreshFeedback() -> "轮速反馈待更新 · 驻车设置暂不可用"
-                                it.driveStandstillPending && !ack.stopped -> "正在减速，等待停车确认"
+                                it.driveStandstillPending && !ack.stopped -> "停车反馈待确认 · 会话保持"
                                 it.driveStandstillPending -> "车轮已停稳 · 松手后再操作"
                                 it.driveFeedbackRecheck && !ack.stopped -> "轮速反馈复核中 · 保持停车"
                                 it.driveFeedbackRecheck -> "反馈已恢复 · 松手后再操作"
                                 driveRecoveryGate.needsRelease -> "网络恢复 · 目标已归零，请松手再操作"
                                 ack.recoveryRequired -> "网络已恢复 · 目标已归零"
+                                ack.hasMinorStoppedFeedbackNoise(maxRpm = activeChannel.ready.feedbackNoiseMaxRpm) && interlock == null ->
+                                    if (activeChannel.ready.dryRun) "模拟控制 · 轮速反馈告警已记录"
+                                    else "手动控制已就绪 · 轮速反馈告警已记录"
                                 ack.targetStopped && !ack.stopped -> "目标已归零 · 等待实测停车"
                                 interlock != null -> interlock.message()
                                 activeChannel.ready.dryRun -> "模拟控制 · 不驱动电机"
@@ -1759,8 +1804,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } finally {
                 channel?.close("drive_cleanup")
+                if (channel != null && !terminalAcknowledged) markDriveCleanupUnconfirmed()
                 driveChannel = null
                 driveRecoveryGate.reset()
+                driveAckRecovering = false
                 desiredWheels = WheelSpeeds()
                 pendingParking = null
                 if (pendingUnifiedParking != null) parkingOperationUnknown(pendingUnifiedParking)
@@ -1772,7 +1819,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 mutableState.update { it.copy(driveStarting = false, driveEnabled = false,
                     driveStopping = true, driveLeft = 0, driveRight = 0, driveStandstillPending = false) }
                 withContext(NonCancellable) {
-                    if (client.isConnected) {
+                    val intentionalStop = stopRequest != null && firstDriveStopSource != ControlStopSource.TRANSPORT_LOST
+                    if (client.isConnected && (!state.value.driveCleanupUnconfirmed || intentionalStop)) {
                         try { changeVideoService(false, driveDiagnostic) } catch (_: Exception) { /* Expose unconfirmed cleanup. */ }
                     }
                 }
@@ -1781,21 +1829,154 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         parkingSupported = false, parkingSettings = null, parkingUpdating = false, driveInterlock = null,
                         driveFeedbackVerified = false,
                         driveRecoveryNeedsRelease = false, driveFeedbackRecheck = false, driveStandstillPending = false,
+                        driveCommunicationDelayed = false,
                         parkingStatus = if (parkingModeReleased && channel?.ready?.dryRun == true) "模拟驻车模式已退出，电流参数未修改"
                             else if (parkingModeReleased) "驻车模式已退出，电机电流参数未修改"
                             else if (it.driveError != null) it.parkingStatus
                             else "驻车状态未确认，重新启用后读取",
                         driveLeft = 0, driveRight = 0, connected = client.isConnected,
-                        status = if (client.isConnected) it.status else "连接已断开")
+                        status = if (!client.isConnected) "连接已断开"
+                            else if (it.driveCleanupUnconfirmed) "控制退出待确认 · SSH 连通性待检查" else it.status)
                 }
                 Diagnostics.event("drive.finished", driveDiagnostic, source = firstDriveStopSource?.name,
                     fields = mapOf("stopAcknowledged" to state.value.driveConfirmedStopped,
                         "transportConnected" to client.isConnected), critical = true)
+                if (state.value.driveCleanupUnconfirmed && client.isConnected && !disconnecting)
+                    inspectDriveCleanupAfterExit("DRIVE_EXIT")
+            }
+        }
+    }
+
+    private fun beginDriveCommunicationRecovery(elapsedMs: Long? = null) {
+        if (stopRequest != null) return
+        val first = !driveAckRecovering
+        driveAckRecovering = true
+        driveRecoveryGate.recovered(neutralRequest = false)
+        if (first || !desiredWheels.stopped) desiredGeneration += 1
+        desiredWheels = WheelSpeeds()
+        mutableState.update { it.copy(driveCommunicationDelayed = true,
+            driveLeft = 0, driveRight = 0, driveConfirmedStopped = false, driveFeedbackVerified = false,
+            driveRecoveryNeedsRelease = driveRecoveryGate.needsRelease,
+            driveStatus = "控制回执延迟 · 目标已回零，正在等待通信恢复") }
+        if (first) Diagnostics.event("drive.communication_wait", driveDiagnostic,
+            fields = mapOf("elapsedMs" to elapsedMs, "needsRelease" to driveRecoveryGate.needsRelease), critical = true)
+    }
+
+    /** This is a new sequenced request, never a retransmission of the delayed target. */
+    private suspend fun recoverDriveCommunication(channel: BoardDriveChannel) {
+        while (driveAckRecovering && stopRequest == null) {
+            val started = System.nanoTime()
+            val ack = channel.exchange(0, 0)
+            handleDriveRecovery(ack, neutralRequest = true)
+            observeDriveParking(ack)
+            // This matching new sequence confirms the neutral command. Wheel feedback
+            // has its own stricter age budget and must not keep a healthy 700 ms link locked.
+            val freshNeutral = !ack.communicationDelayed && ack.targetStopped
+            if (freshNeutral) driveAckRecovering = false
+            mutableState.update { it.withDriveFeedback(ack).copy(
+                driveCommunicationDelayed = driveAckRecovering,
+                driveConfirmedStopped = freshNeutral && ack.stopped && ack.hasFreshFeedback(),
+                parkingSettings = ack.parking,
+                driveRecoveryNeedsRelease = driveRecoveryGate.needsRelease,
+                driveStatus = when {
+                    !freshNeutral -> "目标已回零 · 等待新的回中回执"
+                    driveRecoveryGate.needsRelease -> "通信已恢复 · 请松手后重新操作"
+                    ack.standstillPending || ack.feedbackRecheck -> "通信已恢复 · 停车反馈待确认"
+                    else -> "通信已恢复 · 可以重新操作"
+                }) }
+            if (freshNeutral) {
+                markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
+                Diagnostics.event("drive.communication_recovered", driveDiagnostic,
+                    fields = mapOf("neutralAcknowledged" to true, "needsRelease" to driveRecoveryGate.needsRelease),
+                    critical = true)
+            } else {
+                val remaining = driveHeartbeatWaitMs(started)
+                if (remaining > 0) withTimeoutOrNull(remaining) { driveWakeup.receive() }
+            }
+        }
+    }
+
+    private fun markDriveCleanupUnconfirmed() {
+        preferences.edit().putBoolean("drive_cleanup_unconfirmed", true).apply()
+        mutableState.update { it.copy(driveCleanupUnconfirmed = true, driveConfirmedStopped = false,
+            driveFeedbackVerified = false) }
+        val route = if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL
+        networkStatus.update { it.updateRoute(route, it.route(route).invalidate()) }
+        Diagnostics.event("drive.cleanup_unconfirmed", driveDiagnostic, critical = true)
+    }
+
+    /** Read-only ownership inspection may release a lock, never start a control session. */
+    fun refreshDriveAvailability() {
+        if (!state.value.canInspectFollow || !state.value.driveCleanupUnconfirmed) return
+        inspectDriveCleanupAfterExit("USER_INSPECT")
+    }
+
+    private fun inspectDriveCleanupAfterExit(source: String) {
+        if (disconnecting || !client.isConnected || !state.value.driveCleanupUnconfirmed) return
+        val connectionId = client.diagnosticConnectionId
+        val previous = driveAvailabilityJob?.takeIf { it.isActive }
+        if (previous != null) {
+            if (driveAvailabilityConnectionId != connectionId) viewModelScope.launch {
+                // Never cancel a read-only SSH operation just to replace its observer:
+                // cancellation of a blocked channel open can close that transport.
+                previous.join()
+                if (client.diagnosticConnectionId == connectionId) inspectDriveCleanupAfterExit(source)
+            }
+            return
+        }
+        val operationId = driveDiagnostic.operationId
+        fun stillCurrent() = !disconnecting && client.diagnosticConnectionId == connectionId &&
+            driveDiagnostic.operationId == operationId && state.value.driveCleanupUnconfirmed
+        fun sameOperationAfterLoss() = !disconnecting && !client.isConnected &&
+            client.diagnosticConnectionId == null && driveDiagnostic.operationId == operationId &&
+            state.value.driveCleanupUnconfirmed
+        driveAvailabilityConnectionId = connectionId
+        driveAvailabilityJob = viewModelScope.launch {
+            for (waitMs in listOf(0L, 500L, 1_000L, 1_500L)) {
+                if (waitMs > 0) delay(waitMs)
+                if (!stillCurrent() || !client.isConnected) return@launch
+                val diagnostic = Diagnostics.newContext(connectionId)
+                mutableState.update { it.copy(driveStatus = "正在检查上次手动控制占用…") }
+                try {
+                    // A bounded command on the retained SSH session proves more than its
+                    // local isConnected flag. It never opens serial, cameras or a new run.
+                    val availability = withTimeoutOrNull(3_000L) { client.readFollowAvailability(diagnostic) }
+                    if (availability == null) throw SocketTimeoutException("控制占用检查超时")
+                    if (!stillCurrent()) return@launch
+                    markBoardReachable(if (state.value.remoteMode) BoardRoute.REMOTE else BoardRoute.LOCAL)
+                    Diagnostics.event("drive.availability_result", diagnostic, source = source,
+                        fields = mapOf("controlAvailable" to availability.controlAvailable,
+                            "controlOperationId" to operationId))
+                    if (availability.controlAvailable) {
+                        preferences.edit().putBoolean("drive_cleanup_unconfirmed", false).apply()
+                        mutableState.update { it.copy(driveCleanupUnconfirmed = false,
+                            status = "已连接", driveStatus = "控制占用已释放 · 可手动重新启用；实测停车未确认") }
+                        return@launch
+                    }
+                    mutableState.update { it.copy(status = "已连接 · 上次控制仍被占用",
+                        driveStatus = "上次控制仍被占用 · 保持锁定，可检查控制占用") }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    if (!stillCurrent() && !sameOperationAfterLoss()) return@launch
+                    // Append inspection evidence without replacing the original drive fault.
+                    Diagnostics.event("drive.availability_failed", diagnostic, source = source,
+                        fields = mapOf("exceptionClass" to failure.javaClass.simpleName,
+                            "controlOperationId" to operationId), critical = true)
+                    mutableState.update { it.withTransportState(client.isConnected).copy(
+                        status = if (client.isConnected) "SSH 连通性待确认" else "连接已断开",
+                        driveStatus = if (client.isConnected) "控制退出待确认 · 请检查控制占用"
+                            else "控制退出待确认 · 重新连接后检查控制占用") }
+                    if (!client.isConnected) return@launch
+                }
             }
         }
     }
 
     private fun handleDriveRecovery(ack: DriveAck, neutralRequest: Boolean = false) {
+        // The read coroutine may win the race with its warning callback at the soft
+        // boundary. The reply flag is authoritative even if that callback was cancelled.
+        if (ack.communicationDelayed) beginDriveCommunicationRecovery()
         val before = state.value
         val hadMotionTarget = !desiredWheels.stopped
         mutableState.update { it.copy(driveFeedbackRecheck = ack.feedbackRecheck ||
@@ -1828,6 +2009,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     fun moveJoystick(x: Float, forward: Float) {
         if (!state.value.driveEnabled || state.value.followBlocksControl || stopRequest != null) return
+        if (driveAckRecovering) {
+            driveRecoveryGate.input()
+            driveRecoveryGate.recovered(neutralRequest = false)
+            mutableState.update { it.copy(driveRecoveryNeedsRelease = true) }
+            return
+        }
         if (state.value.parkingUpdating || pendingParking != null || pendingUnifiedParking != null) {
             driveRecoveryGate.input()
             driveRecoveryGate.recovered(neutralRequest = false)
@@ -1861,6 +2048,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         desiredWheels = WheelSpeeds()
         mutableState.update { it.copy(driveLeft = 0, driveRight = 0, driveRecoveryNeedsRelease = false,
             driveStatus = when {
+                it.driveCommunicationDelayed -> "已回中 · 等待通信恢复和新的回中回执"
                 it.driveStandstillPending && !it.driveConfirmedStopped -> "已回中 · 等待停车确认"
                 it.driveStandstillPending -> "已回中 · 等待停车恢复回执"
                 it.driveFeedbackRecheck -> "已回中 · 等待反馈恢复回执"
@@ -1871,7 +2059,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun changeSpeedLimit(value: Int) {
-        if (state.value.parkingUpdating || state.value.driveFeedbackRecheck || state.value.driveStandstillPending ||
+        if (state.value.driveCommunicationDelayed || state.value.parkingUpdating || state.value.driveFeedbackRecheck || state.value.driveStandstillPending ||
             state.value.driveRecoveryNeedsRelease ||
             !desiredWheels.stopped || (state.value.driveEnabled &&
                 (!state.value.driveConfirmedStopped || !state.value.hasFreshDriveFeedback()))) return
@@ -1910,6 +2098,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun disableDrive(reason: String = "手动控制已停用", emergency: Boolean = false,
         source: ControlStopSource = if (emergency) ControlStopSource.EMERGENCY_STOP else ControlStopSource.USER_STOP,
     ) {
+        if (!emergency && source == ControlStopSource.WINDOW_FOCUS_LOST) {
+            Diagnostics.event("drive.focus_loss_ignored", activeDiagnostic(), source = source.name)
+            return
+        }
         if (driveJob?.isActive != true) return
         if (firstDriveStopSource == null) firstDriveStopSource = source
         Diagnostics.event("drive.stop_requested", driveDiagnostic, source = source.name,
@@ -2266,6 +2458,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     fun onControlSurfaceHidden(reason: String, source: ControlStopSource = ControlStopSource.CONTROL_SURFACE_HIDDEN) {
         Diagnostics.event("ui.control_surface_hidden", activeDiagnostic(), source = source.name,
             fields = mapOf("followActive" to state.value.followActive, "manualActive" to state.value.manualActive), critical = true)
+        if (source == ControlStopSource.WINDOW_FOCUS_LOST) return
         disableDrive(reason, source = source)
         stopFollow("$reason，正在请求结束跟随", source)
         cancelMotorAction(reason, source)

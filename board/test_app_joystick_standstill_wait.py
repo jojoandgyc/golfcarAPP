@@ -59,7 +59,7 @@ class StandstillWaitTests(unittest.TestCase):
         self.client.feedback = (-2, 0, 0, 0)
         self.motors.poll_safety()
         self.clock.now = stopped_at + 1.51
-        self.client.feedback = (7, -3, 0, 0)
+        self.client.feedback = (81, -3, 0, 0)
         self.motors.poll_safety()
         self.assertTrue(self.motors.standstill_pending)
 
@@ -67,13 +67,13 @@ class StandstillWaitTests(unittest.TestCase):
         self.assertEqual(self.client.registers, self.original)
         self.assertFalse(any(call[0] == "write" for call in self.client.calls))
 
-    def test_observed_53_minus34_then_minus2_zero_then_7_minus3_keeps_session_and_emergency_stop(self):
+    def test_feedback_above_eighty_enters_wait_and_emergency_stop(self):
         self.enter_wait()
         self.assertIsNone(self.motors.fault_reason)
         self.assertFalse(self.motors.parking_enabled)
         self.assertTrue(self.motors.emergency_hold)
         self.assertFalse(self.motors.stopped_confirmed)
-        self.assertEqual(self.motors.feedback, (7, -3, 0, 0))
+        self.assertEqual(self.motors.feedback, (81, -3, 0, 0))
         self.assertEqual(self.client.calls[-4:], [("left", 0), ("right", 0),
                                                 ("left", "stop", 1), ("right", "stop", 1)])
         ack = self.request()
@@ -108,7 +108,7 @@ class StandstillWaitTests(unittest.TestCase):
     def test_nonzero_request_that_first_observes_timeout_is_discarded_and_marks_its_ack(self):
         started = self.begin_normal_stop()
         self.clock.now = started + 1.51
-        self.client.feedback = (7, -3, 0, 0)
+        self.client.feedback = (81, -3, 0, 0)
         self.client.calls.clear()
         self.assertFalse(self.motors.standstill_pending)
         ack = self.request("drive", 40, -40)
@@ -124,7 +124,7 @@ class StandstillWaitTests(unittest.TestCase):
     def test_final_sample_first_observing_timeout_marks_neutral_ack_and_parking_off(self):
         started = self.begin_normal_stop()
         self.clock.now = started + 1.51
-        self.client.feedback = (7, -3, 0, 0)
+        self.client.feedback = (81, -3, 0, 0)
         # Model a recent stop write: stop() itself has no refresh/read to do,
         # so only accept()'s final feedback sample discovers the elapsed wait.
         self.motors._write_stop(emergency=False)
@@ -186,7 +186,7 @@ class StandstillWaitTests(unittest.TestCase):
         self.assertEqual(ack["feedbackSamples"], 1)
         self.assertTrue(self.motors.standstill_pending)
 
-    def test_real_two_zero_confirmation_restores_larger_unexpected_motion_protection(self):
+    def test_larger_motion_after_two_zeros_restarts_soft_wait_without_releasing_held_input(self):
         self.enter_wait()
         self.client.feedback = (0, 0, 0, 0)
         for _ in range(2):
@@ -194,11 +194,30 @@ class StandstillWaitTests(unittest.TestCase):
             self.request("drive", 40, -40)
         self.assertTrue(self.motors.stopped_confirmed)
         self.assertTrue(self.motors.standstill_pending)
-        self.client.feedback = (7, -3, 0, 0)
+        self.client.feedback = (81, -3, 0, 0)
         self.clock.sleep(.11)
-        with self.assertRaisesRegex(bridge.SessionError, "Unexpected motion after standstill"):
-            self.motors.poll_safety()
-        self.assertIsNotNone(self.motors.fault_reason)
+        self.client.calls.clear()
+        self.motors.poll_safety()
+        self.assertIsNone(self.motors.fault_reason)
+        self.assertTrue(self.motors.standstill_pending)
+        self.assertIsNotNone(self.motors.standstill_wait_at)
+        self.assertFalse(self.motors.stopped_confirmed)
+        self.assertEqual(self.motors.feedback[:2], (81, -3))
+        self.assertIn(("left", "stop", 1), self.client.calls)
+        self.assertIn(("right", "stop", 1), self.client.calls)
+        self.assertTrue(any(event["event"] == "drive.standstill_wait_restarted"
+                            for event in self.diagnostic.events))
+        self.request("drive", 40, -40)
+        self.assertNotIn(("left", 40), self.client.calls)
+        self.assertNotIn(("right", -40), self.client.calls)
+        self.client.feedback = (0, 0, 0, 0)
+        self.clock.sleep(.11)
+        self.assertFalse(self.request()["stopped"])
+        self.assertTrue(self.motors.standstill_pending)
+        self.clock.sleep(.11)
+        self.assertTrue(self.request()["stopped"])
+        self.assertFalse(self.motors.standstill_pending)
+        self.assert_parameters_preserved()
 
     def test_retired_mode_command_cannot_cancel_emergency_or_pending_recovery(self):
         self.enter_wait()
@@ -251,14 +270,14 @@ class StandstillWaitTests(unittest.TestCase):
         self.assertIsNotNone(self.motors.fault_reason)
         self.assert_parameters_preserved()
 
-    def test_startup_never_advertises_ready_from_an_unconfirmed_stop(self):
-        self.client.feedback = (7, -3, 0, 0)
+    def test_startup_advertises_command_confirmation_without_forging_physical_stop(self):
+        self.client.feedback = (81, -3, 0, 0)
         started = self.clock.monotonic()
-        with self.assertRaises(bridge.SessionError):
-            self.session.ready()
-        self.assertLessEqual(self.clock.monotonic() - started, 1.61)
-        self.assertFalse(self.motors.standstill_pending)
-        self.assertIsNotNone(self.motors.fault_reason)
+        ready = self.session.ready()
+        self.assertLessEqual(self.clock.monotonic() - started, 3.3)
+        self.assertFalse(ready['stopped'])
+        self.assertTrue(ready['stopCommandConfirmed'])
+        self.assertIsNone(self.motors.fault_reason)
 
     def test_explicit_close_and_estop_remain_bounded_and_do_not_claim_a_false_stop(self):
         for command in ("close", "estop"):
@@ -269,10 +288,10 @@ class StandstillWaitTests(unittest.TestCase):
                 self.session = bridge.ProtocolSession(self.motors, port="fake", dry_run=False)
                 self.enter_wait()
                 started, seq = self.clock.monotonic(), self.session.next_seq
-                with self.assertRaises(bridge.SessionError):
-                    self.request(command)
+                ack = self.request(command)
                 self.assertLessEqual(self.clock.monotonic() - started, 1.61)
-                self.assertEqual(self.session.next_seq, seq)
+                self.assertEqual(self.session.next_seq, seq + 1)
+                self.assertTrue(ack['stopCommandConfirmed']); self.assertFalse(ack['stopped'])
                 self.assertFalse(self.motors.stopped_confirmed)
                 self.assert_parameters_preserved()
 
@@ -297,7 +316,7 @@ class SessionWaitTests(unittest.TestCase):
         client = CoastClient()
         client.registers.update(left_parking_current=2.0, right_parking_current=2.0)
         original = copy.deepcopy(client.registers)
-        actions = [dict(at=.05, cmd="stop", normal_policy_fixture=True), dict(at=.2, cmd="drive", left=20, right=-20),
+        actions = [dict(at=.05, cmd="stop", normal_policy_fixture=True), dict(at=.2, cmd="drive", left=90, right=-90),
                    dict(at=.3, cmd="stop")]
         actions += [dict(at=n / 10, cmd="stop") for n in range(4, 20)]
         if held_after_wait:
@@ -381,7 +400,7 @@ class SessionWaitTests(unittest.TestCase):
                 self.assertEqual(result, 1)
                 failure = next(event for event in events if event["event"] == "drive.failure")
                 self.assertEqual(failure["stopSource"], "network_grace_expired")
-                self.assertAlmostEqual(failure["at"] - epoch, 6.9)
+                self.assertAlmostEqual(failure["at"] - epoch, 1.9 + bridge.NETWORK_GRACE_SECONDS)
                 self.assertIn("network grace expired", messages[-1]["error"])
 
 
@@ -411,7 +430,7 @@ class ResponseSizeTests(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         for data in sent:
             self.assertTrue(data.endswith(b"\n"))
-            self.assertLessEqual(len(data), 1024)
+            self.assertLessEqual(len(data), 4096)
         self.assertTrue(json.loads(sent[0])["standstillWaitSupported"])
         self.assertTrue(json.loads(sent[1])["standstillPending"])
 

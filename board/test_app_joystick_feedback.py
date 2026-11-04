@@ -183,7 +183,7 @@ class ParkingFeedbackTests(unittest.TestCase):
             read_starts.append(self.clock.monotonic() - epoch)
             self.clock.sleep(.105)
             # Deceleration consumes most of the first confirmation's budget.
-            self.client.feedback = (20, -20, 0, 0) if len(read_starts) <= 5 else (0, 0, 0, 0)
+            self.client.feedback = (81, -20, 0, 0) if len(read_starts) <= 5 else (0, 0, 0, 0)
             return original_read(address, count)
 
         def slow_stop(side, mode):
@@ -269,7 +269,7 @@ class ParkingFeedbackTests(unittest.TestCase):
     def test_queued_neutral_checks_feedback_before_stop_refresh_can_hide_motion(self):
         self.initialize()
         self.clock.sleep(.21)
-        self.client.feedback = (3, 0, 0, 0)
+        self.client.feedback = (81, 0, 0, 0)
         observed = []
         original = self.client.set_left_speed
 
@@ -279,10 +279,12 @@ class ParkingFeedbackTests(unittest.TestCase):
             self.client.feedback = (0, 0, 0, 0)
 
         with patch.object(self.client, "set_left_speed", side_effect=stop_and_erase_feedback):
-            with self.assertRaisesRegex(bridge.SessionError, "Unexpected motion"):
-                self.motors.stop()
-        self.assertEqual(observed[0], (3, 0, 0, 0))
-        self.assertTrue(self.motors.fault_reason)
+            self.motors.stop()
+        self.assertEqual(observed[0], (81, 0, 0, 0))
+        self.assertIsNone(self.motors.fault_reason)
+        self.assertTrue(self.motors.standstill_pending)
+        self.assertEqual(self.motors.feedback[:2], (81, 0), "corrective writes must not erase initiating evidence")
+        self.assertFalse(self.motors.stopped_confirmed)
         self.assert_emergency_attempted()
         self.assert_no_parameter_writes()
 
@@ -299,8 +301,8 @@ class ParkingFeedbackTests(unittest.TestCase):
         self.assertTrue(self.motors.parking_enabled)
         self.assert_no_parameter_writes()
 
-    def test_feedback_above_recheck_limit_trips_immediately_on_either_wheel(self):
-        for left, right in ((3, 0), (-3, 0), (0, 3), (0, -3), (2, -3)):
+    def test_feedback_above_noise_limit_stops_and_waits_without_ending_session(self):
+        for left, right in ((81, 0), (-81, 0), (0, 81), (0, -81), (2, -81)):
             with self.subTest(left=left, right=right):
                 client = FakeClient()
                 motors = bridge.Motors(client)
@@ -308,18 +310,21 @@ class ParkingFeedbackTests(unittest.TestCase):
                 client.calls.clear()
                 client.feedback = (left, right, 0, 0)
                 self.clock.sleep(.101)
-                with self.assertRaises(bridge.SessionError):
-                    motors.poll_safety()
-                self.assertIn(("left", "stop", 1), client.calls)
-                self.assertIn(("right", "stop", 1), client.calls)
+                motors.poll_safety()
+                self.assertIsNone(motors.fault_reason)
+                self.assertTrue(motors.standstill_pending)
+                self.assertEqual(motors.feedback[:2], (left, right))
+                self.assertIn(('left', 'stop', 1), client.calls)
+                self.assertIn(('right', 'stop', 1), client.calls)
                 self.assertFalse(motors.stopped_confirmed)
-                # Returning zero cannot silently clear the fault or resume movement.
+                # A first zero or a held target cannot silently resume motion.
                 client.feedback = (0, 0, 0, 0)
-                with self.assertRaises(bridge.SessionError):
-                    motors.drive(10, -10)
-                self.assertNotIn(("left", 10), client.calls)
+                self.assertEqual(motors.drive(10, -10), (0, 0))
+                self.assertNotIn(('left', 10), client.calls)
+                self.assertTrue(motors.standstill_pending)
+                self.assertFalse(any(call[0] == 'write' for call in client.calls))
 
-    def test_small_signed_feedback_stays_raw_and_requires_recheck_without_claiming_stop(self):
+    def test_small_signed_feedback_stays_raw_without_recovery_or_false_stop(self):
         for left, right in ((1, 0), (-1, 0), (2, 0), (-2, 0),
                             (0, 1), (0, -1), (0, 2), (0, -2), (-2, 2)):
             with self.subTest(left=left, right=right):
@@ -331,270 +336,281 @@ class ParkingFeedbackTests(unittest.TestCase):
                 self.clock.sleep(.101)
                 motors.poll_safety()
                 self.assertIsNone(motors.fault_reason)
-                self.assertIsNotNone(motors.motion_recheck_at)
-                self.assertTrue(motors.motion_recovery_required)
+                self.assertIsNone(motors.motion_recheck_at)
+                self.assertFalse(motors.motion_recovery_required)
+                self.assertFalse(motors.standstill_pending)
                 self.assertEqual(motors.feedback[:2], (left, right))
                 self.assertEqual(motors.zero_samples, 0)
                 self.assertFalse(motors.stopped_confirmed)
-                self.assertFalse(any(call[0] == "write" for call in client.calls))
+                self.assertEqual(motors.drive(40, -40), (40, -40))
+                self.assertIn(('left', 40), client.calls)
+                self.assertIn(('right', -40), client.calls)
+                self.assertFalse(any(call[0] == 'write' for call in client.calls))
 
-    def pending_from_zero_time(self):
-        # Zero is a valid monotonic timestamp, not an absent-timer sentinel.
+    def noise_from_zero_time(self):
+        # Monotonic time zero is valid; no 600 ms fault timer should be armed.
         self.clock.now = -1.0
         self.initialize()
         self.clock.now = 0.0
         self.client.feedback = (-1, 0, 0, 0)
         self.motors._sample_feedback(force=True)
-        self.assertEqual(self.motors.motion_recheck_at, 0.0)
+        self.assertIsNone(self.motors.motion_recheck_at)
+        self.assertFalse(self.motors.feedback_recovery_required)
 
-    def test_recheck_fixed_deadline_survives_zero_timestamp_repeats_side_and_sign_changes(self):
-        self.pending_from_zero_time()
+    def test_sign_side_and_zero_changes_beyond_old_deadline_never_create_recovery(self):
+        self.noise_from_zero_time()
         for at, feedback in ((0.0, (-1, 0, 0, 0)), (.1, (0, 0, 0, 0)),
                              (.2, (0, 2, 0, 0)), (.3, (-2, 0, 0, 0)),
-                             (.4, (0, -2, 0, 0)), (.599, (1, 0, 0, 0))):
+                             (.6, (0, -2, 0, 0)), (1.5, (1, 0, 0, 0)),
+                             (6.0, (0, 2, 0, 0)), (60.0, (-2, 2, 0, 0))):
             self.clock.now = at
             self.client.feedback = feedback
             for _ in range(3):
                 self.motors._sample_feedback(force=True)
-            self.assertEqual(self.motors.motion_recheck_at, 0.0)
+            self.assertIsNone(self.motors.motion_recheck_at)
+            self.assertIsNone(self.motors.fault_reason)
+            self.assertFalse(self.motors.feedback_recovery_required)
+            self.assertFalse(self.motors.standstill_pending)
             self.assertFalse(self.motors.stopped_confirmed)
-        self.clock.now = .6
-        with self.assertRaises(bridge.SessionError):
-            self.motors._sample_feedback(force=True)
-        self.assert_emergency_attempted()
-        self.assertIsNotNone(self.motors.fault_reason)
+            self.assertEqual(self.motors.feedback, feedback)
         self.assert_no_parameter_writes()
 
-    def test_one_late_zero_cannot_extend_recheck_until_a_second_sample_after_deadline(self):
-        self.pending_from_zero_time()
+    def test_noise_warning_is_throttled_across_sign_changes_and_intervening_zeros(self):
+        self.initialize()
+        events = []
+        clock = self.clock
+        class Diagnostic:
+            def event(self, name, **fields):
+                events.append(dict(event=name, at=clock.monotonic(), **fields))
+        self.motors.diagnostic = Diagnostic()
+        epoch = self.clock.monotonic()
+        values = ((1, 0, 0, 0), (0, 0, 0, 0), (0, -2, 0, 0), (-1, 1, 0, 0))
+        for index in range(121):
+            self.clock.now = epoch + index * .02
+            self.client.feedback = values[index % len(values)]
+            self.motors._sample_feedback(force=True)
+        warnings = [row for row in events if row['event'] == 'drive.feedback_noise_warning']
+        self.assertGreaterEqual(len(warnings), 2)
+        self.assertLessEqual(len(warnings), 3)
+        self.assertTrue(all(not row.get('critical', False) for row in warnings))
+        self.assertTrue(all(second['at'] - first['at'] >= .999
+                            for first, second in zip(warnings, warnings[1:])))
+        self.assertTrue(all(0 < row['maxRpm'] <= 80 and row['sampleCount'] >= 1 for row in warnings))
+        self.assertFalse(self.motors.feedback_recovery_required)
+        self.assert_no_parameter_writes()
+
+    def test_one_late_zero_still_needs_a_distinct_fresh_second_zero(self):
+        self.noise_from_zero_time()
         self.clock.now = .55
         self.client.feedback = (0, 0, 0, 0)
         self.motors._sample_feedback(force=True)
         self.assertEqual(self.motors.zero_samples, 1)
         self.assertFalse(self.motors.stopped_confirmed)
         self.clock.now = .6
-        with self.assertRaises(bridge.SessionError):
-            self.motors._sample_feedback(force=True)
-        self.assert_emergency_attempted()
+        self.motors._sample_feedback(force=True)
+        self.assertEqual(self.motors.zero_samples, 1)
+        self.assertFalse(self.motors.stopped_confirmed)
+        self.clock.now = .651
+        self.motors._sample_feedback(force=True)
+        self.assertTrue(self.motors.stopped_confirmed)
+        self.assertFalse(self.motors.feedback_recovery_required)
+        self.assertIsNone(self.motors.fault_reason)
 
-    def test_cached_feedback_poll_cannot_skip_the_absolute_600ms_deadline(self):
-        self.pending_from_zero_time()
+    def test_cached_noise_at_old_600ms_deadline_is_not_a_fatal_timer(self):
+        self.noise_from_zero_time()
         self.clock.now = .599
         self.motors._sample_feedback(force=True)
-        reads = len(self.client.feedback_reads)
         self.client.calls.clear()
         self.clock.now = .6
-        with self.assertRaisesRegex(bridge.SessionError, "recheck timed out"):
-            self.motors.poll_safety()
-        self.assertEqual(len(self.client.feedback_reads), reads,
-                         "an unexpired sampling cache must not postpone the independent deadline")
+        self.motors.poll_safety()
+        self.assertIsNone(self.motors.fault_reason)
+        self.assertFalse(self.motors.feedback_recovery_required)
+        self.assertFalse(self.motors.stopped_confirmed)
+        self.assertEqual(self.motors.feedback[:2], (-1, 0))
         self.assert_emergency_attempted()
         self.assert_no_parameter_writes()
 
-    def test_feedback_read_crossing_recheck_deadline_cannot_return_success(self):
-        self.pending_from_zero_time()
+    def test_feedback_read_crossing_old_deadline_keeps_real_zero_sample_count(self):
+        self.noise_from_zero_time()
         self.clock.now = .59
         original = self.client.read_holding_registers
-
         def delayed_read(address, count):
             self.clock.sleep(.02)
             self.client.feedback = (0, 0, 0, 0)
             return original(address, count)
-
-        with patch.object(self.client, "read_holding_registers", side_effect=delayed_read):
-            with self.assertRaisesRegex(bridge.SessionError, "recheck timed out"):
-                self.motors._sample_feedback(force=True)
+        with patch.object(self.client, 'read_holding_registers', side_effect=delayed_read):
+            self.motors._sample_feedback(force=True)
+        self.assertEqual(self.motors.zero_samples, 1)
         self.assertFalse(self.motors.stopped_confirmed)
-        self.assert_emergency_attempted()
+        self.assertFalse(self.motors.feedback_recovery_required)
+        self.assertIsNone(self.motors.fault_reason)
 
-    def test_two_fresh_zero_samples_end_recheck_but_do_not_authorize_motion(self):
-        self.pending_from_zero_time()
+    def test_two_fresh_zero_samples_after_noise_need_no_extra_release_gesture(self):
+        self.noise_from_zero_time()
         self.client.feedback = (0, 0, 0, 0)
         self.clock.now = .2
         self.motors._sample_feedback(force=True)
         self.motors._sample_feedback(force=True)
         self.assertEqual(self.motors.zero_samples, 1)
-        self.assertIsNotNone(self.motors.motion_recheck_at)
         self.clock.now = .301
         self.motors._sample_feedback(force=True)
-        self.assertIsNone(self.motors.motion_recheck_at)
         self.assertTrue(self.motors.stopped_confirmed)
-        self.assertTrue(self.motors.motion_recovery_required)
+        self.assertFalse(self.motors.feedback_recovery_required)
         self.client.calls.clear()
-        self.assertEqual(self.motors.drive(40, -40), (0, 0))
-        self.assertNotIn(("left", 40), self.client.calls)
-        self.assertNotIn(("right", -40), self.client.calls)
-        self.assertTrue(self.motors.motion_recovery_required)
+        self.assertEqual(self.motors.drive(40, -40), (40, -40))
+        self.assertIn(('left', 40), self.client.calls)
+        self.assertIn(('right', -40), self.client.calls)
 
-    def test_old_stop_deadline_does_not_turn_first_idle_jitter_into_immediate_failure(self):
+    def test_old_stop_deadline_does_not_turn_idle_jitter_into_a_wait_lock(self):
         self.initialize()
         self.clock.sleep(20.0)
         self.client.feedback = (-1, 0, 0, 0)
         self.motors.poll_safety()
         self.assertIsNone(self.motors.fault_reason)
-        self.assertIsNotNone(self.motors.motion_recheck_at)
+        self.assertIsNone(self.motors.motion_recheck_at)
+        self.assertFalse(self.motors.feedback_recovery_required)
         self.assertFalse(self.motors.stopped_confirmed)
         self.assert_no_parameter_writes()
 
-    def test_feedback_faults_and_transport_errors_are_immediate_even_during_recheck(self):
-        for failure in ((0, 0, 1, 0), (0, 0, 0, 1), [], TimeoutError("feedback unavailable")):
+    def test_feedback_faults_and_transport_errors_remain_immediate_after_noise(self):
+        for failure in ((0, 0, 1, 0), (0, 0, 0, 1), [], TimeoutError('feedback unavailable')):
             with self.subTest(failure=failure):
                 client = FakeClient()
                 motors = bridge.Motors(client)
                 motors.initialize()
                 client.feedback = (-1, 0, 0, 0)
                 motors._sample_feedback(force=True)
-                self.assertIsNotNone(motors.motion_recheck_at)
+                self.assertFalse(motors.feedback_recovery_required)
                 client.calls.clear()
                 client.feedback_samples.append(failure)
                 with self.assertRaises(bridge.SessionError):
                     motors._sample_feedback(force=True)
-                self.assertIn(("left", "stop", 1), client.calls)
-                self.assertIn(("right", "stop", 1), client.calls)
+                self.assertIn(('left', 'stop', 1), client.calls)
+                self.assertIn(('right', 'stop', 1), client.calls)
                 self.assertIsNotNone(motors.fault_reason)
 
-    def test_small_feedback_escalating_to_three_rpm_is_immediate_not_debounced(self):
-        self.pending_from_zero_time()
+    def test_feedback_above_eighty_rpm_enters_soft_stop_wait(self):
+        self.noise_from_zero_time()
         self.clock.now = .02
-        self.client.feedback = (0, -3, 0, 0)
-        with self.assertRaises(bridge.SessionError):
-            self.motors._sample_feedback(force=True)
+        self.client.feedback = (0, -81, 0, 0)
+        self.motors._sample_feedback(force=True)
+        self.assertTrue(self.motors.standstill_pending)
+        self.assertIsNotNone(self.motors.standstill_wait_at)
+        self.assertIsNone(self.motors.fault_reason)
+        self.assertFalse(self.motors.stopped_confirmed)
         self.assert_emergency_attempted()
 
-    def test_protocol_suppresses_held_motion_until_confirmed_neutral_then_fresh_input(self):
-        session = bridge.ProtocolSession(self.motors, port="fake", dry_run=False)
+    def test_protocol_soft_wait_suppresses_held_motion_until_two_zeros_and_neutral(self):
+        session = bridge.ProtocolSession(self.motors, port='fake', dry_run=False)
         session.ready()
         self.client.calls.clear()
-
-        def request(command="drive", left=40, right=-40):
-            return session.accept({"seq": session.next_seq, "token": session.token,
-                                   "cmd": command, "left": left, "right": right})[0]
-
-        self.client.feedback = (-1, 0, 0, 0)
+        def request(command='drive', left=40, right=-40):
+            return session.accept(dict(seq=session.next_seq, token=session.token,
+                cmd=command, left=left, right=right))[0]
+        self.client.feedback = (-81, 0, 0, 0)
         self.clock.sleep(.101)
         first = request()
-        self.assertEqual((first["left"], first["right"]), (0, 0))
-        self.assertTrue(first["targetStopped"])
-        self.assertFalse(first["stopped"])
-        self.assertTrue(first["feedbackRecheck"])
-        self.assertTrue(first["recoveryRequired"])
-        self.assertTrue(session.recovery_active)
+        self.assertEqual((first['left'], first['right']), (0, 0))
+        self.assertTrue(first['standstillPending'])
+        self.assertTrue(first['feedbackRecheck'])
+        self.assertTrue(first['recoveryRequired'])
+        self.assertFalse(first['stopped'])
+        self.assertIsNone(self.motors.fault_reason)
         self.client.feedback = (0, 0, 0, 0)
         self.clock.sleep(.12)
-        first_zero = request()
-        self.assertTrue(first_zero["feedbackRecheck"])
-        self.assertFalse(first_zero["stopped"])
+        self.assertFalse(request()['stopped'])
         self.clock.sleep(.11)
-        second_zero = request()
-        self.assertTrue(second_zero["feedbackRecheck"], "feedback recovery still awaits a neutral request")
-        self.assertIsNone(self.motors.motion_recheck_at)
-        self.assertTrue(second_zero["stopped"])
-        self.assertTrue(second_zero["recoveryRequired"])
+        second = request()
+        self.assertTrue(second['stopped'])
+        self.assertTrue(second['standstillPending'])
         self.assertTrue(session.recovery_active)
-        neutral = request("stop", 0, 0)
-        self.assertTrue(neutral["recoveryRequired"], "neutral's ACK must discard the previously held input")
-        self.assertTrue(neutral["feedbackRecheck"])
-        self.assertTrue(neutral["stopped"])
+        neutral = request('stop', 0, 0)
+        self.assertTrue(neutral['recoveryRequired'])
+        self.assertTrue(neutral['stopped'])
         self.assertFalse(session.recovery_active)
-        self.assertFalse(self.motors.motion_recovery_required)
-        self.assertNotIn(("left", 40), self.client.calls)
-        self.assertNotIn(("right", -40), self.client.calls)
-        resumed = request("drive", 20, -20)
-        self.assertFalse(resumed["recoveryRequired"])
-        self.assertFalse(resumed["feedbackRecheck"])
-        self.assertEqual((resumed["left"], resumed["right"]), (20, -20))
-        self.assertIn(("left", 20), self.client.calls)
-        self.assertIn(("right", -20), self.client.calls)
+        self.assertNotIn(('left', 40), self.client.calls)
+        self.assertNotIn(('right', -40), self.client.calls)
+        resumed = request('drive', 20, -20)
+        self.assertFalse(resumed['recoveryRequired'])
+        self.assertFalse(resumed['feedbackRecheck'])
+        self.assertEqual((resumed['left'], resumed['right']), (20, -20))
+        self.assertIn(('left', 20), self.client.calls)
         self.assert_no_parameter_writes()
 
-    def test_repeated_protocol_neutral_cannot_release_pending_or_extend_its_deadline(self):
-        session = bridge.ProtocolSession(self.motors, port="fake", dry_run=False)
+    def test_protocol_neutral_with_noise_stays_alive_without_recovery_flags(self):
+        session = bridge.ProtocolSession(self.motors, port='fake', dry_run=False)
         session.ready()
         self.client.feedback = (0, -1, 0, 0)
-        self.motors._sample_feedback(force=True)
-        started = self.motors.motion_recheck_at
-        for elapsed in (.1, .2, .3, .4, .599):
-            self.clock.now = started + elapsed
-            ack, _ = session.accept({"seq": session.next_seq, "token": session.token,
-                                     "cmd": "stop", "left": 0, "right": 0})
-            self.assertTrue(ack["feedbackRecheck"])
-            self.assertTrue(ack["recoveryRequired"])
-            self.assertFalse(ack["stopped"])
-            self.assertEqual(self.motors.motion_recheck_at, started)
-            self.assertTrue(session.recovery_active)
-        self.clock.now = started + .601
-        with self.assertRaises(bridge.SessionError):
-            session.accept({"seq": session.next_seq, "token": session.token,
-                            "cmd": "stop", "left": 0, "right": 0})
+        epoch = self.clock.monotonic()
+        for elapsed in (.1, .2, .4, .599, .601, 1.6, 6.0):
+            self.clock.now = epoch + elapsed
+            ack, closing = session.accept(dict(seq=session.next_seq, token=session.token,
+                cmd='stop', left=0, right=0))
+            self.assertFalse(closing)
+            self.assertFalse(ack['feedbackRecheck'])
+            self.assertFalse(ack['recoveryRequired'])
+            self.assertFalse(ack['standstillPending'])
+            self.assertFalse(ack['stopped'])
+            self.assertTrue(ack['targetStopped'])
+            self.assertEqual((ack['feedbackLeftRpm'], ack['feedbackRightRpm']), (0, -1))
+            self.assertFalse(session.recovery_active)
         self.assert_emergency_attempted()
         self.assert_no_parameter_writes()
 
-    def test_neutral_final_sample_starts_recheck_and_only_second_zero_neutral_releases_it(self):
-        session = bridge.ProtocolSession(self.motors, port="fake", dry_run=False)
+    def test_neutral_final_sample_noise_never_creates_a_recovery_lock(self):
+        session = bridge.ProtocolSession(self.motors, port='fake', dry_run=False)
         session.ready()
         self.client.feedback = (-1, 0, 0, 0)
-
         def neutral(command):
-            return session.accept({"seq": session.next_seq, "token": session.token,
-                                   "cmd": command, "left": 0, "right": 0})[0]
-
-        # No stop refresh is due, so this episode begins in accept's final sample.
-        started = neutral("stop")
-        self.assertTrue(started["feedbackRecheck"])
-        self.assertTrue(started["recoveryRequired"])
-        self.assertFalse(started["stopped"])
-        self.assertTrue(session.recovery_active)
-        self.client.feedback = (0, 0, 0, 0)
-        self.clock.sleep(.11)
-        first_zero = neutral("drive")
-        self.assertFalse(first_zero["stopped"])
-        self.assertTrue(session.recovery_active)
-        self.clock.sleep(.11)
-        confirmed = neutral("drive")
-        self.assertTrue(confirmed["stopped"])
-        self.assertTrue(confirmed["feedbackRecheck"])
-        self.assertTrue(confirmed["recoveryRequired"])
+            return session.accept(dict(seq=session.next_seq, token=session.token,
+                cmd=command, left=0, right=0))[0]
+        started = neutral('stop')
+        self.assertFalse(started['feedbackRecheck'])
+        self.assertFalse(started['recoveryRequired'])
+        self.assertFalse(started['stopped'])
         self.assertFalse(session.recovery_active)
-        self.assertFalse(self.motors.motion_recovery_required)
-        self.assert_no_parameter_writes()
-
-    def test_parking_can_finish_exact_zero_recheck_without_releasing_motion_latch(self):
-        self.pending_from_zero_time()
         self.client.feedback = (0, 0, 0, 0)
-        self.motors.set_parking(True)
-        self.assertTrue(self.motors.stopped_confirmed)
-        self.assertIsNone(self.motors.motion_recheck_at)
-        self.assertTrue(self.motors.motion_recovery_required)
-        self.assertEqual(self.motors.drive(40, -40), (0, 0))
-        self.assertNotIn(("left", 40), self.client.calls)
-        self.assertNotIn(("right", -40), self.client.calls)
+        self.clock.sleep(.11)
+        self.assertFalse(neutral('drive')['stopped'])
+        self.clock.sleep(.11)
+        confirmed = neutral('drive')
+        self.assertTrue(confirmed['stopped'])
+        self.assertFalse(confirmed['feedbackRecheck'])
+        self.assertFalse(confirmed['recoveryRequired'])
         self.assert_no_parameter_writes()
 
-    def test_parking_cannot_select_normal_mode_while_recheck_is_pending(self):
-        self.pending_from_zero_time()
+    def test_private_stop_policy_after_noise_still_requires_exact_zero_confirmation(self):
+        self.noise_from_zero_time()
+        self.client.feedback = (0, 0, 0, 0)
+        self.motors.set_parking(True)  # Historical private fixture, not a public parking switch.
+        self.assertTrue(self.motors.stopped_confirmed)
+        self.assertFalse(self.motors.feedback_recovery_required)
+        self.assertEqual(self.motors.drive(40, -40), (40, -40))
+        self.assert_no_parameter_writes()
+
+    def test_private_stop_policy_without_real_zero_keeps_its_strict_budget(self):
+        self.noise_from_zero_time()
         self.client.calls.clear()
         with self.assertRaises(bridge.SessionError):
             self.motors.set_parking(True)
-        self.assertLessEqual(self.clock.monotonic(), .71)
-        self.assertNotIn(("left", "stop", 0), self.client.calls)
-        self.assertNotIn(("right", "stop", 0), self.client.calls)
+        self.assertLessEqual(self.clock.monotonic(), 1.61)
+        self.assertNotIn(('left', 'stop', 0), self.client.calls)
+        self.assertNotIn(('right', 'stop', 0), self.client.calls)
         self.assert_emergency_attempted()
         self.assert_no_parameter_writes()
 
-    def test_parking_post_mode_recheck_never_returns_success_without_exact_zero(self):
+    def test_private_post_mode_confirmation_never_treats_noise_as_stopped(self):
         self.initialize()
         original = self.client.stop
-
         def jitter_after_mode_write(side, mode):
             original(side, mode)
             if mode == 0:
                 self.client.feedback = (-1, 0, 0, 0)
-
         started = self.clock.monotonic()
-        with patch.object(self.client, "stop", side_effect=jitter_after_mode_write):
+        with patch.object(self.client, 'stop', side_effect=jitter_after_mode_write):
             with self.assertRaises(bridge.SessionError):
                 self.motors.set_parking(True)
-        self.assertLessEqual(self.clock.monotonic() - started, .71)
+        self.assertLessEqual(self.clock.monotonic() - started, 1.71)
         self.assertFalse(self.motors.stopped_confirmed)
         self.assert_emergency_attempted()
         self.assert_no_parameter_writes()
@@ -604,7 +620,7 @@ class ParkingFeedbackTests(unittest.TestCase):
         original = self.client.read_holding_registers
 
         def deceleration(address, count):
-            self.client.feedback = (-1, 0, 0, 0) if self.clock.monotonic() - epoch < .8 else (0, 0, 0, 0)
+            self.client.feedback = (-81, 0, 0, 0) if self.clock.monotonic() - epoch < .8 else (0, 0, 0, 0)
             return original(address, count)
 
         with patch.object(self.client, "read_holding_registers", side_effect=deceleration):
@@ -616,17 +632,17 @@ class ParkingFeedbackTests(unittest.TestCase):
         self.assertFalse(self.motors.motion_recovery_required)
         self.assert_no_parameter_writes()
 
-    def test_terminal_cleanup_keeps_exact_zero_requirement_and_bounded_wait(self):
+    def test_terminal_cleanup_acknowledges_stop_writes_without_forging_zero(self):
         session = bridge.ProtocolSession(self.motors, port="fake", dry_run=False)
         session.ready()
         self.client.feedback = (-1, 0, 0, 0)
         self.motors._sample_feedback(force=True)
         started, seq = self.clock.monotonic(), session.next_seq
-        with self.assertRaises(bridge.SessionError):
-            session.accept({"seq": seq, "token": session.token,
-                            "cmd": "close", "left": 0, "right": 0})
+        ack, closing = session.accept({"seq": seq, "token": session.token,
+                                      "cmd": "close", "left": 0, "right": 0})
+        self.assertTrue(closing); self.assertTrue(ack['stopCommandConfirmed']); self.assertFalse(ack['stopped'])
         self.assertLessEqual(self.clock.monotonic() - started, 1.61)
-        self.assertEqual(session.next_seq, seq, "no success ACK may be generated")
+        self.assertEqual(session.next_seq, seq + 1)
         self.assertFalse(self.motors.stopped_confirmed)
         self.assert_emergency_attempted()
         self.assert_no_parameter_writes()
@@ -662,7 +678,7 @@ class ParkingFeedbackTests(unittest.TestCase):
                 self.assertEqual(len(client.feedback_samples), 1)
                 self.assertFalse(any(call[0] == "write" for call in client.calls))
 
-    def test_terminal_cannot_ack_when_completed_confirmation_is_stale(self):
+    def test_terminal_refreshes_stale_feedback_before_acknowledging_stop_writes(self):
         for command in ("close", "estop"):
             with self.subTest(command=command):
                 client = FakeClient()
@@ -679,14 +695,15 @@ class ParkingFeedbackTests(unittest.TestCase):
                 seq, token = session.next_seq, session.token
                 request = {"seq": seq, "token": token, "cmd": command, "left": 0, "right": 0}
                 with patch.object(motors, method, side_effect=stale):
-                    with self.assertRaisesRegex(bridge.SessionError, "standstill confirmation"):
-                        session.accept(request)
-                self.assertEqual(session.next_seq, seq)
-                self.assertEqual(session.token, token)
+                    ack, closing = session.accept(request)
+                self.assertTrue(closing); self.assertTrue(ack['stopCommandConfirmed'])
+                self.assertEqual(ack['feedbackAgeMs'], 0)
+                self.assertEqual(session.next_seq, seq + 1)
+                self.assertNotEqual(session.token, token)
                 self.assertFalse(motors.stopped_confirmed)
                 self.assertFalse(any(call[0] == "write" for call in client.calls))
 
-    def test_run_loop_does_not_skip_cleanup_for_an_unconfirmed_terminal_response(self):
+    def test_run_loop_retries_cleanup_when_terminal_stop_writes_were_not_confirmed(self):
         messages = []
         original_accept = bridge.ProtocolSession.accept
 
@@ -707,7 +724,7 @@ class ParkingFeedbackTests(unittest.TestCase):
 
         def unconfirmed(session, message):
             ack, closing = original_accept(session, message)
-            return dict(ack, stopped=False), closing
+            return dict(ack, stopped=False, stopCommandConfirmed=False), closing
 
         with patch.object(bridge, "JsonOutput", Output), patch.object(bridge, "InputPump", Input), \
                 patch.object(bridge.ProtocolSession, "accept", unconfirmed), \
@@ -749,7 +766,7 @@ class ParkingFeedbackTests(unittest.TestCase):
     def test_deceleration_timeout_keeps_an_emergency_stopped_session_waiting(self):
         self.initialize()
         self.motors.drive(20, -20)
-        self.client.feedback = (20, -20, 0, 0)
+        self.client.feedback = (81, -20, 0, 0)
         self.motors.stop()
         self.assertFalse(self.motors.stopped_confirmed)
         for _ in range(14):

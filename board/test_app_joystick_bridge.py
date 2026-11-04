@@ -149,7 +149,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(ready["parkingLeftCurrentAmps"], 5.0)
         self.assertEqual(ready["parkingRightCurrentAmps"], 5.0)
         self.assertEqual(ready["watchdogMs"], 600)
-        self.assertEqual(ready["networkGraceMs"], 5000)
+        self.assertEqual(ready["networkGraceMs"], int(bridge.NETWORK_GRACE_SECONDS * 1000))
         self.assertEqual(ready["safetyVersion"], 2)
         self.assertTrue(ready["stopped"])
         self.assert_no_configuration_writes(client)
@@ -477,8 +477,8 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertIsNone(process.poll(), "motion lease expiry must retain the stopped session")
         error = json.loads(process.stdout.readline())
         self.assertIn("network grace expired", error["error"])
-        self.assertGreaterEqual(time.monotonic() - started, 4.5)
-        self.assertLess(time.monotonic() - started, 6.5)
+        self.assertGreaterEqual(time.monotonic() - started, bridge.NETWORK_GRACE_SECONDS - .5)
+        self.assertLess(time.monotonic() - started, bridge.NETWORK_GRACE_SECONDS + 1.5)
         self.finish(process)
         self.assertNotEqual(process.returncode, 0)
         rows = [json.loads(line) for path in Path(os.environ["APP_DRIVE_DIAGNOSTIC_TEST_DIR"]).glob("*.jsonl")
@@ -487,7 +487,8 @@ class BridgeProtocolTests(unittest.TestCase):
         pause = [row for row in rows if row["event"] == "drive.network_paused"]
         self.assertEqual(len(pause), 1)
         self.assertAlmostEqual(pause[0]["sessionDeadlineMonotonicMs"] -
-                               pause[0]["leaseExpiredMonotonicMs"], 4400, delta=1)
+                               pause[0]["leaseExpiredMonotonicMs"],
+                               (bridge.NETWORK_GRACE_SECONDS - bridge.WATCHDOG_SECONDS) * 1000, delta=1)
         self.assertLess(pause[0]["stoppedMonotonicMs"] - pause[0]["leaseExpiredMonotonicMs"], 500)
         self.assertEqual(pause[0]["lastValidRequest"]["seq"], 1)
         failure = next(row for row in rows if row["event"] == "drive.failure")
@@ -726,14 +727,19 @@ class BridgeProtocolTests(unittest.TestCase):
             self.assertAlmostEqual(left, right)
 
     def test_suppressed_held_targets_do_not_extend_grace_or_repeat_motor_writes(self):
+        grace = bridge.NETWORK_GRACE_SECONDS
         result, messages, deadlines, events, elapsed, motors, client = self.run_scripted_grace([
-            (0.1, "drive"), "deadline", (1.2, "drive"), (4.9, "drive"), "deadline"])
+            (0.1, "drive"), "deadline", (1.2, "drive"), (grace - .1, "drive"), "deadline"])
         self.assertEqual(result, 1)
-        self.assert_deadlines(deadlines, [0.6, 0.7, 5.1, 5.1, 5.1])
-        self.assertAlmostEqual(elapsed, 5.1)
+        self.assert_deadlines(deadlines, [0.6, 0.7, grace + .1, grace + .1, grace + .1])
+        self.assertAlmostEqual(elapsed, grace + .1)
         acks = [message for message in messages if message["type"] == "ack"]
         self.assertEqual([ack["recoveryRequired"] for ack in acks], [False, True, True])
-        self.assertEqual([ack["stopped"] for ack in acks], [False, True, True])
+        self.assertFalse(acks[0]["stopped"])
+        self.assertTrue(acks[1]["stopped"])
+        # A late ACK may fall between two fresh physical samples. The lease
+        # guarantee is the zero target; it must not forge physical confirmation.
+        self.assertTrue(all(ack["targetStopped"] for ack in acks[1:]))
         # Stop refreshes may repeat; the suppressed held targets must never reach a motor.
         self.assertEqual(client.calls.count(("left", 30)), 1)
         self.assertEqual(client.calls.count(("right", -30)), 1)
@@ -745,17 +751,18 @@ class BridgeProtocolTests(unittest.TestCase):
         recovery = [row for row in events if row["event"] == "drive.network_recovery_ack"]
         self.assertEqual([row["neutralAccepted"] for row in recovery], [False, False])
         for row in recovery:
-            self.assertAlmostEqual(row["sessionDeadlineMonotonicMs"], 5100)
+            self.assertAlmostEqual(row["sessionDeadlineMonotonicMs"], (grace + .1) * 1000)
         self.assertEqual(next(row for row in events if row["event"] == "drive.failure")["stopSource"],
                          "network_grace_expired")
         self.assertGreaterEqual(motors.polls, 5, "IR polling remains active during grace")
 
     def test_current_read_during_recovery_does_not_release_latch_or_extend_grace(self):
+        grace = bridge.NETWORK_GRACE_SECONDS
         result, messages, deadlines, events, elapsed, _motors, _client = self.run_scripted_grace([
             (0.1, "drive"), "deadline", (2.0, "parking_settings"), "deadline"], parking_seconds=0.8)
         self.assertEqual(result, 1)
-        self.assert_deadlines(deadlines, [0.6, 0.7, 5.1, 5.1])
-        self.assertAlmostEqual(elapsed, 5.1)
+        self.assert_deadlines(deadlines, [0.6, 0.7, grace + .1, grace + .1])
+        self.assertAlmostEqual(elapsed, grace + .1)
         self.assertTrue(messages[2]["recoveryRequired"])
         self.assertTrue(messages[2]["parkingResult"]["ok"])
         self.assertTrue(messages[2]["parkingMode"])
@@ -764,7 +771,7 @@ class BridgeProtocolTests(unittest.TestCase):
 
     def test_recovery_current_read_completion_cannot_outlive_fixed_grace(self):
         result, messages, _deadlines, events, _elapsed, _motors, _client = self.run_scripted_grace([
-            (0.1, "drive"), "deadline", (4.9, "parking_settings")], parking_seconds=0.3)
+            (0.1, "drive"), "deadline", (bridge.NETWORK_GRACE_SECONDS - .1, "parking_settings")], parking_seconds=0.3)
         self.assertEqual(result, 1)
         self.assertEqual([message["type"] for message in messages], ["ready", "ack", "error"])
         self.assertIn("network grace expired", messages[-1]["error"])
@@ -777,10 +784,11 @@ class BridgeProtocolTests(unittest.TestCase):
                     (0.1, "drive"), "deadline", (1.2, neutral, 0, 0),
                     (1.3, "drive"), "deadline", "deadline"])
                 self.assertEqual(result, 1)
-                for actual, expected in zip(deadlines, [0.6, 0.7, 5.1, 1.8, 1.9, 6.3]):
+                for actual, expected in zip(deadlines, [0.6, 0.7, bridge.NETWORK_GRACE_SECONDS + .1,
+                                                        1.8, 1.9, bridge.NETWORK_GRACE_SECONDS + 1.3]):
                     self.assertAlmostEqual(actual, expected)
                 self.assertEqual(len(deadlines), 6)
-                self.assertAlmostEqual(elapsed, 6.3)
+                self.assertAlmostEqual(elapsed, bridge.NETWORK_GRACE_SECONDS + 1.3)
                 self.assertEqual([message["recoveryRequired"] for message in messages if message["type"] == "ack"],
                                  [False, True, False])
                 recovery = next(row for row in events if row["event"] == "drive.network_recovery_ack")
@@ -820,11 +828,16 @@ class BridgeProtocolTests(unittest.TestCase):
         # Exercise the real bounded InputPump across both deadlines without real time or IO.
         with patch.object(bridge.threading, "Thread"):
             pump = bridge.InputPump(-1)
-        now, polls = [0.0], []
+        now, polls, reads = [0.0], [], [0]
         pump.poll = lambda: polls.append(now[0])
 
         def drip(*, timeout):
             now[0] += timeout
+            reads[0] += 1
+            # A slow byte drip stays within the framing bound throughout 15 s;
+            # silence between bytes still exercises the actual queue/deadline path.
+            if reads[0] % 5:
+                raise bridge.queue.Empty
             return b" "
 
         with patch.object(bridge.time, "monotonic", lambda: now[0]), \
@@ -833,8 +846,8 @@ class BridgeProtocolTests(unittest.TestCase):
                 pump.line(0.6, threading.Event())
             self.assertAlmostEqual(now[0], 0.6)
             with self.assertRaises(bridge.MotionLeaseExpired):
-                pump.line(5.0, threading.Event())
-            self.assertAlmostEqual(now[0], 5.0)
+                pump.line(bridge.NETWORK_GRACE_SECONDS, threading.Event())
+            self.assertAlmostEqual(now[0], bridge.NETWORK_GRACE_SECONDS)
         self.assertGreater(len(polls), 200)
         self.assertNotIn(b"\n", pump.buffer)
         self.assertLess(len(pump.buffer), bridge.MAX_LINE_BYTES)

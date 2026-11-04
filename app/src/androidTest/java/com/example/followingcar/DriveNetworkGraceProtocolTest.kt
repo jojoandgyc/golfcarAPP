@@ -50,7 +50,7 @@ class DriveNetworkGraceProtocolTest {
         val control = open(ready(), ack(recovery = true), ack(seq = 2, recovery = true),
             ack(seq = 3, left = 30, right = -30, recovery = false))
         assertEquals(5_000, control.ready.networkGraceMs)
-        assertEquals(2_500L, driveAckTimeoutMillis(control.ready.networkGraceMs))
+        assertEquals(4_250L, driveAckTimeoutMillis(control.ready.networkGraceMs))
         val blocked = control.exchange(30, -30)
         assertTrue(blocked.recoveryRequired)
         assertTrue(blocked.stopped)

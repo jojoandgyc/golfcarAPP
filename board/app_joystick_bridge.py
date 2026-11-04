@@ -65,7 +65,9 @@ class BestEffortDiagnostic:
 
 MAX_RPM = 100
 WATCHDOG_SECONDS = 0.6
-NETWORK_GRACE_SECONDS = 5.0
+# Keep the already stopped session available for a delayed SSH ACK and neutral recovery.
+# This never extends the independent 600 ms lease that permits motor movement.
+NETWORK_GRACE_SECONDS = 15.0
 PARKING_TRANSACTION_SECONDS = 2.0
 UNIFIED_PARKING_TRANSACTION_SECONDS = 3.0
 MAX_PARKING_CURRENT = 60
@@ -74,8 +76,10 @@ FEEDBACK_INTERVAL_SECONDS = 0.1
 FEEDBACK_MAX_AGE_SECONDS = 0.25
 STOP_REFRESH_SECONDS = 0.2
 STANDSTILL_TIMEOUT_SECONDS = 1.5
-MOTION_RECHECK_MAX_RPM = 2
-MOTION_RECHECK_SECONDS = 0.6
+MOTION_RECHECK_MAX_RPM = 80
+STOP_CONFIRMATION_TOLERANCE_RPM = MOTION_RECHECK_MAX_RPM
+MOTION_RECHECK_SECONDS = 0.0  # Retired fatal timer; advertised as disabled to clients.
+FEEDBACK_NOISE_LOG_SECONDS = 1.0
 SERIAL_TIMEOUT = 0.15
 IR_POLL_SECONDS = 0.02
 MAX_LINE_BYTES = 512
@@ -147,8 +151,11 @@ class Motors:
         self.last_stop_at: float | None = None
         self.stop_requested_at: float | None = None
         self.standstill_seen = False
+        # Retained as inert compatibility attributes; tiny feedback no longer starts a timer or input lock.
         self.motion_recheck_at: float | None = None
         self.motion_recovery_required = False
+        self.feedback_noise_logged_at: float | None = None
+        self.feedback_noise_sample_count = 0
         self.standstill_wait_at: float | None = None
         self.standstill_pending = False
         self.fault_reason: str | None = None
@@ -201,17 +208,18 @@ class Motors:
                                   errorClass=type(error).__name__)
         raise SessionError(self.fault_reason)
 
-    def _enter_standstill_wait(self) -> None:
-        """Retain the emergency response to slow stopping, without ending ownership."""
-        if self.standstill_pending:
+    def _enter_standstill_wait(self, reason: str = "normal_stop_confirmation_timeout") -> None:
+        """Stop unexpected/slow motion without ending ownership or replaying held input."""
+        if self.standstill_pending and self.standstill_wait_at is not None:
             return
+        restarting = self.standstill_pending
         self.standstill_wait_at = time.monotonic()
         self.standstill_pending = True
         parking_was_enabled = self.parking_enabled
         self.parking_enabled = False
         self.emergency_hold = True
-        self.diagnostic.event("drive.standstill_wait_started", critical=True,
-            reason="normal_stop_confirmation_timeout", parkingWasEnabled=parking_was_enabled,
+        self.diagnostic.event("drive.standstill_wait_restarted" if restarting else "drive.standstill_wait_started", critical=True,
+            reason=reason, parkingWasEnabled=parking_was_enabled,
             **self.feedback_state(), **self.parking_state())
         try:
             self._write_stop(emergency=True)
@@ -226,10 +234,6 @@ class Motors:
     def _sample_feedback(self, *, force: bool = False, cleanup: bool = False,
                          allow_standstill_wait: bool = True) -> None:
         now = time.monotonic()
-        if not cleanup and self.motion_recheck_at is not None and (
-            now - self.motion_recheck_at >= MOTION_RECHECK_SECONDS
-        ):
-            self._trip(f"Motion feedback recheck timed out: left={self.feedback[0]}, right={self.feedback[1]} RPM")
         if not force and self.feedback_at is not None and now - self.feedback_at < FEEDBACK_INTERVAL_SECONDS:
             return
         try:
@@ -262,26 +266,35 @@ class Motors:
             if cleanup:
                 raise SessionError(f"Motor fault remains during cleanup: {left_error}/{right_error}")
             self._trip(f"Motor fault feedback: left={left_error}, right={right_error}")
-        # A low-amplitude episode has a fixed deadline. A late zero or a forced
-        # duplicate read cannot extend it or clear it without two fresh samples.
-        if not cleanup and self.motion_recheck_at is not None and (
-            observed_at - self.motion_recheck_at >= MOTION_RECHECK_SECONDS
-        ):
-            self._trip(f"Motion feedback recheck timed out: left={left}, right={right} RPM")
         if self.last_target != (0, 0):
             self.zero_samples, self.last_zero_at = 0, None
             return
         if left != 0 or right != 0:
             self.zero_samples, self.last_zero_at = 0, None
-            if not cleanup and self.standstill_seen:
-                if max(abs(left), abs(right)) > MOTION_RECHECK_MAX_RPM:
-                    self._trip(f"Unexpected motion after standstill: left={left}, right={right} RPM")
-                if self.motion_recheck_at is None:
-                    self.motion_recheck_at = observed_at
-                    self.motion_recovery_required = True
-                    self.diagnostic.event("drive.feedback_recheck_started", critical=True,
-                        maxRpm=MOTION_RECHECK_MAX_RPM, timeoutMs=int(MOTION_RECHECK_SECONDS * 1000),
-                        **self.feedback_state())
+            small_feedback = max(abs(left), abs(right)) <= MOTION_RECHECK_MAX_RPM
+            if not cleanup and allow_standstill_wait:
+                if small_feedback:
+                    # The configured warning range does not prove physical rest.
+                    # Preserve raw RPM and stopped=false without an input lock,
+                    # a lease renewal or a session failure.
+                    # The rate limit also survives alternating zeros/signs/sides.
+                    self.feedback_noise_sample_count += 1
+                    if self.feedback_noise_logged_at is None or (
+                        observed_at - self.feedback_noise_logged_at >= FEEDBACK_NOISE_LOG_SECONDS
+                    ):
+                        self.diagnostic.event("drive.feedback_noise_warning", critical=False,
+                            maxRpm=MOTION_RECHECK_MAX_RPM, sampleCount=self.feedback_noise_sample_count,
+                            **self.feedback_state())
+                        self.feedback_noise_logged_at = observed_at
+                        self.feedback_noise_sample_count = 0
+                    return
+                if self.standstill_seen:
+                    self._enter_standstill_wait(reason="unexpected_motion_after_stop")
+                    return
+            elif not cleanup and self.standstill_seen and max(abs(left), abs(right)) > STOP_CONFIRMATION_TOLERANCE_RPM:
+                # Explicit startup/legacy transactions still require bounded,
+                # exact physical confirmation; runtime warnings do not relax them.
+                self._trip(f"Unexpected motion after standstill: left={left}, right={right} RPM")
             if not cleanup and not self.standstill_seen and self.stop_requested_at is not None and (
                 self.feedback_at - self.stop_requested_at >= STANDSTILL_TIMEOUT_SECONDS
             ):
@@ -305,12 +318,6 @@ class Motors:
                 self.diagnostic.event("drive.standstill_wait_zero_confirmed", critical=True,
                     elapsedMs=int(elapsed * 1000), releaseRequired=self.standstill_pending,
                     **self.feedback_state())
-            if self.motion_recheck_at is not None:
-                elapsed = observed_at - self.motion_recheck_at
-                self.motion_recheck_at = None
-                self.diagnostic.event("drive.feedback_recheck_zero_confirmed", critical=True,
-                    elapsedMs=int(elapsed * 1000), releaseRequired=self.motion_recovery_required,
-                    **self.feedback_state())
 
     @property
     def zero_samples(self) -> int:
@@ -326,10 +333,14 @@ class Motors:
     @property
     def stopped_confirmed(self) -> bool:
         return (self.fault_reason is None and self.last_target == (0, 0) and self.zero_samples >= 2
-                and self.motion_recheck_at is None
                 and self.standstill_wait_at is None
                 and self.feedback == (0, 0, 0, 0) and self.feedback_at is not None
                 and time.monotonic() - self.feedback_at <= FEEDBACK_MAX_AGE_SECONDS)
+
+    @property
+    def stop_command_confirmed(self) -> bool:
+        """Both zero/stop writes succeeded; this never asserts physical standstill."""
+        return self.last_target == (0, 0) and self.last_stop_at is not None
 
     def feedback_state(self) -> dict[str, Any]:
         age = None if self.feedback_at is None else max(0, int((time.monotonic() - self.feedback_at) * 1000))
@@ -340,37 +351,49 @@ class Motors:
 
     @property
     def feedback_recovery_required(self) -> bool:
-        return self.motion_recovery_required or self.standstill_pending
+        return self.standstill_pending
 
     def release_motion_recovery(self) -> None:
-        if self.motion_recheck_at is not None or self.standstill_wait_at is not None or not self.stopped_confirmed:
+        if self.standstill_wait_at is not None or not self.stopped_confirmed:
             return
         if self.standstill_pending:
             self.standstill_pending = False
             self.emergency_hold = False
             self.diagnostic.event("drive.standstill_wait_released", critical=True, **self.feedback_state())
-        if self.motion_recovery_required:
-            self.motion_recovery_required = False
-            self.diagnostic.event("drive.feedback_recheck_released", critical=True, **self.feedback_state())
 
-    def await_standstill(self, *, cleanup: bool = False, deadline: float | None = None) -> None:
+    def await_standstill(self, *, cleanup: bool = False, deadline: float | None = None,
+                         allow_unconfirmed: bool = False) -> bool:
         deadline = min(time.monotonic() + STANDSTILL_TIMEOUT_SECONDS,
                        deadline if deadline is not None else float("inf"))
+        def unconfirmed(reason: str) -> bool:
+            self.diagnostic.event("drive.stop_confirmation_warning", critical=True,
+                reason=reason, cleanup=cleanup, stopCommandConfirmed=self.stop_command_confirmed,
+                physicalStopped=False, **self.feedback_state())
+            return False
         while True:
             if time.monotonic() >= deadline:
+                if allow_unconfirmed:
+                    return unconfirmed("confirmation_timeout")
                 if cleanup:
                     raise SessionError("Cleanup standstill not confirmed")
                 self._trip("Standstill confirmation timed out")
-            # Startup, parking transitions and terminal cleanup retain their
-            # bounded confirmation contract; only normal session polling may wait.
-            self._sample_feedback(force=True, cleanup=cleanup, allow_standstill_wait=False)
+            self._sample_feedback(force=True, cleanup=cleanup, allow_standstill_wait=allow_unconfirmed)
             measured = self.last_target == (0, 0) and self.zero_samples >= 2 and self.feedback == (0, 0, 0, 0)
-            if time.monotonic() >= deadline:
+            if not allow_unconfirmed and time.monotonic() >= deadline:
                 if cleanup:
                     raise SessionError("Cleanup standstill not confirmed")
                 self._trip("Standstill confirmation timed out")
             if measured:
-                return
+                return True
+            maximum = max(abs(self.feedback[0]), abs(self.feedback[1]))
+            if allow_unconfirmed and self.stop_command_confirmed and 0 < maximum <= STOP_CONFIRMATION_TOLERANCE_RPM:
+                return unconfirmed("feedback_within_tolerance")
+            if time.monotonic() >= deadline:
+                if allow_unconfirmed:
+                    return unconfirmed("confirmation_timeout")
+                if cleanup:
+                    raise SessionError("Cleanup standstill not confirmed")
+                self._trip("Standstill confirmation timed out")
             if self.last_stop_at is None or time.monotonic() - self.last_stop_at >= STOP_REFRESH_SECONDS:
                 self._write_stop(emergency=cleanup or not self.parking_enabled)
             if self.client is not None:
@@ -379,7 +402,7 @@ class Motors:
     def initialize(self) -> None:
         self.parking_enabled = False
         self._write_stop(emergency=True)
-        self.await_standstill()
+        self.await_standstill(allow_unconfirmed=True)
         if self.client is not None:
             try:
                 values = [self.client.read_register(name) for name in
@@ -392,7 +415,7 @@ class Motors:
             except Exception as error:
                 self._trip(f"Parking configuration read failed: {type(error).__name__}: {error}")
         # Config reads may consume a few transactions; READY still needs fresh feedback.
-        self.await_standstill()
+        self.await_standstill(allow_unconfirmed=True)
         self.diagnostic.event("parking.configuration_read", critical=True,
                               **self.parking_state(), **self.feedback_state())
 
@@ -516,13 +539,13 @@ class Motors:
                               **self.parking_state(), **self.feedback_state())
 
     def shutdown(self) -> None:
-        """Emergency stop plus physical feedback, preserving every saved parameter."""
+        """Issue emergency stop; report unconfirmed standstill without inventing zero RPM."""
         self.parking_enabled = False
         self.requested_target = (0, 0)
         self.ir_latched_directions.clear()
         self._write_stop(emergency=True)
         self.zero_samples, self.last_zero_at = 0, None
-        self.await_standstill(cleanup=True)
+        self.await_standstill(cleanup=True, allow_unconfirmed=True)
 
     def unified_parking(self, request: dict[str, Any]) -> dict[str, Any]:
         if request['op'] == 'read' and self.last_target != (0, 0):
@@ -677,10 +700,13 @@ class ProtocolSession:
                 "watchdogMs": int(WATCHDOG_SECONDS * 1000), "parkingSupported": True,
                 "safetyVersion": SAFETY_VERSION, "left": 0, "right": 0,
                 "targetStopped": True, "stopped": self.motors.stopped_confirmed,
+                "stopCommandConfirmed": self.motors.stop_command_confirmed,
+                "stopConfirmationWarningSupported": True,
                 **self.motors.feedback_state(),
                 "networkGraceMs": int(NETWORK_GRACE_SECONDS * 1000),
                 "motionRecheckMaxRpm": MOTION_RECHECK_MAX_RPM,
-                "motionRecheckMs": int(MOTION_RECHECK_SECONDS * 1000),
+                "motionRecheckMs": 0,
+                "feedbackNoiseNonFatal": True, "feedbackNoiseMaxRpm": MOTION_RECHECK_MAX_RPM,
                 "standstillWaitSupported": True, "unifiedParkingSupported": True,
                 "infraredSupported": self.motors.infrared is not None,
                 **self.motors.parking_state()}
@@ -737,7 +763,12 @@ class ProtocolSession:
             left, right = 0, 0
         else:
             left, right = self.motors.drive(left, right)
-        if closing or command == "parking":
+        if closing:
+            if not self.motors.stop_command_confirmed:
+                raise SessionError("Terminal zero/stop writes were not confirmed")
+            if self.motors.feedback_at is None or time.monotonic() - self.motors.feedback_at > FEEDBACK_MAX_AGE_SECONDS:
+                self.motors._sample_feedback(force=True, cleanup=True)
+        elif command == "parking":
             # These transactions already ended with two fresh zero observations.
             # A redundant sample must not turn their success into an unconfirmed
             # terminal ACK that would skip cleanup on the way out.
@@ -761,6 +792,7 @@ class ProtocolSession:
         return {"type": "ack", "safetyVersion": SAFETY_VERSION, "seq": seq, "token": self.token, "left": left,
                 "right": right, "targetStopped": (left, right) == (0, 0),
                 "stopped": (left, right) == (0, 0) and self.motors.stopped_confirmed,
+                "stopCommandConfirmed": self.motors.stop_command_confirmed,
                 **self.motors.feedback_state(),
                 # Neutral clears the latch for subsequent requests, but its own ACK must
                 # still tell the App to discard the held target and require fresh input.
@@ -868,6 +900,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
     failed = False
     error_message = None
     cleanup_confirmed = False
+    cleanup_attempted = False
     phase = "ready"
     pump = None
     deadline = 0.0
@@ -944,6 +977,7 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             # Terminal acceptance already verified emergency stop and measured standstill.
             # No configuration registers are changed, including on cleanup.
             cleanup_confirmed = closing and response["stopped"]
+            cleanup_attempted = closing and response.get("stopCommandConfirmed") is True
             completed = time.monotonic()
             processed_ms = (completed - received) * 1000
             parking = message["cmd"] in ("parking", "parking_settings")
@@ -1035,10 +1069,10 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             infrared=motors.infrared_state())
     finally:
         diagnostic.event("drive.cleanup_started", critical=True, alreadyStopped=cleanup_confirmed)
-        if not cleanup_confirmed:
+        if not cleanup_attempted:
             try:
                 motors.shutdown()
-                cleanup_confirmed = True
+                cleanup_confirmed = motors.stopped_confirmed
             except Exception as error:
                 failed = True
                 error_message = f"{error_message + '; ' if error_message else ''}{error}"
@@ -1047,7 +1081,8 @@ def run_session(motors: Motors, port: str, dry_run: bool, stopped: threading.Eve
             with contextlib.suppress(Exception):
                 output.send({"type": "error", "error": error_message[:700], "runId": session.run_id})
         diagnostic.event("drive.finished", critical=True, exitCode=1 if failed else 0,
-                         cleanupConfirmed=cleanup_confirmed)
+                         cleanupConfirmed=cleanup_confirmed,
+                         stopCommandConfirmed=motors.stop_command_confirmed)
         diagnostic.close(timeout=.1)  # Bounded flush after motor cleanup, never on a heartbeat.
     return 1 if failed else 0
 

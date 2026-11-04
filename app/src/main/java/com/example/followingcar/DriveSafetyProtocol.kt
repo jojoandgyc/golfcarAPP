@@ -39,6 +39,16 @@ internal fun BoardUiState.canEditParkingAt(nowNanos: Long): Boolean =
 internal fun DriveAck.hasFreshFeedback(nowNanos: Long = System.nanoTime()): Boolean = feedback != null &&
     driveFeedbackIsFresh(feedbackReceivedNanos, feedbackAgeAtReceiptMs, nowNanos)
 
+/** A display-only runtime warning; it never upgrades a nonzero measured speed to stopped. */
+internal fun DriveAck.hasMinorStoppedFeedbackNoise(nowNanos: Long = System.nanoTime(), maxRpm: Int = 2): Boolean {
+    val measured = feedback ?: return false
+    return targetStopped && left == 0 && right == 0 && !stopped &&
+        !recoveryRequired && !feedbackRecheck && !standstillPending && hasFreshFeedback(nowNanos) &&
+        measured.leftError == 0 && measured.rightError == 0 && measured.ageMs in 0..250 &&
+        maxRpm in 1..80 && measured.leftRpm in -maxRpm..maxRpm && measured.rightRpm in -maxRpm..maxRpm &&
+        (measured.leftRpm != 0 || measured.rightRpm != 0)
+}
+
 internal fun BoardUiState.withDriveFeedback(ack: DriveAck): BoardUiState = copy(
     driveFeedbackLeftRpm = ack.feedback?.leftRpm,
     driveFeedbackRightRpm = ack.feedback?.rightRpm,

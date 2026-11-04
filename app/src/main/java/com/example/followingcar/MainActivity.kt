@@ -113,7 +113,8 @@ class MainActivity : ComponentActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (::boardViewModel.isInitialized) {
             boardViewModel.recordUiEvent("ui.window_focus", "hasFocus=$hasFocus")
-            if (!hasFocus) boardViewModel.onControlSurfaceHidden("界面失去焦点", ControlStopSource.WINDOW_FOCUS_LOST)
+            // Dialogs and notification shade focus changes do not end control.
+            // Actual backgrounding still follows onPause's stop path.
         }
     }
 }
@@ -691,10 +692,13 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                 }
             }
             if (!controlling && manualSection != ManualSection.PARKING) {
-                Button(onClick = { viewModel.enableDrive() },
-                    enabled = state.canEnableDrive,
+                Button(onClick = {
+                    if (state.driveCleanupUnconfirmed) viewModel.refreshDriveAvailability()
+                    else viewModel.enableDrive()
+                },
+                    enabled = if (state.driveCleanupUnconfirmed) state.canInspectFollow else state.canEnableDrive,
                     modifier = Modifier.fillMaxWidth().testTag("enableDrive")) {
-                    Text("启用手动控制")
+                    Text(if (state.driveCleanupUnconfirmed) "检查控制占用" else "启用手动控制")
                 }
             } else if (controlling) {
                 Button(onClick = { viewModel.disableDrive("已急停 · 重新启用后可操作", emergency = true) },

@@ -348,7 +348,7 @@ class BoardTransportDiagnosticsTest {
         }
     }
 
-    @Test fun missingDriveAckInvalidatesTransportImmediatelyWithoutChangingDeadline() = runBlocking {
+    @Test fun missingDriveAckClosesOnlyItsChannelAndLeavesSshForIndependentChecks() = runBlocking {
         val context = testContext()
         val client = BoardSshClient()
         val socket = Socket()
@@ -359,11 +359,11 @@ class BoardTransportDiagnosticsTest {
             val started = System.nanoTime()
             assertTrue(runCatching { control.exchange(0, 0) }.exceptionOrNull() is SocketTimeoutException)
             assertTrue("Original 900 ms deadline must remain bounded", elapsedMillis(started) < 1800)
-            assertFalse(client.isConnected)
-            assertTrue(socket.isClosed)
+            assertTrue(client.isConnected)
+            assertFalse(socket.isClosed)
             val records = events(context)
-            assertEquals("drive_ack_timeout", record(records, "ssh.transport_abort").getString("source"))
-            assertEquals("transport", record(records, "drive.channel_close").getJSONObject("fields").getString("closeScope"))
+            assertFalse(records.any { it.optString("event") == "ssh.transport_abort" })
+            assertEquals("channel", record(records, "drive.channel_close").getJSONObject("fields").getString("closeScope"))
             assertEquals("drive.ack_timeout", testEngine.snapshot().failures.single().event)
         } finally { client.disconnect("test_cleanup", context); socket.close() }
     }
@@ -395,12 +395,13 @@ class BoardTransportDiagnosticsTest {
             val oldControl = client.openDriveChannel(dryRun = true, diagnostic = oldContext)
             attachConnection(client, DiagnosticTestSession(ReadyChannel("")), newSocket, newContext)
             assertTrue(runCatching { oldControl.exchange(0, 0) }.exceptionOrNull() is SocketTimeoutException)
-            assertTrue(oldSocket.isClosed)
+            assertFalse(oldSocket.isClosed)
             assertFalse(newSocket.isClosed)
             assertTrue(client.isConnected)
             assertEquals(newContext.connectionId, client.diagnosticConnectionId)
-            assertFalse(record(events(oldContext), "ssh.transport_abort").getJSONObject("fields")
-                .getBoolean("currentConnectionDetached"))
+            val records = events(oldContext)
+            assertFalse(records.any { it.optString("event") == "ssh.transport_abort" })
+            assertEquals("channel", record(records, "drive.channel_close").getJSONObject("fields").getString("closeScope"))
         } finally { client.disconnect("test_cleanup", newContext); oldSocket.close(); newSocket.close() }
     }
 

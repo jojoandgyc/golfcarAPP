@@ -133,6 +133,39 @@ class DriveSafetyProtocolTest {
         assertTrue(next.hasFreshFeedback(received + 1_000_000_000L))
     }
 
+    @Test fun minorRuntimeFeedbackNoiseIsOnlyADisplayHintAndNeverConfirmsStop() {
+        val received = 1_000_000_000L
+        for ((left, right) in listOf(1 to 0, -1 to 0, 0 to 2, 2 to -2)) {
+            val measured = parse(feedback(stopped = false) + mapOf("feedbackLeftRpm" to left,
+                "feedbackRightRpm" to right, "feedbackSamples" to 0)).feedback
+            val ack = DriveAck(0, 0, false, feedback = measured, feedbackReceivedNanos = received,
+                feedbackAgeAtReceiptMs = 30)
+            assertTrue(ack.hasMinorStoppedFeedbackNoise(received))
+            assertFalse(ack.stopped)
+            assertFalse(measured.zeroSpeedConfirmed)
+            rejects { parse(feedback() + mapOf("feedbackLeftRpm" to left, "feedbackRightRpm" to right)) }
+        }
+    }
+
+    @Test fun minorNoiseHintNeverMasksRecoveryFaultsStaleSamplesOrLargerMotion() {
+        val received = 1_000_000_000L
+        val measured = DriveFeedback(1, 0, 0, 0, 0, 0, "hardware")
+        val ack = DriveAck(0, 0, false, feedback = measured, feedbackReceivedNanos = received,
+            feedbackAgeAtReceiptMs = 30)
+        val rejected = listOf(ack.copy(left = 1), ack.copy(right = -1), ack.copy(targetStopped = false),
+            ack.copy(stopped = true), ack.copy(recoveryRequired = true), ack.copy(feedbackRecheck = true),
+            ack.copy(standstillPending = true), ack.copy(feedback = null),
+            ack.copy(feedback = measured.copy(leftRpm = 0)),
+            ack.copy(feedback = measured.copy(leftRpm = 3)),
+            ack.copy(feedback = measured.copy(rightRpm = -3)),
+            ack.copy(feedback = measured.copy(leftError = 1)),
+            ack.copy(feedback = measured.copy(rightError = 1)),
+            ack.copy(feedback = measured.copy(ageMs = 251)), ack.copy(feedbackAgeAtReceiptMs = 501))
+        rejected.forEach { assertFalse(it.toString(), it.hasMinorStoppedFeedbackNoise(received)) }
+        assertFalse(ack.hasMinorStoppedFeedbackNoise(received - 1))
+        assertFalse(ack.hasMinorStoppedFeedbackNoise(received + 471_000_000L))
+    }
+
     @Test fun parkingPermissionExpiresWithoutAnotherAckAndDoesNotDiscardRecoveryLocks() {
         val received = 1_000_000_000L
         val ready = BoardUiState(connected = true, driveEnabled = true, driveConfirmedStopped = true,

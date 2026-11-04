@@ -2,9 +2,20 @@ package com.example.followingcar
 
 /** Only a board that separates its motion lease from session expiry may wait longer. */
 internal fun driveAckTimeoutMillis(networkGraceMs: Int?): Long {
-    require(networkGraceMs == null || networkGraceMs == 5_000) { "开发板网络恢复参数不匹配" }
-    return if (networkGraceMs == null) 900L else 2_500L
+    require(networkGraceMs == null || networkGraceMs in setOf(5_000, 15_000)) { "开发板网络恢复参数不匹配" }
+    return when (networkGraceMs) {
+        null -> 900L
+        5_000 -> 4_250L
+        else -> 8_000L
+    }
 }
+
+/** Waiting for an ACK may tolerate jitter; a blocked socket write still has a short deadline. */
+internal const val DRIVE_WRITE_TIMEOUT_MS = 2_500L
+internal const val DRIVE_ACK_WARNING_MS = 1_200L
+
+internal class DriveAckTimeoutException(message: String, val transportRetained: Boolean) :
+    java.net.SocketTimeoutException(message)
 
 internal fun validatedDriveRecovery(
     supported: Boolean, reported: Boolean?, left: Int, right: Int, stopped: Boolean,
