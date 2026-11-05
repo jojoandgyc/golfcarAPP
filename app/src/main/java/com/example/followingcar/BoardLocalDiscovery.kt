@@ -7,13 +7,18 @@ import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.SystemClock
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.NetworkInterface
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 internal const val BOARD_DISCOVERY_SERVICE_TYPE = "_followingcar._tcp."
@@ -27,6 +32,8 @@ internal data class LocalBoardEndpoint(
     val port: Int = 22,
     val source: String = "mdns",
     val network: Network? = null,
+    val localAddress: InetAddress? = null,
+    val localInterfaceIndex: Int? = null,
 )
 
 /** Pure filtering: TXT records are not an identity proof and must never update online state. */
@@ -77,12 +84,34 @@ internal fun isOnLocalDiscoveryLink(address: InetAddress, localAddresses: List<L
 
 internal fun orderedLocalEndpoints(endpoints: List<LocalBoardEndpoint>): List<LocalBoardEndpoint> = endpoints
     .filter { it.host.isNotBlank() && it.host.none(Char::isWhitespace) && it.port in 1..65535 }
-    .distinctBy { Triple(it.host, it.port, it.network) }
+    .distinctBy { listOf(it.host, it.port, it.network, it.localAddress?.hostAddress, it.localInterfaceIndex) }
     .sortedBy { if (':' in it.host) 1 else 0 }
     .take(MAX_LOCAL_BOARD_CANDIDATES)
 
+internal data class LocalDiscoveryBatch(val endpoints: List<LocalBoardEndpoint>, val validUntilMillis: Long)
+
+/** Concurrent callers share one bounded observation, including a short negative cache. */
+internal class LocalDiscoveryFlight(private val clock: () -> Long = SystemClock::elapsedRealtime) {
+    private val mutex = Mutex()
+    private var links = emptyList<LocalDiscoveryLink>()
+    private var cached = emptyList<LocalBoardEndpoint>()
+    private var expires = 0L
+    suspend fun discover(currentLinks: () -> List<LocalDiscoveryLink>,
+        load: suspend (List<LocalDiscoveryLink>) -> LocalDiscoveryBatch): List<LocalBoardEndpoint> = mutex.withLock {
+        val before = currentLinks()
+        val now = clock()
+        if (before == links && now < expires) return@withLock cached.filter { localEndpointIsCurrent(it, before) }
+        val batch = load(before)
+        val after = currentLinks()
+        cached = orderedLocalEndpoints(batch.endpoints.filter { localEndpointIsCurrent(it, after) })
+        links = after
+        expires = if (cached.isEmpty()) clock() + 1_000L else minOf(batch.validUntilMillis, clock() + 30_000L)
+        cached
+    }
+}
+
 /**
- * One bounded discovery, restricted to existing Wi-Fi Networks. No network requests, Wi-Fi
+ * One bounded discovery on existing Wi-Fi Networks and current phone hotspot interfaces. No requests, Wi-Fi
  * changes, process binding, IP scans, SSH operations or credential handling occur here.
  */
 internal class BoardLocalDiscovery(context: Context) {
@@ -90,9 +119,24 @@ internal class BoardLocalDiscovery(context: Context) {
     private val connectivity = app.getSystemService(ConnectivityManager::class.java)
     private val nsd = app.getSystemService(NsdManager::class.java)
     private val wifi = app.getSystemService(WifiManager::class.java)
+    private val flight = LocalDiscoveryFlight()
+
+    suspend fun discover(): List<LocalBoardEndpoint> = withContext(Dispatchers.Main.immediate) {
+        flight.discover({ currentLocalDiscoveryLinks(app) }) { links -> coroutineScope {
+            // Both branches share the caller's six-second deadline; AP discovery never
+            // waits for STA discovery to finish and never requests a new Network.
+            val hotspot = async { discoverHotspotBoards(links) }
+            val registered = async { discoverWifi() }
+            val ordinary = registered.await()
+            val direct = hotspot.await().filter { it.expiresAtMillis > SystemClock.elapsedRealtime() }
+            LocalDiscoveryBatch(ordinary + direct.map { it.endpoint },
+                minOf(SystemClock.elapsedRealtime() + 30_000L,
+                    direct.minOfOrNull { it.expiresAtMillis } ?: Long.MAX_VALUE))
+        } }
+    }
 
     @Suppress("DEPRECATION") // Enumerate existing networks, including Wi-Fi without validated Internet.
-    suspend fun discover(): List<LocalBoardEndpoint> = withContext(Dispatchers.Main.immediate) {
+    private suspend fun discoverWifi(): List<LocalBoardEndpoint> = withContext(Dispatchers.Main.immediate) {
         val manager = nsd ?: return@withContext emptyList()
         val networks = connectivity?.allNetworks.orEmpty().filter(::isWifi).take(4)
         if (networks.isEmpty()) return@withContext emptyList()

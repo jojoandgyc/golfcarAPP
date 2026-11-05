@@ -139,6 +139,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     val networkRefreshing by viewModel.networkRefreshing.collectAsStateWithLifecycle()
     val wireless by viewModel.wifiDirect.state.collectAsStateWithLifecycle()
     val pairing by viewModel.pairing.state.collectAsStateWithLifecycle()
+    val hotspotProfile by viewModel.systemHotspotProfile.collectAsStateWithLifecycle()
     val motorConfiguration by viewModel.motorConfiguration.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -427,12 +428,13 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                 canManagePairing = canManagePairing,
                                 canRefreshWireless = !wireless.busy && !mutationPending,
                                 onCheckPairing = recoverPairing, onCancelPairing = viewModel.pairing::cancel,
-                                onRefreshWireless = viewModel.wifiDirect::refresh)
+                                onRefreshWireless = viewModel.wifiDirect::refresh,
+                                onOpenSystemHotspotSettings = viewModel::openSystemHotspotSettings)
                             if (method == ConnectionMethod.WIFI_DIRECT) WifiDirectCard(
                                 state = wireless, canManage = state.canManageWifiDirect,
                                 lockedReason = when {
                                     state.pairingUnconfirmed -> "先在上方恢复并核对配网，再更改直连无线组。"
-                                    state.pairingHotspotActive -> "配对热点仍在使用，请先在下方关闭热点，再创建直连无线组。"
+                                    state.pairingHotspotActive -> "小车正在使用手机系统热点；断开 SSH 并解除配对记录后可创建直连无线组。"
                                     state.connected -> "先断开 SSH，才能更改无线组。"
                                     !state.canManageWifiDirect -> selectionReason ?: "控制或配网操作尚未结束。"
                                     state.followUncertain -> "可以恢复无线连接；旧控制仍保持锁定，SSH 重连后会检查占用。"
@@ -456,7 +458,10 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                                 PairingCard(state = pairing, canManage = canManagePairing,
                                     sshConnected = state.connected, onPair = pair, onCancel = viewModel.pairing::cancel,
                                     onCheck = recoverPairing, onStopHotspot = viewModel.pairing::stopHotspot,
-                                    onCheckBluetooth = { address -> beginPairingAction(address, true) })
+                                    onCheckBluetooth = { address -> beginPairingAction(address, true) },
+                                    hotspotProfile = hotspotProfile,
+                                    onSaveHotspotProfile = viewModel::saveSystemHotspotProfile,
+                                    onOpenHotspotSettings = viewModel::openSystemHotspotSettings)
                             }
                             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,

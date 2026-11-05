@@ -187,9 +187,14 @@ class BoardSystem:
         state = fields.get("GENERAL.STATE", "").split(" ", 1)[0]
         if not state.isdigit() or fields.get("GENERAL.NM-MANAGED") != "yes":
             raise JoinError("wifi_not_managed_or_state_unknown")
-        current_uuid = fields.get("GENERAL.CON-UUID", "--")
+        if "GENERAL.CON-UUID" not in fields:
+            raise JoinError("invalid_current_profile_uuid")
+        # nmcli terse output uses an empty value for a disconnected device;
+        # other versions/formats use --. A missing field is not that observation.
+        current_uuid = fields["GENERAL.CON-UUID"].strip()
+        current_uuid = None if current_uuid in ("", "--") else current_uuid
         ssid = None
-        if current_uuid != "--":
+        if current_uuid is not None:
             try:
                 current_uuid = str(uuid.UUID(current_uuid))
             except ValueError:
@@ -199,12 +204,15 @@ class BoardSystem:
         addresses = []
         for key, value in fields.items():
             if key.startswith("IP4.ADDRESS"):
+                value = value.strip()
+                if value in ("", "--"):
+                    continue
                 try:
                     addresses.append(str(ipaddress.IPv4Interface(value).ip))
                 except ValueError:
                     raise JoinError("invalid_ip_observation") from None
         return dict(interface=INTERFACE, state=int(state), managed=True,
-                    profileUuid=None if current_uuid == "--" else current_uuid,
+                    profileUuid=current_uuid,
                     profileName=fields.get("GENERAL.CONNECTION"), ssid=ssid, addresses=addresses,
                     supports2GHz=fields.get("WIFI-PROPERTIES.2GHZ") == "yes",
                     supports5GHz=fields.get("WIFI-PROPERTIES.5GHZ") == "yes")
@@ -313,10 +321,12 @@ class BoardSystem:
                           "connection.uuid": profile_uuid, "connection.interface-name": INTERFACE,
                           "802-11-wireless.ssid": ssid}
 
-    def add_profile(self, profile_uuid, ssid):
+    def add_profile(self, profile_uuid, ssid, *, internet_access=False):
         # NM 1.36's connection add generates an immutable UUID before processing
         # properties. Load a private runtime keyfile to preserve the chosen identity.
         # It contains no PSK and cannot autoconnect; reboot removes the /run profile.
+        if type(internet_access) is not bool:
+            raise JoinError("invalid_internet_access")
         if str(uuid.UUID(profile_uuid)) != profile_uuid or profile_uuid in self.profile_uuids():
             raise JoinError("profile_uuid_collision")
         if (not self.profile_root.is_dir()
@@ -329,7 +339,8 @@ class BoardSystem:
                    + "\ntype=wifi\ninterface-name=" + INTERFACE + "\nautoconnect=false\n"
                    "\n[wifi]\nmode=infrastructure\nband=bg\nssid=" + encoded_ssid
                    + "\n\n[wifi-security]\nkey-mgmt=wpa-psk\nproto=rsn;\npsk-flags=2\n"
-                   "\n[ipv4]\nmethod=auto\nnever-default=true\n\n[ipv6]\nmethod=disabled\n")
+                   "\n[ipv4]\nmethod=auto\nnever-default=" + ("false" if internet_access else "true")
+                   + "\n\n[ipv6]\nmethod=disabled\n")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         info = os.fstat(fd)
         self.created_profile_files[profile_uuid] = (path, info.st_dev, info.st_ino)
@@ -383,8 +394,14 @@ class BoardSystem:
                 pass
 
     def activate(self, profile_uuid, secret_path):
-        self.checked([NMCLI, "--wait", "45", "connection", "up", "uuid", profile_uuid,
-                      "ifname", INTERFACE, "passwd-file", str(secret_path)], 50)
+        result = self.run([NMCLI, "--wait", "45", "connection", "up", "uuid", profile_uuid,
+                           "ifname", INTERFACE, "passwd-file", str(secret_path)], 50)
+        if result.returncode:
+            # run_command fixes LC_ALL=C. Classify only this known activation
+            # reason; neither arbitrary stderr nor credentials leave this layer.
+            if "The Wi-Fi network could not be found" in (result.stderr or ""):
+                raise JoinError("hotspot_not_visible_2g")
+            raise JoinError("networkmanager_command_failed")
 
     def delete_own_profile(self, profile_uuid):
         self.checked([NMCLI, "--wait", "10", "connection", "delete", "uuid", profile_uuid], 15)
@@ -462,11 +479,13 @@ def check(system):
 
 
 def join_group(credentials, system, store, *, signal_monitor=None,
-               method="legacy_wifi_client_of_android_go"):
+               method="legacy_wifi_client_of_android_go", internet_access=False):
+    if type(internet_access) is not bool:
+        raise JoinError("invalid_internet_access")
     profile_uuid = str(uuid.uuid4())
     result = dict(schemaVersion=1, action="join", ok=False, phase="preflight",
                   startedAt=datetime.now(timezone.utc).isoformat(), profileUuid=profile_uuid,
-                  requestedSsid=credentials.ssid, method=method,
+                  requestedSsid=credentials.ssid, method=method, internetAccessRequested=internet_access,
                   interface=INTERFACE, autoRestore=False)
     signals = None
     def save():
@@ -479,6 +498,7 @@ def join_group(credentials, system, store, *, signal_monitor=None,
         with (signal_monitor or join_signal_monitor)() as signals, system.idle_guard():
             current = system.network()
             if (current["state"] not in (30, 100) or not current["supports2GHz"]
+                    or current["state"] == 30 and (current["profileUuid"] is not None or current["addresses"])
                     or current["state"] == 100 and not current["profileUuid"]):
                 raise JoinError("wifi_not_ready_for_switch")
             result["previousConnectionUuid"] = current["profileUuid"]
@@ -492,7 +512,7 @@ def join_group(credentials, system, store, *, signal_monitor=None,
                     signals.check_cancelled()
                     attempted = True
                     result["phase"] = "creating_profile"
-                    system.add_profile(profile_uuid, credentials.ssid)
+                    system.add_profile(profile_uuid, credentials.ssid, internet_access=internet_access)
                     result["profileCreationConfirmed"] = True
                     signals.check_cancelled()
                     result["phase"] = "activating"

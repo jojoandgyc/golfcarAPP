@@ -44,11 +44,11 @@ class PairingModelsTest {
         assertFalse(pairingErrorMessage(pairingBoardErrorCode("secretpassword123")).contains("secretpassword123"))
     }
 
-    @Test fun unknownOutcomeAndExistingHotspotPreventRepeatedProvision() {
+    @Test fun unknownOutcomeBlocksRepeatedProvisionButExistingSystemHotspotIsReusable() {
         val ready = PairingState(supported = true, permissionGranted = true, bluetoothEnabled = true)
         assertNull(pairingRequestAllowed(ready, true))
         assertNotNull(pairingRequestAllowed(ready.copy(confirmationRequired = true), true))
-        assertNotNull(pairingRequestAllowed(ready.copy(hotspotActive = true), true))
+        assertNull(pairingRequestAllowed(ready.copy(hotspotActive = true), true))
         assertNotNull(pairingRequestAllowed(ready.copy(busy = true), true))
         assertNotNull(pairingRequestAllowed(ready, false))
     }

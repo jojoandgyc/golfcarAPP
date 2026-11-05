@@ -10,6 +10,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
+import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -33,6 +34,7 @@ data class BoardConnection(
     val password: String,
     val tls: RemoteTlsConfig? = null,
     val localNetwork: Network? = null,
+    val localAddress: InetAddress? = null,
 ) {
     // Avoid accidentally including credentials in logs or exception messages.
     override fun toString(): String = "BoardConnection(host=$host, port=$port, username=$username)"
@@ -108,7 +110,8 @@ class BoardSshClient {
                 setDaemonThread(true)
                 setSocketFactory(object : SocketFactory {
                     override fun createSocket(host: String, port: Int): Socket {
-                        return openBoardSocket(socket, host, port, CONNECT_TIMEOUT_MS, config.tls, config.localNetwork)
+                        return openBoardSocket(socket, host, port, CONNECT_TIMEOUT_MS, config.tls,
+                            config.localNetwork, config.localAddress)
                     }
 
                     override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()

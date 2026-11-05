@@ -172,8 +172,11 @@ def parse_request(raw):
         if "queryRequestId" in request:
             canonical_uuid(request["queryRequestId"])
     elif cmd == "provision":
-        if set(request) != base | {"ssid", "psk"}:
+        provision_fields = base | {"ssid", "psk"}
+        if set(request) not in (provision_fields, provision_fields | {"internetAccess"}):
             raise JoinError("unexpected_fields")
+        if type(request.get("internetAccess", False)) is not bool:
+            raise JoinError("invalid_internet_access")
         validate_credentials(request["ssid"], request["psk"])
     else:
         raise JoinError("unsupported_command")
@@ -282,10 +285,15 @@ class PairingState:
                     raise ValueError()
                 for record in data:
                     canonical_uuid(record["requestId"])
+                    requested_access = record.get("internetAccessRequested")
+                    if "internetAccessRequested" in record and type(requested_access) is not bool:
+                        raise ValueError()
                     if record.get("type") != "result":
                         # Never retry credentials or claim completion after a crash.
                         record = response(record["requestId"], "result", ok=False, definitive=False,
                                           error="outcome_unknown_after_restart", networkChanged=True)
+                        if requested_access is not None:
+                            record["internetAccessRequested"] = requested_access
                     self.records.append(record)
             except (ValueError, KeyError, TypeError):
                 raise JoinError("pairing_state_unreadable") from None
@@ -295,6 +303,11 @@ class PairingState:
                      if record["requestId"] == request_id), None)
 
     def put(self, record):
+        record = dict(record)
+        previous = self.get(record["requestId"])
+        if previous is not None and "internetAccessRequested" in previous:
+            # An accepted request's policy is immutable, including after recovery.
+            record["internetAccessRequested"] = previous["internetAccessRequested"]
         values = [item for item in self.records if item["requestId"] != record["requestId"]]
         values.append(dict(record))
         values = values[-MAX_HISTORY:]
@@ -336,6 +349,9 @@ class Provisioner:
 
     def remember_final(self, final):
         """Disk failure must not strand an accepted request in progress in memory."""
+        previous = self.state.get(final["requestId"])
+        if previous is not None and "internetAccessRequested" in previous:
+            final = dict(final, internetAccessRequested=previous["internetAccessRequested"])
         try:
             self.state.put(final)
         except Exception:
@@ -378,7 +394,8 @@ class Provisioner:
                     error = code(failure)
             result = response(request["requestId"], "status", boardId=self.board_id,
                               controlAvailable=available, band="2.4GHz", operationInProgress=active,
-                              lastResult=previous, error=error, recoveryState=recovery_state)
+                              lastResult=previous, error=error, recoveryState=recovery_state,
+                              supportsSystemHotspot=True)
             if recovery_id is not None:
                 result["recoveryRequestId"] = recovery_id
             return result
@@ -461,6 +478,8 @@ class Provisioner:
                                 previouslySucceeded=True)
             if "firstError" in previous:
                 fallback["firstError"] = previous["firstError"]
+            if "internetAccessRequested" in previous:
+                fallback["internetAccessRequested"] = previous["internetAccessRequested"]
         if self.active_id is not None or self.worker is not None and self.worker.is_alive():
             return fallback
         try:
@@ -516,6 +535,8 @@ class Provisioner:
                 first_error = previous.get("firstError") or previous.get("error")
                 if type(first_error) is str and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", first_error):
                     final["firstError"] = first_error
+                if "internetAccessRequested" in previous:
+                    final["internetAccessRequested"] = previous["internetAccessRequested"]
                 self.state.put(final)
                 return final
         except Exception:
@@ -537,6 +558,9 @@ class Provisioner:
             return
         request_id = request["requestId"]
         credentials = validate_credentials(request["ssid"], request["psk"])
+        internet_access = request.get("internetAccess", False)
+        if type(internet_access) is not bool:
+            raise JoinError("invalid_internet_access")
         with self.lock:
             if not request_is_current():
                 return  # A replaced socket cannot submit its queued old frame.
@@ -565,7 +589,8 @@ class Provisioner:
             try:
                 with self.system.idle_guard():
                     pass
-                accepted = response(request_id, "progress", stage="accepted")
+                accepted = response(request_id, "progress", stage="accepted",
+                                    internetAccessRequested=internet_access)
                 self.state.put(accepted)
             except Exception as failure:
                 safe_emit(response(request_id, "result", ok=False, definitive=True,
@@ -574,20 +599,23 @@ class Provisioner:
             self.active_id = request_id
             safe_emit(accepted)
             try:
-                self.start_thread(lambda: self._provision(request_id, credentials, safe_emit))
+                self.start_thread(lambda: self._provision(request_id, credentials, safe_emit,
+                                                          internet_access=internet_access))
             except Exception:
                 self.active_id = None
                 failed = response(request_id, "result", ok=False, definitive=True,
-                                  error="worker_unavailable", networkChanged=False)
+                                  error="worker_unavailable", networkChanged=False,
+                                  internetAccessRequested=internet_access)
                 safe_emit(self.remember_final(failed))
 
-    def _provision(self, request_id, credentials, emit):
+    def _provision(self, request_id, credentials, emit, *, internet_access=False):
         result = None
         try:
             # Signal handlers belong to the main GLib thread; a worker finishes
             # its bounded transaction while the service stops accepting clients.
             result = join_group(credentials, self.system, JoinRecord(self, request_id, emit),
-                                signal_monitor=lambda: nullcontext(JoinSignals()), method="bluetooth_hotspot")
+                                signal_monitor=lambda: nullcontext(JoinSignals()), method="bluetooth_hotspot",
+                                internet_access=internet_access)
             if result["ok"]:
                 addresses = self.system.address_result(result["profileUuid"])
                 final = response(request_id, "result", ok=True, definitive=True, networkChanged=True, **addresses)
@@ -602,6 +630,7 @@ class Provisioner:
                              networkChanged=bool(result and result.get("ok")))
         finally:
             credentials = None
+        final["internetAccessRequested"] = internet_access
         with self.lock:
             final = self.remember_final(final)
             self.active_id = None

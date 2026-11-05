@@ -18,6 +18,12 @@
         android:usesPermissionFlags="neverForLocation" />
     <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
 
+    <queries>
+        <intent><action android:name="android.settings.TETHER_SETTINGS" /></intent>
+        <intent><action android:name="android.settings.WIRELESS_SETTINGS" /></intent>
+        <intent><action android:name="android.settings.SETTINGS" /></intent>
+    </queries>
+
     <application
         android:name=".FollowingCarApplication"
         android:allowBackup="true"

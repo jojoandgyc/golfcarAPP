@@ -11,8 +11,8 @@ import android.content.pm.ServiceInfo
 import android.os.IBinder
 import androidx.core.content.ContextCompat
 
-/** Keeps the process holding the local-hotspot reservation alive while the board uses it.
- * Restarting this service never starts a new hotspot, pairing attempt or control session. */
+/** Keeps an explicit Bluetooth provisioning transaction alive through system pairing dialogs.
+ * It does not own, create or stop the user's system hotspot. */
 class PairingHotspotService : Service() {
     override fun onCreate() {
         super.onCreate()
@@ -23,8 +23,8 @@ class PairingHotspotService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_car)
-            .setContentTitle("小车配对与热点连接")
-            .setContentText("点击返回 App 查看连接；后台保留热点，控制仍遵循停车规则。")
+            .setContentTitle("正在配对小车")
+            .setContentText("正在通过蓝牙核对入网结果，手机热点由系统管理。")
             .setContentIntent(open).setOngoing(true).setCategory(Notification.CATEGORY_SERVICE).build()
         startForeground(ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
     }

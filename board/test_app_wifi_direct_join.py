@@ -91,6 +91,7 @@ class FakeBoard(helper.BoardSystem):
             if self.fail_up:
                 return subprocess.CompletedProcess(args, 4, PSK, "password=" + PSK)
             self.active_uuid = self.created_uuid
+            self.net_state = 100
             if self.on_up:
                 self.on_up()
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -111,8 +112,9 @@ class FakeBoard(helper.BoardSystem):
             output = "wlan0:wifi\np2p-dev-wlan0:wifi-p2p\neth0:ethernet\n"
         elif "device" in args:
             output = ("GENERAL.DEVICE:wlan0\nGENERAL.TYPE:wifi\nGENERAL.STATE:" + str(self.net_state) + " (connected)\n"
-                      "GENERAL.NM-MANAGED:yes\nGENERAL.CON-UUID:" + (self.active_uuid or "--") + "\n"
-                      "GENERAL.CONNECTION:Original access point\nIP4.ADDRESS[1]:172.16.16.82/22\n"
+                      "GENERAL.NM-MANAGED:yes\nGENERAL.CON-UUID:" + (self.active_uuid or "") + "\n"
+                      "GENERAL.CONNECTION:" + ("Original access point" if self.active_uuid else "") + "\n"
+                      + ("IP4.ADDRESS[1]:172.16.16.82/22\n" if self.net_state == 100 and self.active_uuid else "") +
                       "WIFI-PROPERTIES.2GHZ:yes\nWIFI-PROPERTIES.5GHZ:no\n")
         elif "802-11-wireless.ssid" in args:
             output = SSID if self.active_uuid == self.created_uuid else "Original network"
@@ -140,6 +142,91 @@ class FakeBoard(helper.BoardSystem):
     @staticmethod
     def assert_no_secret(args):
         assert all(PSK not in arg for arg in args), "PSK leaked into argv"
+
+
+def replace_device_fields(board, replacements=None, omitted=()):
+    """Feed actual parser text while keeping every command inside FakeBoard."""
+    original = board.run
+    replacements = replacements or {}
+    def run(arguments, timeout=6):
+        result = original(arguments, timeout)
+        if arguments[-3:] == ["device", "show", "wlan0"]:
+            fields = dict(line.split(":", 1) for line in result.stdout.splitlines() if ":" in line)
+            fields.update(replacements)
+            for key in omitted:
+                fields.pop(key, None)
+            result.stdout = "".join(key + ":" + value + "\n" for key, value in fields.items())
+        return result
+    board.run = run
+
+
+class NetworkObservationTests(unittest.TestCase):
+    def board(self, fields=None, omitted=()):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        board = FakeBoard(temporary.name)
+        board.active_uuid, board.net_state = None, 30
+        replace_device_fields(board, fields, omitted)
+        return board
+
+    def assert_no_ssid_query(self, board):
+        self.assertFalse(any("802-11-wireless.ssid" in command for command in board.calls))
+
+    def test_empty_and_placeholder_uuid_are_absent_without_ssid_query(self):
+        for value in ("", "--", "  ", " \t--\t "):
+            with self.subTest(value=value):
+                board = self.board({"GENERAL.CON-UUID": value})
+                network = board.network()
+                self.assertIsNone(network["profileUuid"])
+                self.assertIsNone(network["ssid"])
+                self.assertEqual(network["state"], 30)
+                self.assertEqual(network["addresses"], [])
+                self.assert_no_ssid_query(board)
+
+    def test_missing_uuid_field_is_unknown_not_a_disconnected_observation(self):
+        board = self.board(omitted=("GENERAL.CON-UUID",))
+        with self.assertRaisesRegex(helper.JoinError, "invalid_current_profile_uuid"):
+            board.network()
+        self.assert_no_ssid_query(board)
+
+    def test_nonempty_malformed_uuid_stays_an_error(self):
+        for value in ("not-a-uuid", "0", " --unknown ", OLD_UUID + ":unexpected"):
+            with self.subTest(value=value):
+                board = self.board({"GENERAL.CON-UUID": value})
+                with self.assertRaisesRegex(helper.JoinError, "invalid_current_profile_uuid"):
+                    board.network()
+                self.assert_no_ssid_query(board)
+
+    def test_valid_uuid_is_trimmed_validated_and_used_for_exact_ssid_read(self):
+        board = self.board({"GENERAL.CON-UUID": " " + OLD_UUID + " ", "GENERAL.STATE": "100 (connected)",
+                            "IP4.ADDRESS[1]": "172.16.16.116/22"})
+        network = board.network()
+        self.assertEqual(network["profileUuid"], OLD_UUID)
+        self.assertEqual(network["state"], 100)
+        self.assertEqual(network["addresses"], ["172.16.16.116"])
+        ssid_reads = [command for command in board.calls if "802-11-wireless.ssid" in command]
+        self.assertEqual(ssid_reads, [[helper.NMCLI, "-g", "802-11-wireless.ssid", "connection", "show", "uuid", OLD_UUID]])
+
+    def test_empty_address_placeholders_are_skipped_without_hiding_valid_addresses(self):
+        board = self.board({"IP4.ADDRESS[1]": "", "IP4.ADDRESS[2]": " -- ",
+                            "IP4.ADDRESS[3]": " 172.16.16.116/22 "})
+        network = board.network()
+        self.assertEqual(network["state"], 30, "parser must not rewrite an inconsistent state")
+        self.assertEqual(network["addresses"], ["172.16.16.116"])
+
+    def test_nonempty_invalid_address_stays_an_error(self):
+        for value in ("invalid", "192.0.2.5/99", "2001:db8::1/64", "--unknown"):
+            with self.subTest(value=value):
+                board = self.board({"IP4.ADDRESS[1]": value})
+                with self.assertRaisesRegex(helper.JoinError, "invalid_ip_observation"):
+                    board.network()
+
+    def test_connected_empty_uuid_is_not_relabelled_disconnected(self):
+        board = self.board({"GENERAL.STATE": "100 (connected)"})
+        network = board.network()
+        self.assertEqual(network["state"], 100)
+        self.assertIsNone(network["profileUuid"])
+        self.assert_no_ssid_query(board)
 
 
 class CredentialTests(unittest.TestCase):
@@ -213,6 +300,9 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(parsed['connection']['uuid'], board.created_uuid)
         self.assertEqual(parsed['wifi-security']['psk-flags'], '2')
         self.assertEqual(parsed['connection']['interface-name'], 'wlan0')
+        self.assertEqual(parsed['ipv4']['method'], 'auto')
+        self.assertEqual(parsed['ipv4']['never-default'], 'true')
+        self.assertFalse(result['internetAccessRequested'])
         self.assertNotIn('psk', parsed['wifi-security'])
         self.assertNotIn(PSK, board.profile_content)
         self.assertFalse(board.secret_path.exists())
@@ -223,6 +313,82 @@ class JoinTests(unittest.TestCase):
         self.assertEqual([row["phase"] for row in store.rows], ["preflight", "activating", "connected"])
         self.assertFalse(any("delete" in call for call in board.calls))
         self.assertNotIn(PSK, json.dumps(board.calls) + json.dumps(store.rows) + json.dumps(result))
+
+    def test_internet_access_only_changes_new_profiles_default_route_policy(self):
+        profiles = []
+        for enabled in (False, True):
+            board, store = self.setup_board()
+            result = helper.join_group(helper.Credentials(SSID, PSK), board, store,
+                                       method="bluetooth_hotspot", internet_access=enabled)
+            self.assertTrue(result["ok"])
+            self.assertEqual("bluetooth_hotspot", result["method"])
+            self.assertIs(enabled, result["internetAccessRequested"])
+            self.assertTrue(all(row["internetAccessRequested"] is enabled for row in store.rows))
+            parsed = configparser.ConfigParser()
+            parsed.read_string(board.profile_content)
+            self.assertEqual("false" if enabled else "true", parsed["ipv4"]["never-default"])
+            self.assertEqual("auto", parsed["ipv4"]["method"])
+            self.assertEqual("disabled", parsed["ipv6"]["method"])
+            self.assertFalse(any("modify" in command or "delete" in command for command in board.calls))
+            # Ignore only the generated identity and the one intentional policy difference.
+            del parsed["connection"]["id"]
+            del parsed["connection"]["uuid"]
+            del parsed["ipv4"]["never-default"]
+            profiles.append({section: dict(parsed[section]) for section in parsed.sections()})
+            self.assertNotIn(PSK, json.dumps(store.rows) + json.dumps(result) + board.profile_content)
+        self.assertEqual(profiles[0], profiles[1])
+
+    def test_invalid_internet_access_is_rejected_before_any_network_or_storage_action(self):
+        board, store = self.setup_board()
+        for invalid in (None, 0, 1, "true", [], {}):
+            with self.subTest(value=invalid), self.assertRaisesRegex(helper.JoinError, "invalid_internet_access"):
+                helper.join_group(helper.Credentials(SSID, PSK), board, store, internet_access=invalid)
+        self.assertEqual([], board.calls)
+        self.assertEqual([], board.events)
+        self.assertEqual([], store.rows)
+
+    def test_direct_cli_does_not_accept_the_new_bluetooth_mode_field(self):
+        board, store = self.setup_board()
+        wire = json.dumps(dict(ssid=SSID, psk=PSK, internetAccess=True)).encode()
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(1, helper.main(["--join"], board, store, io.BytesIO(wire)))
+        self.assertEqual([], board.calls)
+        self.assertNotIn(PSK, output.getvalue())
+
+    def test_known_network_not_found_reason_is_classified_without_leaking_stderr(self):
+        board, store = self.setup_board()
+        original = board.run
+        def missing_network(args, timeout=6):
+            if "up" in args:
+                return subprocess.CompletedProcess(args, 4, PSK,
+                    "Error: Connection activation failed: The Wi-Fi network could not be found.\n" + PSK)
+            return original(args, timeout)
+        board.run = missing_network
+        result = helper.join_group(helper.Credentials(SSID, PSK), board, store, internet_access=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual("hotspot_not_visible_2g", result["error"])
+        self.assertEqual("deleted_and_transition_settled", result["ownProfileCleanup"])
+        self.assertNotIn(PSK, json.dumps(result) + json.dumps(store.rows))
+        self.assertNotIn("Connection activation failed", json.dumps(result) + json.dumps(store.rows))
+
+    def test_other_activation_failures_remain_generic_and_success_is_not_reclassified(self):
+        for returncode, stderr, expected in (
+            (4, "Secrets were required, but not provided." + PSK, "networkmanager_command_failed"),
+            (4, "ssid-not-found " + PSK, "networkmanager_command_failed"),
+            (0, "The Wi-Fi network could not be found", None),
+        ):
+            calls = []
+            def run(args, timeout=6):
+                calls.append((args, timeout))
+                return subprocess.CompletedProcess(args, returncode, "", stderr)
+            system = helper.BoardSystem(runner=run)
+            with self.subTest(returncode=returncode, expected=expected):
+                if expected:
+                    with self.assertRaisesRegex(helper.JoinError, "^" + expected + "$"):
+                        system.activate(OLD_UUID, Path("test-secret-file"))
+                else:
+                    system.activate(OLD_UUID, Path("test-secret-file"))
+            self.assertEqual(1, len(calls))
 
     def test_failure_deletes_only_new_uuid_and_removes_secret_without_auto_restoring_old(self):
         board, store = self.setup_board()
@@ -370,6 +536,57 @@ class JoinTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "wifi_not_ready_for_switch")
         self.assertIsNone(board.created_uuid)
+
+    def test_raw_empty_disconnected_profile_can_join_without_existing_profile(self):
+        board, store = self.setup_board()
+        board.active_uuid, board.net_state = None, 30
+        # The real parser sees nmcli's empty current UUID and address placeholders.
+        original = board.run
+        def run(arguments, timeout=6):
+            result = original(arguments, timeout)
+            if arguments[-3:] == ["device", "show", "wlan0"] and board.active_uuid is None:
+                result.stdout += "IP4.ADDRESS[1]:\nIP4.ADDRESS[2]:--\n"
+            return result
+        board.run = run
+        result = helper.join_group(helper.Credentials(SSID, PSK), board, store)
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["previousConnectionUuid"])
+        self.assertEqual(result["currentNetwork"]["profileUuid"], board.created_uuid)
+        self.assertEqual(board.net_state, 100)
+        self.assertEqual(len([command for command in board.calls if "up" in command]), 1)
+        self.assertFalse(any("down" in command or "delete" in command for command in board.calls))
+        self.assertNotIn(PSK, json.dumps(result) + json.dumps(store.rows) + json.dumps(board.calls))
+
+    def test_disconnected_state_with_profile_or_leftover_address_refuses_switch(self):
+        for fields in ({"GENERAL.CON-UUID": OLD_UUID}, {"IP4.ADDRESS[1]": "172.16.16.116/22"}):
+            with self.subTest(fields=fields):
+                board, store = self.setup_board()
+                board.active_uuid, board.net_state = None, 30
+                replace_device_fields(board, fields)
+                result = helper.join_group(helper.Credentials(SSID, PSK), board, store)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], "wifi_not_ready_for_switch")
+                self.assertEqual(result["failedPhase"], "preflight")
+                self.assertIsNone(board.created_uuid)
+
+    def test_transition_states_with_empty_uuid_never_create_profile(self):
+        for state in (20, 40, 50, 60, 70, 80, 90, 110, 120):
+            with self.subTest(state=state):
+                board, store = self.setup_board()
+                board.active_uuid, board.net_state = None, state
+                result = helper.join_group(helper.Credentials(SSID, PSK), board, store)
+                self.assertEqual(result["error"], "wifi_not_ready_for_switch")
+                self.assertIsNone(board.created_uuid)
+
+    def test_missing_or_invalid_uuid_during_preflight_never_creates_profile(self):
+        for fields, omitted in (({}, ("GENERAL.CON-UUID",)), ({"GENERAL.CON-UUID": "not-a-uuid"}, ())):
+            with self.subTest(fields=fields, omitted=omitted):
+                board, store = self.setup_board()
+                board.active_uuid, board.net_state = None, 30
+                replace_device_fields(board, fields, omitted)
+                result = helper.join_group(helper.Credentials(SSID, PSK), board, store)
+                self.assertEqual(result["error"], "invalid_current_profile_uuid")
+                self.assertIsNone(board.created_uuid)
 
     def test_unrecordable_operation_cannot_start_network_change(self):
         board, _ = self.setup_board()

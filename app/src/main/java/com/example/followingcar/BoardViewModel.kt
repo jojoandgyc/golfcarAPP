@@ -2,8 +2,6 @@ package com.example.followingcar
 
 import android.app.Application
 import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
@@ -155,6 +153,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private var followRecovery = FollowRecoverySnapshot.restore(recoveryPreferences.all)
     private val client = BoardSshClient()
     private var authenticatedEndpoint: Pair<String, Int>? = null
+    private var authenticatedLocalEndpoint: LocalBoardEndpoint? = null
     private val networkMonitor = BoardNetworkMonitor(application)
     private val reachabilityProbe = BoardReachabilityProbe()
     private val localDiscovery by lazy { BoardLocalDiscovery(application) }
@@ -195,6 +194,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         )
     )
     val state = mutableState.asStateFlow()
+    private val systemHotspotStore = SystemHotspotCredentialStore(application)
+    private var systemHotspotCredentials: SystemHotspotCredentials? = null
+    private val mutableSystemHotspotProfile = MutableStateFlow(SystemHotspotProfileState())
+    internal val systemHotspotProfile = mutableSystemHotspotProfile.asStateFlow()
+    private val systemHotspotLoad = viewModelScope.launch {
+        systemHotspotCredentials = systemHotspotStore.load()
+        systemHotspotCredentials?.let {
+            Diagnostics.protectSecret(it.ssid)
+            Diagnostics.protectSecret(it.password)
+        }
+        mutableSystemHotspotProfile.value = SystemHotspotProfileState(loading = false,
+            configured = systemHotspotCredentials != null, ssid = systemHotspotCredentials?.ssid.orEmpty())
+    }
     private val mutableMotorConfiguration = MutableStateFlow(MotorConfigurationUiState(connection =
         MotorSerialSettings(preferences.getInt("motor_slave", 1), preferences.getInt("motor_baud", 115200),
             preferences.getInt("motor_parity", 0)).takeIf { it.isValid } ?: MotorSerialSettings()))
@@ -218,7 +230,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 // The controller has checked the Bluetooth result against the phone's real AP subnet.
                 if (state.value.canManagePairing && !wifiDirect.mutationPending && pairing.state.value.hotspotActive &&
                     !pairing.state.value.confirmationRequired && pairing.state.value.boardIp == address) {
-                    // Pairing creates a local link. A previously selected remote profile must not
+                    // Pairing uses the system hotspot. A previously selected remote profile must not
                     // redirect this automatic SSH connection through the overseas server.
                     mutableState.update { it.withVerifiedPairingNetwork(address) }
                     preferences.edit().putBoolean("remote_mode", false).apply()
@@ -482,11 +494,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     currentCoroutineContext().ensureActive()
                     if (!networkForeground || !canProbeNetwork(state.value) || generation != networkProbeGeneration) return@launch
                     // Invalid credentials require an edit or explicit refresh, not recurring authentication attempts.
-                    if (!forceRetry && networkStatus.health.route(route).failure in setOf(ReachabilityFailure.AUTHENTICATION,
-                            ReachabilityFailure.IDENTITY, ReachabilityFailure.CONFIGURATION)) continue
+                    if (!forceRetry && (networkStatus.health.route(route).failure in setOf(ReachabilityFailure.AUTHENTICATION,
+                            ReachabilityFailure.CONFIGURATION) || route == BoardRoute.REMOTE &&
+                            networkStatus.health.remote.failure == ReachabilityFailure.IDENTITY)) continue
                     val started = SystemClock.elapsedRealtime()
                     val configured = input.username.isNotBlank() && input.password.isNotEmpty() &&
-                        if (route == BoardRoute.LOCAL) input.host.isNotBlank() && input.port.toIntOrNull() in 1..65535
+                        if (route == BoardRoute.LOCAL) input.port.toIntOrNull() in 1..65535
                         else input.remoteProfile != null && input.remoteProfileError == null
                     if (!configured) {
                         networkStatus.update { it.updateRoute(route, RouteHealth(Reachability.NOT_CONFIGURED)) }
@@ -494,13 +507,32 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     networkStatus.update { it.updateRoute(route, it.route(route).checking()) }
                     val result = try {
-                        val tls = if (route == BoardRoute.REMOTE) withContext(Dispatchers.IO) {
-                            remoteCredentials.createTlsConfig()
-                        } else null
-                        val config = if (route == BoardRoute.REMOTE) BoardConnection(input.remoteProfile!!.host,
-                            input.remoteProfile.controlPort, input.username.trim(), input.password, tls)
-                        else BoardConnection(input.host.trim(), input.port.toInt(), input.username.trim(), input.password)
-                        reachabilityProbe.check(config, if (route == BoardRoute.LOCAL) localPresenceDiagnostic else remotePresenceDiagnostic)
+                        if (route == BoardRoute.LOCAL) {
+                            val presence = probeLocalBoardPresence(
+                                preferred = authenticatedLocalEndpoint,
+                                saved = currentLocalEndpoint(input.host.trim(), input.port.toInt()),
+                                discover = { localDiscovery.discover() },
+                                isCurrent = ::isLocalEndpointCurrent,
+                                authenticate = { endpoint ->
+                                    reachabilityProbe.check(BoardConnection(endpoint.host, endpoint.port,
+                                        input.username.trim(), input.password, localNetwork = endpoint.network,
+                                        localAddress = endpoint.localAddress), localPresenceDiagnostic)
+                                }, clock = SystemClock::elapsedRealtime)
+                            currentCoroutineContext().ensureActive()
+                            if (generation == networkProbeGeneration) {
+                                authenticatedLocalEndpoint = presence.endpoint
+                                presence.endpoint?.let { endpoint ->
+                                    Diagnostics.event("network.local_endpoint_authenticated", ownerDiagnostic,
+                                        fields = mapOf("host" to endpoint.host, "port" to endpoint.port,
+                                            "source" to endpoint.source))
+                                }
+                            }
+                            presence.health
+                        } else {
+                            val tls = withContext(Dispatchers.IO) { remoteCredentials.createTlsConfig() }
+                            reachabilityProbe.check(BoardConnection(input.remoteProfile!!.host,
+                                input.remoteProfile.controlPort, input.username.trim(), input.password, tls), remotePresenceDiagnostic)
+                        }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {
@@ -627,18 +659,53 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     internal fun startPairing(address: String) {
         if (!state.value.canManagePairing || pairing.state.value.busy) return
+        if (mutableSystemHotspotProfile.value.loading || mutableSystemHotspotProfile.value.saving) return
+        if (systemHotspotCredentials == null && !pairing.state.value.confirmationRequired) {
+            mutableSystemHotspotProfile.update { it.copy(error = "请先保存手机系统热点的名称和密码。") }
+            return
+        }
         if (wifiDirect.state.value.groupExists || wifiDirect.mutationPending || wifiDirect.state.value.confirmationRequired) {
             mutableState.update { it.copy(error = "请先在 Wi-Fi Direct 中确认并解散现有无线组，再一键配对。") }
             return
         }
         mutableState.update { it.copy(error = null) }
-        pairing.start(address.trim().uppercase())
+        pairing.start(address.trim().uppercase(), systemHotspotCredentials)
+    }
+
+    internal fun saveSystemHotspotProfile(ssid: String, password: String) {
+        if (!state.value.canManagePairing || pairing.state.value.busy ||
+            mutableSystemHotspotProfile.value.loading || mutableSystemHotspotProfile.value.saving) return
+        val retainedPassword = password.ifEmpty { systemHotspotCredentials?.password.orEmpty() }
+        if (!validPairingCredentials(ssid, retainedPassword)) {
+            mutableSystemHotspotProfile.update { it.copy(error = "热点名称应为 1–32 字节，密码为 8–63 个英文字符或数字；请与系统热点保持一致。") }
+            return
+        }
+        Diagnostics.protectSecret(ssid)
+        Diagnostics.protectSecret(retainedPassword)
+        val credentials = SystemHotspotCredentials(ssid, retainedPassword)
+        mutableSystemHotspotProfile.update { it.copy(saving = true, error = null) }
+        viewModelScope.launch {
+            if (systemHotspotStore.save(credentials)) {
+                systemHotspotCredentials = credentials
+                mutableSystemHotspotProfile.value = SystemHotspotProfileState(loading = false,
+                    configured = true, ssid = ssid,
+                    savedRevision = mutableSystemHotspotProfile.value.savedRevision + 1)
+            } else mutableSystemHotspotProfile.update { it.copy(saving = false,
+                error = "热点资料保存失败，请重试；尚未向小车发送。") }
+        }
+    }
+
+    internal fun openSystemHotspotSettings() {
+        if (!state.value.canManagePairing || pairing.state.value.busy || wifiDirect.mutationPending) return
+        if (!SystemHotspotSettings.open(getApplication())) mutableState.update {
+            it.copy(error = "无法打开系统热点设置，请从手机设置中进入“移动热点和网络共享”。")
+        }
     }
 
     private fun onPairingHotspotLost() {
         if (hotspotConnectionAddress == null) return
         hotspotConnectionAddress = null
-        val message = "手机配对热点已断开，请恢复配对后重新连接开发板。"
+        val message = "手机热点连接已变化，请检查系统热点，再重新查找或连接小车。"
         if (connectingHotspot) operation?.cancel(CancellationException(message))
         val failure = IOException(message)
         if (state.value.followActive) {
@@ -687,14 +754,20 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         if (setRemoteMode(false)) connect(discoverFirst = true)
     }
 
-    @Suppress("DEPRECATION")
-    private fun currentLocalNetwork(): Network? {
-        val manager = getApplication<Application>().getSystemService(ConnectivityManager::class.java) ?: return null
-        return manager.allNetworks.firstOrNull { network ->
-            manager.getNetworkCapabilities(network)?.let {
-                it.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && !it.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-            } == true
+    private fun currentLocalEndpoint(host: String, port: Int, source: String = "saved"): LocalBoardEndpoint? =
+        selectLocalEndpoint(host, port, currentLocalDiscoveryLinks(getApplication<Application>()), source)
+
+    private fun isLocalEndpointCurrent(endpoint: LocalBoardEndpoint): Boolean =
+        localEndpointIsCurrent(endpoint, currentLocalDiscoveryLinks(getApplication<Application>()))
+
+    /** Synchronous on the VM's main dispatcher: reject and release only this completed attempt. */
+    private fun requireCurrentLocalConnection(endpoint: LocalBoardEndpoint, diagnostic: DiagnosticContext) {
+        val establishedId = client.diagnosticConnectionId
+        if (establishedId != null && client.isConnected && isLocalEndpointCurrent(endpoint)) return
+        if (establishedId != null && client.diagnosticConnectionId == establishedId) {
+            client.disconnect("local_interface_changed", diagnostic.copy(connectionId = establishedId))
         }
+        throw IOException("连接期间本地接口已变化，请重新查找")
     }
 
     fun connect(viaWifiDirect: Boolean = false, discoverFirst: Boolean = false) {
@@ -754,6 +827,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 var selectedRemote = input.remoteMode
                 var selectedHost = host
                 var selectedPort = port
+                var selectedLocalEndpoint: LocalBoardEndpoint? = null
                 var discovered = false
                 val canRecoverLocal = !input.remoteMode && directGroup == null && pairedAddress == null
                 if (canRecoverLocal) {
@@ -761,16 +835,20 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     val recovery = recoverLocalConnection(
                         // Re-check IPv4 after an IPv6 rescue, so local video can return to its direct path.
                         initialEndpoint = if (discoverFirst || !oldEndpointValid || ':' in host) null
-                            else LocalBoardEndpoint(host, port, "saved", currentLocalNetwork()),
+                            else authenticatedLocalEndpoint?.takeIf(::isLocalEndpointCurrent)
+                                ?: currentLocalEndpoint(host, port),
                         discover = {
                             localDiscovery.discover() + if (oldEndpointValid && ':' in host)
-                                listOf(LocalBoardEndpoint(host, port, "saved_ipv6", currentLocalNetwork())) else emptyList()
+                                listOfNotNull(currentLocalEndpoint(host, port, "saved_ipv6")) else emptyList()
                         },
                         connectLocal = { endpoint ->
+                            if (!isLocalEndpointCurrent(endpoint)) throw IOException("小车候选所在的本地接口已变化，请重新查找")
                             client.connect(BoardConnection(endpoint.host, endpoint.port, username, input.password,
-                                localNetwork = endpoint.network), diagnostic)
+                                localNetwork = endpoint.network, localAddress = endpoint.localAddress), diagnostic)
+                            requireCurrentLocalConnection(endpoint, diagnostic)
                             selectedHost = endpoint.host
                             selectedPort = endpoint.port
+                            selectedLocalEndpoint = endpoint
                             discovered = endpoint.source != "saved"
                         },
                         connectRemote = profile?.let { remote -> suspend {
@@ -797,6 +875,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                         val preferred = preferLocalIpv4(endpoint, username, input.password, diagnostic)
                         selectedHost = preferred.host
                         selectedPort = preferred.port
+                        selectedLocalEndpoint = preferred
                     }
                 } else {
                     val remoteTls = if (input.remoteMode) withContext(Dispatchers.IO) {
@@ -812,17 +891,27 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }) {
                         ensureDirectConnectionGroup(directGroup)
                         ensurePairingNetwork(pairedAddress)
-                        client.connect(BoardConnection(host, port, username, input.password, tls = remoteTls), diagnostic)
+                        val local = if (pairedAddress != null) currentLocalEndpoint(host, port, "paired_hotspot")
+                            ?: throw IOException("已配对热点接口暂不可用，请核对热点后重连") else null
+                        client.connect(BoardConnection(host, port, username, input.password, tls = remoteTls,
+                            localNetwork = local?.network, localAddress = local?.localAddress), diagnostic)
+                        local?.let { requireCurrentLocalConnection(it, diagnostic) }
+                        selectedLocalEndpoint = local
                         ensureDirectConnectionGroup(directGroup)
                         ensurePairingNetwork(pairedAddress)
                     }
                 }
                 currentCoroutineContext().ensureActive()
+                if (!selectedRemote) selectedLocalEndpoint?.let { requireCurrentLocalConnection(it, diagnostic) }
                 sshEstablished = true
                 authenticatedEndpoint = selectedHost to selectedPort
+                if (!selectedRemote) authenticatedLocalEndpoint = selectedLocalEndpoint
                 markBoardReachable(if (selectedRemote) BoardRoute.REMOTE else BoardRoute.LOCAL)
                 preferences.edit().apply {
-                    if (!selectedRemote && directGroup == null && pairedAddress == null)
+                    // Temporary AP and scoped IPv6 addresses stay in this connection only. Persist
+                    // a router-LAN IPv4 only after pinned authentication on its current Wi-Fi link.
+                    if (!selectedRemote && directGroup == null && pairedAddress == null &&
+                        selectedLocalEndpoint?.network != null && ':' !in selectedHost)
                         putString("host", selectedHost).putString("port", selectedPort.toString())
                     putBoolean("remote_mode", selectedRemote)
                     putString("username", username)
@@ -880,7 +969,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         diagnostic: DiagnosticContext): LocalBoardEndpoint {
         if (':' !in endpoint.host) return endpoint
         val manager = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
-        val network = endpoint.network ?: currentLocalNetwork() ?: return endpoint
+        val network = endpoint.network ?: return endpoint
         val prefixes = manager?.getLinkProperties(network)?.linkAddresses.orEmpty()
             .map { LocalAddressPrefix(it.address, it.prefixLength) }
         mutableState.update { it.copy(connectionRecoveryMessage = "已验证小车，正在核对当前直连地址…") }
@@ -894,15 +983,18 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             for (host in addresses.filter { address ->
                     isOnLocalDiscoveryLink(InetAddress.getByName(address), prefixes) }.take(2)) {
                 try {
+                    val candidate = currentLocalEndpoint(host, endpoint.port, "authenticated_network_query")
+                        ?.takeIf { it.network == network } ?: continue
                     val connected = withTimeoutOrNull(4_000L) {
                         client.connect(BoardConnection(host, endpoint.port, username, password,
-                            localNetwork = network), diagnostic)
+                            localNetwork = candidate.network, localAddress = candidate.localAddress), diagnostic)
+                        requireCurrentLocalConnection(candidate, diagnostic)
                         true
                     } == true
                     if (connected) {
                         Diagnostics.event("connection.local_ipv4_preferred", diagnostic,
                             fields = mapOf("host" to host, "source" to "authenticated_network_query"), critical = true)
-                        return LocalBoardEndpoint(host, endpoint.port, "authenticated_network_query", network)
+                        return candidate
                     }
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: Exception) {
@@ -917,9 +1009,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
         currentCoroutineContext().ensureActive()
         if (!client.isConnected) {
+            if (!isLocalEndpointCurrent(endpoint)) throw IOException("已验证的局域网接口已变化")
             val restored = withTimeoutOrNull(4_000L) {
                 client.connect(BoardConnection(endpoint.host, endpoint.port, username, password,
-                    localNetwork = network), diagnostic)
+                    localNetwork = network, localAddress = endpoint.localAddress), diagnostic)
+                requireCurrentLocalConnection(endpoint, diagnostic)
                 true
             } == true
             if (!restored) throw SocketTimeoutException("已验证的局域网救援连接暂不可用")

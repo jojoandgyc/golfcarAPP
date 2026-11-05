@@ -3,6 +3,7 @@ package com.example.followingcar
 import android.net.Network
 import java.io.IOException
 import java.net.InetSocketAddress
+import java.net.InetAddress
 import java.net.Socket
 import java.util.Locale
 import javax.net.ssl.SNIHostName
@@ -54,6 +55,7 @@ internal fun openBoardSocket(
     timeoutMillis: Int,
     tls: RemoteTlsConfig?,
     localNetwork: Network? = null,
+    localAddress: InetAddress? = null,
 ): Socket {
     if (tls != null) {
         require(requireRemoteHost(host) == requireRemoteHost(tls.serverName)) {
@@ -62,7 +64,7 @@ internal fun openBoardSocket(
     }
     rawSocket.tcpNoDelay = true
     // Bind this socket only. A local-only Wi-Fi must not be replaced by cellular/VPN routing.
-    localNetwork?.bindSocket(rawSocket)
+    bindBoardSocketLocalRoute(rawSocket, tls, localNetwork, localAddress)
     rawSocket.connect(InetSocketAddress(host, port), timeoutMillis)
     if (tls == null) return rawSocket
 
@@ -86,5 +88,18 @@ internal fun openBoardSocket(
     } catch (failure: Exception) {
         runCatching { secure.close() }
         throw failure
+    }
+}
+
+/** A downstream hotspot is not a ConnectivityManager Network; bind only its numeric source. */
+internal fun bindBoardSocketLocalRoute(rawSocket: Socket, tls: RemoteTlsConfig?,
+    localNetwork: Network?, localAddress: InetAddress?) {
+    if (tls != null) return
+    localNetwork?.bindSocket(rawSocket)
+    localAddress?.let { address ->
+        require(!address.isAnyLocalAddress && !address.isLoopbackAddress && !address.isMulticastAddress) {
+            "本地连接接口地址无效"
+        }
+        rawSocket.bind(InetSocketAddress(address, 0))
     }
 }

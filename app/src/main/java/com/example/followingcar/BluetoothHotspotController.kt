@@ -11,15 +11,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.net.wifi.SoftApConfiguration
-import android.net.wifi.WifiManager
-import android.net.wifi.WifiSsid
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.SparseIntArray
-import java.net.Inet4Address
-import java.net.NetworkInterface
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
@@ -45,8 +38,8 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-/** One explicit request owns one authenticated Bluetooth link and one ephemeral local hotspot.
- * UI observers can be recreated without closing a hotspot used by an active SSH connection. */
+/** One explicit request provisions the user's already enabled system hotspot over Bluetooth.
+ * This controller never creates, changes, or closes a Wi-Fi hotspot. */
 @SuppressLint("MissingPermission")
 class BluetoothHotspotController(
     context: Context,
@@ -59,8 +52,8 @@ class BluetoothHotspotController(
     private val main = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val adapter = app.getSystemService(BluetoothManager::class.java)?.adapter
-    private val wifi = app.getSystemService(WifiManager::class.java)
-    private val mutableState = MutableStateFlow(PairingState(supported = adapter != null && wifi != null,
+    private val mutableState = MutableStateFlow(PairingState(supported = adapter != null &&
+        app.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI),
         recoveryLoading = true))
     val state: StateFlow<PairingState> = mutableState.asStateFlow()
     private var closed = false
@@ -70,7 +63,10 @@ class BluetoothHotspotController(
     @Volatile private var socket: BluetoothSocket? = null
     private var bondWaiter: CompletableDeferred<Boolean>? = null
     private var bondingAddress: String? = null
-    private var credentialsMayHaveBeenSent = false
+    private var recoveredCredentialsMayHaveBeenSent = false
+    @Volatile private var credentialWriteGate: PairingCredentialWriteGate? = null
+    private val credentialsMayHaveBeenSent: Boolean
+        get() = recoveredCredentialsMayHaveBeenSent || credentialWriteGate?.hasStarted == true
     private var definitiveResultReceived = false
     private var readOnlyOperation = false
     private var diagnostic = DiagnosticContext.NONE
@@ -83,6 +79,7 @@ class BluetoothHotspotController(
     private var firstFailureCode: String? = null
     private var pairedAfterOperation: Pair<String, String>? = null
     private var newRequestPrepared = false
+    private var preparedRequestId: String? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -133,7 +130,6 @@ class BluetoothHotspotController(
                         lease.active && lease.boardIp != null -> PairingStage.PAIRED
                         else -> previous.stage
                     })
-                if (wasActive != lease.active) notifyLease(lease.active)
                 if (wasActive && !lease.active && !HotspotLease.explicitlyStopping) {
                     mutableState.value = state.value.copy(stage = PairingStage.ERROR,
                         status = "手机热点已停止", error = pairingErrorMessage("hotspot_stopped"))
@@ -142,10 +138,19 @@ class BluetoothHotspotController(
                 wasActive = lease.active
             }
         }
+        scope.launch {
+            while (true) {
+                // Observation has no ownership or enable/disable side effects. It also notices
+                // system Settings changes while a Bluetooth request or paired SSH link is live.
+                if (HotspotLease.state.value.active || state.value.busy) observeSystemHotspot()
+                delay(1_000)
+            }
+        }
         refresh()
     }
 
     fun refresh() = onMain {
+        observeSystemHotspot()
         val permission = hasPermissions()
         val enabled = permission && runCatching { adapter?.isEnabled == true }.getOrDefault(false)
         mutableState.value = state.value.copy(permissionGranted = permission, bluetoothEnabled = enabled)
@@ -182,12 +187,25 @@ class BluetoothHotspotController(
         }
     }
 
-    fun start(address: String? = null) = onMain {
+    internal fun start(address: String? = null, credentials: SystemHotspotCredentials? = null) = onMain {
         refresh()
         if (!recoveryAvailable()) return@onMain
         pairingRequestAllowed(state.value, canMutate())?.let { reject(it); return@onMain }
         val target = address ?: state.value.selectedAddress
         if (!BluetoothAdapter.checkBluetoothAddress(target)) { reject("开发板蓝牙地址无效。"); return@onMain }
+        if (credentials == null || !validPairingCredentials(credentials.ssid, credentials.password)) {
+            reject("请填写系统热点名称和密码，与手机热点设置保持一致。")
+            return@onMain
+        }
+        val observed = currentSystemHotspotObservations(app)
+        if (observed.isEmpty()) {
+            reject("请先在系统设置中开启 2.4 GHz 手机热点，再返回配对。")
+            return@onMain
+        }
+        val ssid = credentials.ssid
+        val psk = credentials.password
+        Diagnostics.protectSecret(psk)
+        Diagnostics.protectSecret(ssid)
         mutableState.value = state.value.copy(selectedAddress = target)
         beginOperation {
             val status = statusReliably(target, allowBond = true)
@@ -199,41 +217,42 @@ class BluetoothHotspotController(
                 if (!recoveryStore.save(PairingRecoveryRecord(previousId, target, PairingRecoveryPhase.UNKNOWN)))
                     throw PairingFailure("recovery_storage_failed")
                 HotspotLease.restore(target, previousId)
-                credentialsMayHaveBeenSent = true
+                recoveredCredentialsMayHaveBeenSent = true
                 recoverResult(target, previousId)
                 if (HotspotLease.state.value.requestId != null) return@beginOperation
                 // The same explicit one-click intent may continue only after a proved expired lease.
-                credentialsMayHaveBeenSent = false
+                if (!definitiveResultReceived) throw PairingFailure("protocol_error")
+                log("previous_request_reconciled", fields = mapOf("requestId" to previousId,
+                    "firstCode" to firstFailureCode))
+                // The old cause is now recorded against the old request. Capability/AP checks
+                // and a new submission below must establish their own first cause.
+                firstFailureCode = null
+                mutableState.value = state.value.copy(firstError = null)
+                recoveredCredentialsMayHaveBeenSent = false
                 definitiveResultReceived = false
             }
+            // Older board helpers deliberately suppress the default route for local-only APs.
+            // A system-tethering request must advertise its intent rather than inherit that mode.
+            if (status.opt("supportsSystemHotspot") != true)
+                throw PairingFailure("system_hotspot_update_required")
             ensureCanMutate()
-            stage(PairingStage.STARTING_HOTSPOT, "正在创建手机配对热点…")
-            createHotspot()
-            ensureCanMutate()
-            val reservation = HotspotLease.reservation ?: throw PairingFailure("hotspot_stopped")
-            val config = reservation.softApConfiguration
-            @Suppress("DEPRECATION")
-            val ssid = config.ssid ?: throw PairingFailure("invalid_hotspot_configuration")
-            val psk = config.passphrase ?: throw PairingFailure("invalid_hotspot_configuration")
-            if (config.securityType != SoftApConfiguration.SECURITY_TYPE_WPA2_PSK &&
-                config.securityType != SoftApConfiguration.SECURITY_TYPE_WPA3_SAE_TRANSITION)
-                throw PairingFailure("unsupported_hotspot_security")
-            if (!validPairingCredentials(ssid, psk)) throw PairingFailure("invalid_hotspot_configuration")
-            Diagnostics.protectSecret(psk)
-            Diagnostics.protectSecret(ssid)
+            if (!sameSystemHotspotObservations(observed, currentSystemHotspotObservations(app)))
+                throw PairingFailure("hotspot_stopped")
             val requestId = UUID.randomUUID().toString()
             newRequestPrepared = true
-            HotspotLease.pending(target, requestId)
+            preparedRequestId = requestId
+            val binding = HotspotLease.pending(target, requestId, observed)
+            val writeGate = PairingCredentialWriteGate(binding, requestId)
+            credentialWriteGate = writeGate
             if (!recoveryStore.save(PairingRecoveryRecord(requestId, target, PairingRecoveryPhase.PENDING)))
                 throw PairingFailure("recovery_storage_failed")
-            // Cancellation during disk I/O must not erase the recovery record or dispatch a write.
+            // Disk I/O can outlive this hotspot. Never dispatch credentials for a lost lease.
             ensureCanMutate()
+            HotspotLease.requireCredentialLease(writeGate, currentSystemHotspotObservations(app))
             stage(PairingStage.SENDING_CREDENTIALS, "正在通过加密蓝牙发送热点配置…")
-            // Set before write: a partial write followed by EOF cannot prove that the board did not act.
-            credentialsMayHaveBeenSent = true
             submitPairingOnce(submit = {
                 writeFrame(JSONObject().put("v", 1).put("requestId", requestId).put("cmd", "provision")
-                    .put("ssid", ssid).put("psk", psk))
+                    .put("ssid", ssid).put("psk", psk).put("internetAccess", true), writeGate)
                 stage(PairingStage.WAITING_NETWORK, "等待开发板连接手机热点…")
                 withTimeout(100_000) {
                     while (true) {
@@ -250,6 +269,8 @@ class BluetoothHotspotController(
                     }
                 }
             }, recover = { failure ->
+                // A rejected/cancelled queued write cannot have changed the board network.
+                if (!writeGate.hasStarted) throw failure
                 rememberFailure(failure)
                 closeSocket()
                 recoverResult(target, requestId)
@@ -257,11 +278,11 @@ class BluetoothHotspotController(
         }
     }
 
-    /** Board read-only probe. No hotspot reservation, provision request or SSH connection. */
+    /** Board read-only probe. No hotspot mutation, provision request or SSH connection. */
     fun checkBluetooth(address: String? = null) = onMain {
         refresh()
         if (!recoveryAvailable()) return@onMain
-        // Do not inspect through a lease that is active or awaits recovery confirmation.
+        // Do not inspect through a pairing that is active or awaits recovery confirmation.
         val lease = HotspotLease.state.value
         pairingRequestAllowed(state.value.copy(hotspotActive = lease.active,
             confirmationRequired = lease.unconfirmed), canMutate())?.let { reject(it); return@onMain }
@@ -289,13 +310,13 @@ class BluetoothHotspotController(
         val lease = HotspotLease.state.value
         if (recoveryBlocked || lease.requestId == null || lease.address == null) {
             beginOperation {
-                credentialsMayHaveBeenSent = true
+                recoveredCredentialsMayHaveBeenSent = true
                 repairRecoveryRecord()
             }
             return@onMain
         }
         beginOperation {
-            credentialsMayHaveBeenSent = true
+            recoveredCredentialsMayHaveBeenSent = true
             recoverResult(lease.address, lease.requestId)
         }
     }
@@ -304,28 +325,30 @@ class BluetoothHotspotController(
         if (state.value.stage == PairingStage.DISCOVERING) {
             runCatching { adapter?.cancelDiscovery() }; finishDiscovery()
         }
+        credentialWriteGate?.cancelBeforeWrite()
         operation?.cancel()
         closeSocket()
     }
 
     fun stopHotspot() = onMain {
         if (!recoveryAvailable()) return@onMain
-        if (!canMutate() || state.value.busy) { reject("请先结束控制并断开 SSH，再关闭热点。"); return@onMain }
-        if (state.value.confirmationRequired) { reject("配网结果尚未确认，请先查询结果再关闭热点。"); return@onMain }
+        if (!canMutate() || state.value.busy) { reject("请先结束控制并断开 SSH，再清除配对记录。"); return@onMain }
+        if (state.value.confirmationRequired) { reject("配网结果尚未确认，请先查询结果。"); return@onMain }
         beginOperation {
             if (!recoveryStore.clear(HotspotLease.state.value.requestId)) throw PairingFailure("recovery_storage_failed")
             HotspotLease.stop()
-            mutableState.value = state.value.copy(stage = PairingStage.IDLE, status = "配对热点已关闭", error = null)
-            log("hotspot_closed")
+            mutableState.value = state.value.copy(stage = PairingStage.IDLE, status = "已清除配对记录，系统热点保持原样", error = null)
+            log("pairing_record_cleared")
         }
     }
 
-    /** Detaches this observer. A live or unconfirmed network remains owned by the process lease. */
+    /** Detaches this observer without changing the user's system hotspot. */
     fun close() = onMain {
         closed = true
+        credentialWriteGate?.cancelBeforeWrite()
         if (!readOnlyOperation) {
             if (credentialsMayHaveBeenSent && !definitiveResultReceived) HotspotLease.markUnknown()
-            else if (state.value.busy && HotspotLease.state.value.boardIp == null) HotspotLease.stop()
+            else if (state.value.busy && HotspotLease.state.value.boardIp == null) releaseUnsentHotspot()
         }
         operation?.cancel()
         closeSocket()
@@ -334,14 +357,16 @@ class BluetoothHotspotController(
         if (registered) runCatching { app.unregisterReceiver(receiver) }
         registered = false
         scope.cancel()
-        if (!HotspotLease.state.value.active) notifyLease(false)
+        notifyLease(false)
     }
 
     private fun beginOperation(readOnly: Boolean = false, block: suspend () -> Unit) {
         readOnlyOperation = readOnly
-        credentialsMayHaveBeenSent = false
+        recoveredCredentialsMayHaveBeenSent = false
+        credentialWriteGate = null
         definitiveResultReceived = false
         newRequestPrepared = false
+        preparedRequestId = null
         pairedAfterOperation = null
         if (HotspotLease.state.value.requestId == null) firstFailureCode = null
         diagnostic = Diagnostics.newContext()
@@ -367,6 +392,8 @@ class BluetoothHotspotController(
             try {
                 block()
             } catch (failure: Exception) {
+                // Cancel wins before any queued executor is allowed to start credential I/O.
+                credentialWriteGate?.cancelBeforeWrite()
                 val failedStage = state.value.stage
                 val code = pairingFailureCode(failure)
                 val failureFields = pairingFailureFields(failure, failedStage, ioPhase,
@@ -374,7 +401,7 @@ class BluetoothHotspotController(
                 var unknown = !readOnly && pairingFailureRequiresConfirmation(credentialsMayHaveBeenSent, definitiveResultReceived)
                 if (!readOnly && !credentialsMayHaveBeenSent && newRequestPrepared) {
                     // No credential write was started. It is safe to remove only our unsent record.
-                    if (!withContext(NonCancellable) { recoveryStore.clear(HotspotLease.state.value.requestId) }) {
+                    if (!withContext(NonCancellable) { recoveryStore.clear(preparedRequestId) }) {
                         recoveryBlocked = true
                         unknown = true
                     }
@@ -385,7 +412,7 @@ class BluetoothHotspotController(
                         HotspotLease.markUnknown()
                         persistUnknown()
                     }
-                    else if (!definitiveResultReceived) HotspotLease.stop()
+                    else if (!definitiveResultReceived) releaseUnsentHotspot()
                 }
                 if (!closed) mutableState.value = state.value.copy(
                     stage = if (unknown) PairingStage.UNKNOWN else PairingStage.ERROR,
@@ -398,7 +425,7 @@ class BluetoothHotspotController(
             } finally {
                 closeSocket()
                 if (!closed) mutableState.value = state.value.copy(busy = false)
-                if (!HotspotLease.state.value.active) notifyLease(false)
+                notifyLease(false)
                 operation = null
                 readOnlyOperation = false
                 val completed = pairedAfterOperation
@@ -413,6 +440,11 @@ class BluetoothHotspotController(
                 }
             }
         }
+    }
+
+    private fun releaseUnsentHotspot() {
+        val requestId = preparedRequestId
+        if (requestId != null) HotspotLease.stopIfRequestMatches(requestId) else HotspotLease.stop()
     }
 
     private fun recoveryAvailable(): Boolean {
@@ -496,8 +528,7 @@ class BluetoothHotspotController(
                 throw PairingFailure("protocol_error")
             when (result.optString("type")) {
                 "progress" -> null
-                "result" -> if (result.opt("definitive") == true &&
-                    !(result.opt("ok") == true && !HotspotLease.state.value.active)) result else null
+                "result" -> if (result.opt("definitive") == true) result else null
                 else -> throw PairingFailure("protocol_error")
             }
         }
@@ -567,113 +598,74 @@ class BluetoothHotspotController(
             if (!pairingResultIsDefinitive(false, reply.opt("definitive") as? Boolean,
                     reply.opt("networkChanged") == true)) {
                 if (firstFailureCode == null) firstFailureCode = pairingBoardErrorCode(
-                    if (reply.has("firstError")) reply.opt("firstError") else reply.opt("error"))
+                    (reply.opt("firstError") as? String) ?: reply.opt("error"))
                 throw PairingFailure("network_address_unconfirmed")
             }
+            val submittedThisOperation = newRequestPrepared && credentialWriteGate?.hasStarted == true &&
+                preparedRequestId == reply.optString("requestId")
+            // A terminal rollback may carry the original failure even if its initial reply was lost.
+            if (firstFailureCode == null && reply.opt("firstError") is String)
+                firstFailureCode = pairingBoardErrorCode(reply.opt("firstError"))
             if (!recoveryStore.clear(HotspotLease.state.value.requestId)) throw PairingFailure("recovery_storage_failed")
             definitiveResultReceived = true
             HotspotLease.confirmFailure()
             val code = pairingBoardErrorCode(reply.opt("error"))
-            // A verified negative outcome needs no abandoned hotspot or manual teardown step.
+            // A verified negative outcome releases only our pairing record, never the hotspot.
             HotspotLease.stop()
             log("network_released", code)
             if (pairingLeaseExpired(code)) {
-                mutableState.value = state.value.copy(stage = PairingStage.IDLE,
-                    confirmationRequired = false, status = pairingErrorMessage(code), error = null)
+                mutableState.value = state.value.withReleasedPairingOutcome(code,
+                    submittedThisOperation, firstFailureCode)
+                if (mutableState.value.stage == PairingStage.ERROR) log("provision_failed_recovered", code,
+                    mapOf("firstCode" to firstFailureCode, "networkRestored" to (code == "network_restored")))
                 return
             }
             throw PairingFailure(code)
         }
         if (reply.opt("definitive") != true) throw PairingFailure("protocol_error")
-        if (!HotspotLease.state.value.active) {
-            throw PairingFailure("hotspot_stopped")
-        }
         stage(PairingStage.VERIFYING_NETWORK, "正在核对开发板的热点地址…")
-        var verified: String? = null
+        var verified: SystemHotspotObservation? = null
         repeat(20) {
             if (verified == null) {
-                verified = verifiedPairingBoardIp(reply.optString("ip"), reply.optString("gateway"),
-                    reply.optInt("prefixLength", -1),
-                    newPairingLocalAddresses(HotspotLease.baselineAddresses, localAddresses()))
+                verified = verifiedSystemHotspotObservation(reply.optString("ip"), reply.optString("gateway"),
+                    reply.optInt("prefixLength", -1), currentSystemHotspotObservations(app))
                 if (verified == null) delay(250)
             }
         }
-        val ip = verified ?: throw PairingFailure("address_unverified")
-        if (!HotspotLease.state.value.active) throw PairingFailure("hotspot_stopped")
+        val verifiedHotspot = verified ?: throw PairingFailure("address_unverified")
+        val ip = reply.optString("ip")
         val lease = HotspotLease.state.value
         if (lease.requestId == null || lease.address == null) throw PairingFailure("state_changed")
         if (!recoveryStore.save(PairingRecoveryRecord(lease.requestId, lease.address, PairingRecoveryPhase.PAIRED,
                 firstFailureCode = firstFailureCode))) throw PairingFailure("recovery_storage_failed")
         ensureCanMutate()
-        if (!HotspotLease.state.value.active || HotspotLease.state.value.requestId != lease.requestId)
+        if (verifiedHotspot !in currentSystemHotspotObservations(app) ||
+            HotspotLease.state.value.requestId != lease.requestId)
             throw PairingFailure("hotspot_stopped")
         definitiveResultReceived = true
-        HotspotLease.paired(ip)
+        HotspotLease.paired(ip, verifiedHotspot)
         mutableState.value = state.value.copy(stage = PairingStage.PAIRED, boardIp = ip,
             confirmationRequired = false, status = "开发板已接入手机热点", error = null)
         log("paired")
         pairedAfterOperation = lease.requestId to ip
     }
 
-    private suspend fun createHotspot() = try { withTimeout(30_000) {
-        suspendCancellableCoroutine<Unit> { continuation ->
-            val leaseToken = UUID.randomUUID().toString()
-            HotspotLease.request(leaseToken, localAddresses())
-            continuation.invokeOnCancellation { main.post { HotspotLease.cancelRequest(leaseToken) } }
-            val callback = object : WifiManager.LocalOnlyHotspotCallback() {
-                override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation) {
-                    if (!continuation.isActive || closed || !canMutate() || !HotspotLease.accepts(leaseToken)) {
-                        HotspotLease.cancelRequest(leaseToken)
-                        runCatching { reservation.close() }
-                        if (continuation.isActive) continuation.resumeWithException(PairingFailure("state_changed"))
-                        return
-                    }
-                    HotspotLease.acquire(reservation, leaseToken)
-                    continuation.resume(Unit)
-                }
-                override fun onStopped() { HotspotLease.stoppedBySystem(leaseToken) }
-                override fun onFailed(reason: Int) {
-                    HotspotLease.cancelRequest(leaseToken)
-                    val code = when (reason) {
-                        ERROR_NO_CHANNEL -> "hotspot_no_channel"
-                        ERROR_INCOMPATIBLE_MODE -> "hotspot_incompatible"
-                        ERROR_TETHERING_DISALLOWED -> "hotspot_denied"
-                        else -> "hotspot_failed"
-                    }
-                    if (continuation.isActive) continuation.resumeWithException(PairingFailure(code))
-                }
-            }
-            try {
-                if (Build.VERSION.SDK_INT >= 36) {
-                    val ssid = "FollowingCar-" + UUID.randomUUID().toString().take(8)
-                    val password = UUID.randomUUID().toString().replace("-", "")
-                    val config = SoftApConfiguration.Builder().setWifiSsid(WifiSsid.fromBytes(ssid.toByteArray()))
-                        .setPassphrase(password, SoftApConfiguration.SECURITY_TYPE_WPA2_PSK)
-                        .setChannels(SparseIntArray().apply { put(SoftApConfiguration.BAND_2GHZ, 0) }).build()
-                    wifi!!.startLocalOnlyHotspotWithConfiguration(config, app.mainExecutor, callback)
-                } else {
-                    // Android 15 exposes no public band selector/getter. The 2.4 GHz board confirms
-                    // actual association; absence of an API is never represented as verified 2.4 GHz.
-                    wifi!!.startLocalOnlyHotspot(callback, main)
-                }
-            } catch (failure: Exception) {
-                HotspotLease.cancelRequest(leaseToken)
-                if (continuation.isActive) continuation.resumeWithException(
-                    PairingFailure(if (failure is SecurityException) "permission_denied" else "hotspot_failed", failure))
-            }
-        }
-    } } catch (failure: TimeoutCancellationException) {
-        currentCoroutineContext().ensureActive()
-        throw PairingFailure("hotspot_timeout", failure)
-    }
-
-    private suspend fun writeFrame(frame: JSONObject) {
+    private suspend fun writeFrame(frame: JSONObject, writeGate: PairingCredentialWriteGate? = null) {
         ioPhase = PairingIoPhase.WRITE
         ioElapsedMs = null
         val bytes = (frame.toString() + "\n").toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_PAIRING_FRAME_BYTES) throw PairingFailure("request_too_large")
         val link = socket ?: throw PairingFailure("bluetooth_eof")
-        socketCall(PairingIoPhase.WRITE, 10_000) { link.outputStream.write(bytes); link.outputStream.flush() }
+        socketCall(PairingIoPhase.WRITE, 10_000, onCancel = { writeGate?.cancelBeforeWrite() }) {
+            val output = link.outputStream
+            // Runs on the I/O executor immediately before write, after every scheduling delay.
+            // Lease loss and this transition share a lock; cancellation arbitrates on the gate.
+            if (writeGate != null && !HotspotLease.beginCredentialWrite(writeGate,
+                    currentSystemHotspotObservations(app)))
+                throw PairingFailure("hotspot_stopped")
+            output.write(bytes)
+            output.flush()
+        }
     }
 
     private suspend fun readReply(requestId: String, timeout: Long = 100_000): JSONObject {
@@ -687,7 +679,8 @@ class BluetoothHotspotController(
     }
 
     /** Timeout/cancel closes the socket from another thread, including a blocked Bluetooth write. */
-    private suspend fun <T> socketCall(phase: PairingIoPhase, timeout: Long, action: () -> T): T {
+    private suspend fun <T> socketCall(phase: PairingIoPhase, timeout: Long,
+        onCancel: () -> Unit = {}, action: () -> T): T {
         ioPhase = phase
         ioElapsedMs = null
         val started = System.nanoTime()
@@ -698,9 +691,13 @@ class BluetoothHotspotController(
             return withTimeout(timeout) {
                 val ownedSocket = socket
                 suspendCancellableCoroutine { continuation ->
-                    continuation.invokeOnCancellation { IO.execute { runCatching { ownedSocket?.close() } } }
+                    continuation.invokeOnCancellation {
+                        onCancel()
+                        IO.execute { runCatching { ownedSocket?.close() } }
+                    }
                     IO.execute {
                         try {
+                            if (!continuation.isActive) return@execute
                             val result = action()
                             if (continuation.isActive) continuation.resume(result)
                         } catch (failure: Exception) {
@@ -728,13 +725,9 @@ class BluetoothHotspotController(
         }
     }.getOrDefault(PairingBondState.UNKNOWN)
 
-    private fun localAddresses(): List<PairingLocalAddress> = runCatching {
-        NetworkInterface.getNetworkInterfaces().toList().flatMap { device ->
-            device.interfaceAddresses.filter { it.address is Inet4Address }.mapNotNull { entry ->
-                entry.address.hostAddress?.let { PairingLocalAddress(it, entry.networkPrefixLength.toInt()) }
-            }
-        }
-    }.getOrDefault(emptyList())
+    private fun observeSystemHotspot() {
+        HotspotLease.observe(currentSystemHotspotObservations(app))
+    }
 
     private fun ensureCanMutate() {
         if (closed || !canMutate()) throw PairingFailure("state_changed")
@@ -796,58 +789,86 @@ class BluetoothHotspotController(
     }
 }
 
-/** Only this process-level lease owns the reservation. It deliberately outlives an Activity/ViewModel. */
+/** Process-local pairing evidence, not a Wi-Fi reservation. No method mutates a system network. */
 private object HotspotLease {
     data class Snapshot(val active: Boolean = false, val unconfirmed: Boolean = false,
         val address: String? = null, val requestId: String? = null, val boardIp: String? = null)
     val state = MutableStateFlow(Snapshot())
-    var reservation: WifiManager.LocalOnlyHotspotReservation? = null
-        private set
     var explicitlyStopping = false
         private set
-    private var ownerToken: String? = null
-    private var pendingToken: String? = null
-    var baselineAddresses: List<PairingLocalAddress> = emptyList()
-        private set
-    fun request(token: String, baseline: List<PairingLocalAddress>) {
-        if (reservation != null || pendingToken != null) throw PairingFailure("hotspot_incompatible")
-        pendingToken = token
-        baselineAddresses = baseline
-    }
-    fun accepts(token: String) = pendingToken == token && reservation == null
-    fun cancelRequest(token: String) { if (pendingToken == token) pendingToken = null }
-    fun acquire(value: WifiManager.LocalOnlyHotspotReservation, token: String) {
-        check(accepts(token))
-        pendingToken = null
-        reservation = value
-        ownerToken = token
+    private data class Binding(val observations: List<SystemHotspotObservation>)
+    private var binding: Binding? = null
+    private var verifiedHotspot: SystemHotspotObservation? = null
+    private val continuity = SystemHotspotContinuity()
+    @Synchronized fun pending(address: String, requestId: String,
+        observations: List<SystemHotspotObservation>): Any {
+        require(observations.isNotEmpty())
+        val prepared = Binding(observations.toList())
+        binding = prepared
+        verifiedHotspot = null
+        continuity.reset()
         explicitlyStopping = false
-        state.value = Snapshot(active = true)
+        state.value = Snapshot(address = address, requestId = requestId, unconfirmed = true)
+        return prepared
     }
-    fun pending(address: String, requestId: String) {
-        state.value = state.value.copy(address = address, requestId = requestId, unconfirmed = true)
+    @Synchronized fun restore(address: String, requestId: String) {
+        binding = null
+        verifiedHotspot = null
+        continuity.reset()
+        explicitlyStopping = false
+        state.value = Snapshot(address = address, requestId = requestId, unconfirmed = true)
     }
-    fun restore(address: String, requestId: String) {
-        state.value = state.value.copy(address = address, requestId = requestId, unconfirmed = true, boardIp = null)
+    @Synchronized fun markUnknown() {
+        binding = null
+        verifiedHotspot = null
+        continuity.reset()
+        state.value = state.value.copy(active = false, unconfirmed = true, boardIp = null)
     }
-    fun markUnknown() { state.value = state.value.copy(unconfirmed = true, boardIp = null) }
-    fun paired(ip: String) { state.value = state.value.copy(unconfirmed = false, boardIp = ip) }
-    fun confirmFailure() { state.value = state.value.copy(unconfirmed = false, boardIp = null) }
-    fun stop() {
+    @Synchronized fun paired(ip: String, observed: SystemHotspotObservation) {
+        binding = null
+        verifiedHotspot = observed
+        continuity.reset()
+        explicitlyStopping = false
+        state.value = state.value.copy(active = true, unconfirmed = false, boardIp = ip)
+    }
+    @Synchronized fun confirmFailure() {
+        binding = null
+        verifiedHotspot = null
+        continuity.reset()
+        state.value = state.value.copy(active = false, unconfirmed = false, boardIp = null)
+    }
+    @Synchronized fun requireCredentialLease(gate: PairingCredentialWriteGate,
+        observations: List<SystemHotspotObservation>) {
+        if (!gate.matches(credentialLease(observations))) throw PairingFailure("hotspot_stopped")
+    }
+    @Synchronized fun beginCredentialWrite(gate: PairingCredentialWriteGate,
+        observations: List<SystemHotspotObservation>): Boolean =
+        gate.beginWriting(credentialLease(observations))
+    private fun credentialLease(observations: List<SystemHotspotObservation>): PairingCredentialLease {
+        val expected = binding
+        return PairingCredentialLease(expected != null &&
+            sameSystemHotspotObservations(expected.observations, observations), expected, state.value.requestId)
+    }
+    @Synchronized fun stopIfRequestMatches(requestId: String) {
+        if (state.value.requestId == requestId) stop()
+    }
+    @Synchronized fun stop() {
         explicitlyStopping = true
-        val old = reservation
-        reservation = null
-        ownerToken = null
-        pendingToken = null
-        baselineAddresses = emptyList()
+        binding = null
+        verifiedHotspot = null
+        continuity.reset()
         state.value = Snapshot()
-        runCatching { old?.close() }
     }
-    fun stoppedBySystem(token: String) {
-        if (token != ownerToken) return
-        reservation = null
-        ownerToken = null
-        state.value = state.value.copy(active = false, boardIp = null,
-            unconfirmed = state.value.requestId != null || state.value.unconfirmed)
+    @Synchronized fun observe(observations: List<SystemHotspotObservation>) {
+        val pending = binding
+        if (pending != null && !sameSystemHotspotObservations(pending.observations, observations))
+            binding = null // A disappeared/replaced AP cannot revive the pending credential write.
+        val verified = verifiedHotspot
+        if (state.value.active && (verified == null || continuity.isLost(verified, observations, System.nanoTime()))) {
+            verifiedHotspot = null
+            explicitlyStopping = false
+            state.value = state.value.copy(active = false, boardIp = null,
+                unconfirmed = state.value.requestId != null || state.value.unconfirmed)
+        }
     }
 }

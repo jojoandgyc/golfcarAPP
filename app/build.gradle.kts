@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 30
-        versionName = "1.8.19-ack-recovery"
+        versionCode = 34
+        versionName = "1.8.23-system-hotspot"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

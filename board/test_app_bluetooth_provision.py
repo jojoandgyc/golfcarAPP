@@ -36,6 +36,7 @@ class FakeSystem(pair.HotspotSystem):
         self.idle, self.locked = True, False
         self.current = "f550c401-1217-405e-9853-41e50c71db40"
         self.created, self.calls = None, []
+        self.internet_access_requests = []
         self.fail_up, self.fail_address = False, False
         self.extra_active = set()
 
@@ -68,8 +69,9 @@ class FakeSystem(pair.HotspotSystem):
     def active_uuids(self):
         return ({self.current} if self.current else set()) | self.extra_active
 
-    def add_profile(self, profile_uuid, ssid):
+    def add_profile(self, profile_uuid, ssid, *, internet_access=False):
         assert self.locked
+        self.internet_access_requests.append(internet_access)
         self.calls.append("create")
         self.created = profile_uuid
 
@@ -165,6 +167,55 @@ class ProvisionTests(unittest.TestCase):
         self.handle(request)
         self.assertTrue(self.replies[-1]["ok"])
         self.assertEqual(["create", "activate"], self.system.calls)
+
+    def test_default_false_and_true_are_per_request_and_remain_in_nonsecret_history(self):
+        for extra, expected in (({}, False), ({"internetAccess": True}, True), ({"internetAccess": False}, False)):
+            request = self.request(**extra)
+            self.handle(request)
+            self.assertIs(expected, self.state.get(request["requestId"])["internetAccessRequested"])
+            self.jobs.pop()()
+            self.assertTrue(self.replies[-1]["ok"])
+            self.assertIs(expected, self.system.internet_access_requests[-1])
+            self.assertIs(expected, self.replies[-1]["internetAccessRequested"])
+            self.assertIs(expected, self.state.get(request["requestId"])["internetAccessRequested"])
+            self.assertIs(expected, self.join_store.rows[-1]["internetAccessRequested"])
+            self.assertEqual("bluetooth_hotspot", self.join_store.rows[-1]["method"])
+        self.assertEqual([False, True, False], self.system.internet_access_requests)
+        self.assertNotIn(PASSWORD, json.dumps(self.store.rows + self.join_store.rows + self.replies))
+
+    def test_duplicate_id_and_mutated_request_cannot_change_accepted_route_policy(self):
+        request = self.request(internetAccess=True)
+        self.handle(request)
+        request["internetAccess"] = False
+        self.handle(request)
+        self.assertTrue(self.replies[-1]["internetAccessRequested"])
+        self.assertEqual(1, len(self.jobs))
+        self.jobs.pop()()
+        self.assertEqual([True], self.system.internet_access_requests)
+        self.handle(request)
+        self.assertTrue(self.replies[-1]["ok"])
+        self.assertTrue(self.replies[-1]["internetAccessRequested"])
+        self.assertEqual(["create", "activate"], self.system.calls)
+        self.assertTrue(self.state.get(request["requestId"])["internetAccessRequested"])
+
+    def test_new_mode_does_not_change_busy_guard_or_status_read_only_behavior(self):
+        self.handle(self.request("status"))
+        self.assertIs(True, self.replies[-1]["supportsSystemHotspot"])
+        self.assertEqual([], self.system.calls)
+        self.system.idle = False
+        self.handle(self.request(internetAccess=True))
+        self.assertEqual("control_busy_or_unconfirmed", self.replies[-1]["error"])
+        self.assertEqual([], self.system.calls)
+        self.assertEqual([], self.system.internet_access_requests)
+        self.assertEqual([], self.jobs)
+
+    def test_invalid_route_policy_cannot_reach_direct_handle_mutation(self):
+        for invalid in (None, 0, 1, "true", [], {}):
+            with self.subTest(value=invalid), self.assertRaisesRegex(pair.JoinError, "invalid_internet_access"):
+                self.handle(self.request(internetAccess=invalid))
+        self.assertEqual([], self.system.calls)
+        self.assertEqual([], self.jobs)
+        self.assertEqual([], self.store.rows)
 
     def test_disconnected_client_does_not_cancel_accepted_switch(self):
         request = self.request()
@@ -778,6 +829,21 @@ class ProtocolTests(unittest.TestCase):
     def test_status_accepts_valid_uuid(self):
         self.assertEqual("status", pair.parse_request(self.wire())["cmd"])
 
+    def test_provision_internet_access_is_optional_strict_boolean(self):
+        base = dict(v=1, requestId=str(uuid.uuid4()), cmd="provision", ssid=SSID, psk=PASSWORD)
+        for extra, expected in (({}, False), ({"internetAccess": False}, False), ({"internetAccess": True}, True)):
+            parsed = pair.parse_request((json.dumps(dict(base, **extra)) + "\n").encode())
+            self.assertIs(expected, parsed.get("internetAccess", False))
+        for invalid in (None, 0, 1, "true", [], {}):
+            with self.subTest(value=invalid), self.assertRaisesRegex(pair.JoinError, "invalid_internet_access"):
+                pair.parse_request((json.dumps(dict(base, internetAccess=invalid)) + "\n").encode())
+        with self.assertRaisesRegex(pair.JoinError, "unexpected_fields"):
+            pair.parse_request(self.wire(internetAccess=True))
+
+    def test_hotspot_uses_the_same_real_keyfile_builder_as_direct(self):
+        # ProvisionTests fakes activation, while JoinTests checks the actual builder.
+        self.assertIs(pair.BoardSystem.add_profile, pair.HotspotSystem.add_profile)
+
     def test_unknown_fields_rejected(self):
         with self.assertRaises(pair.JoinError):
             pair.parse_request(self.wire(command="sudo reboot"))
@@ -820,10 +886,22 @@ class ProtocolTests(unittest.TestCase):
             path = Path(directory) / "state.json"
             state = pair.PairingState(path)
             request_id = str(uuid.uuid4())
-            state.put(pair.response(request_id, "progress", stage="connecting"))
+            state.put(pair.response(request_id, "progress", stage="connecting", internetAccessRequested=True))
             reopened = pair.PairingState(path)
             self.assertEqual("outcome_unknown_after_restart", reopened.get(request_id)["error"])
             self.assertTrue(reopened.get(request_id)["networkChanged"])
+            self.assertTrue(reopened.get(request_id)["internetAccessRequested"])
+
+    def test_history_keeps_the_accepted_policy_through_progress_and_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pair.PairingState(Path(directory) / "state.json", MemoryStore())
+            request_id = str(uuid.uuid4())
+            state.put(pair.response(request_id, "progress", stage="accepted", internetAccessRequested=True))
+            state.put(pair.response(request_id, "progress", stage="connecting"))
+            self.assertTrue(state.get(request_id)["internetAccessRequested"])
+            state.put(pair.response(request_id, "result", ok=False, definitive=True,
+                                    error="hotspot_disconnected", internetAccessRequested=False))
+            self.assertTrue(state.get(request_id)["internetAccessRequested"])
 
     def test_history_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

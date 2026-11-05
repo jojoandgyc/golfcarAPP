@@ -29,7 +29,7 @@ data class PairingState(
     val hotspotActive: Boolean = false,
     val boardIp: String? = null,
     val confirmationRequired: Boolean = false,
-    val status: String = "一键连接蓝牙并为开发板配置手机热点",
+    val status: String = "通过蓝牙让小车接入手机系统热点",
     val error: String? = null,
     val firstError: String? = null,
 ) {
@@ -94,7 +94,6 @@ internal fun pairingRequestAllowed(state: PairingState, canMutate: Boolean): Str
     !state.permissionGranted -> "请允许附近设备权限。"
     !state.bluetoothEnabled -> "请先开启手机蓝牙。"
     state.confirmationRequired -> "配网结果尚未确认，请先查询配对结果。"
-    state.hotspotActive -> "配对热点已开启，请使用已有连接或先关闭热点。"
     else -> null
 }
 
@@ -180,13 +179,20 @@ internal fun pairingErrorMessage(code: String): String = when (code) {
     "permission_denied" -> "附近设备权限不可用，请重新授权。"
     "bluetooth_disabled" -> "手机蓝牙已关闭。"
     "bluetooth_timeout", "bluetooth_eof", "partial_reply" -> "蓝牙通信中断或超时。"
+    "invalid_current_profile_uuid" -> "开发板未能读取当前 Wi-Fi 配置标识，请更新板端配网服务后重试。"
+    "invalid_ip_observation" -> "开发板返回的网络地址无法确认，请重新检查配网状态。"
+    "networkmanager_command_failed" -> "开发板连接热点失败，请检查系统热点名称、密码和频段。"
+    "system_hotspot_update_required" -> "请更新开发板配网服务，以支持系统网络共享热点。"
     "unsupported_hotspot_security" -> "系统热点的加密方式与开发板不兼容，需要 WPA2 热点。"
     "hotspot_no_channel", "hotspot_not_visible_2g", "hotspot_unavailable" ->
         "开发板未能使用该热点；本开发板仅支持 2.4 GHz，请检查热点频段。"
-    "hotspot_incompatible" -> "系统当前的热点或 Wi-Fi Direct 与配对热点冲突，请先关闭后重试。"
-    "hotspot_denied" -> "手机系统不允许创建配对热点。"
-    "hotspot_timeout" -> "手机热点启动超时，尚未发送配网配置；请检查系统热点或 Wi-Fi Direct 是否冲突。"
-    "hotspot_stopped" -> "手机配对热点已停止，连接已失效。"
+    "system_hotspot_not_ready" -> "未检测到手机热点，请在系统设置开启 2.4 GHz 网络共享热点，再返回配对。"
+    "system_hotspot_credentials_missing", "invalid_hotspot_configuration" -> "请先保存与手机系统热点一致的名称和密码。"
+    "system_hotspot_changed" -> "手机热点已关闭或发生变化，尚未发送新配置；请检查系统热点后重试。"
+    "hotspot_incompatible" -> "当前无线网络尚未准备好，请检查系统热点和 Wi-Fi Direct 状态。"
+    "hotspot_denied" -> "请在手机系统设置中开启网络共享热点。"
+    "hotspot_timeout" -> "手机热点尚未准备好，请在系统设置开启后重试。"
+    "hotspot_stopped" -> "手机热点已关闭或地址发生变化，请检查系统热点。"
     "address_unverified" -> "开发板已返回地址，但无法确认属于手机热点；尚未连接 SSH。"
     "request_not_found" -> "开发板没有该次配网的确认记录，请检查现场网络。"
     "provisioning_pending" -> "开发板仍在连接热点，请稍后再次查询结果。"

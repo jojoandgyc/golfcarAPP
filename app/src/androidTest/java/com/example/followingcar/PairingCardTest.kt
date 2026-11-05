@@ -7,6 +7,12 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
 import com.example.followingcar.ui.theme.FollowingCarTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -18,94 +24,95 @@ class PairingCardTest {
     @Test fun bluetoothCheckDoesNotTriggerProvisioning() {
         var provisions = 0
         var checked: String? = null
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(supported = true), true, false, { provisions++ }, {}, {}, {},
                 onCheckBluetooth = { checked = it })
-        } }
-        compose.onNodeWithTag("checkBluetooth").performClick()
+        } } }
+        compose.onNodeWithTag("checkBluetooth").performScrollTo().performClick()
         assertEquals(DEFAULT_PAIRING_BOARD_ADDRESS, checked)
         assertEquals(0, provisions)
     }
 
     @Test fun bluetoothCheckCannotRunDuringUnknownProvisioning() {
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(confirmationRequired = true), true, false, {}, {}, {}, {},
                 onCheckBluetooth = {})
-        } }
+        } } }
         compose.onNodeWithTag("checkBluetooth").assertDoesNotExist()
     }
 
     @Test fun singleButtonUsesConfiguredBoardWithoutShowingCredentials() {
         var selected: String? = null
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(supported = true), true, false,
-                { selected = it }, {}, {}, {})
-        } }
-        compose.onNodeWithTag("startPairing").performClick()
+                { selected = it }, {}, {}, {},
+                hotspotProfile = SystemHotspotProfileState(loading = false, configured = true, ssid = "Phone"))
+        } } }
+        compose.onNodeWithTag("startPairing").performScrollTo().performClick()
         assertEquals(DEFAULT_PAIRING_BOARD_ADDRESS, selected)
         compose.onNodeWithTag("pairingBoardAddress").assertDoesNotExist()
     }
 
     @Test fun unknownResultOffersQueryInsteadOfStartingOrClosingHotspot() {
         var checks = 0
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(hotspotActive = true, confirmationRequired = true), true, false,
                 {}, {}, { checks++ }, {})
-        } }
-        compose.onNodeWithTag("checkPairing").performClick()
+        } } }
+        compose.onNodeWithTag("checkPairing").performScrollTo().performClick()
         assertEquals(1, checks)
         compose.onNodeWithTag("startPairing").assertDoesNotExist()
-        compose.onNodeWithTag("stopPairingHotspot").assertDoesNotExist()
+        compose.onNodeWithTag("forgetPairing").assertDoesNotExist()
     }
 
-    @Test fun connectedSshPreventsHotspotTeardown() {
-        compose.setContent { FollowingCarTheme {
+    @Test fun connectedSshPreventsForgettingPairingButHasNoHotspotShutdownAction() {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(hotspotActive = true, boardIp = "192.168.45.20"), false, true,
                 {}, {}, {}, {})
-        } }
-        compose.onNodeWithTag("stopPairingHotspot").assertIsNotEnabled()
+        } } }
+        compose.onNodeWithTag("forgetPairing").assertIsNotEnabled()
     }
 
     @Test fun pendingOperationShowsCancelAndCannotStartAnother() {
         var cancelled = false
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(busy = true), true, false, {}, { cancelled = true }, {}, {})
-        } }
-        compose.onNodeWithTag("cancelPairing").assertIsEnabled().performClick()
+        } } }
+        compose.onNodeWithTag("cancelPairing").assertIsEnabled().performScrollTo().performClick()
         assertEquals(true, cancelled)
         compose.onNodeWithTag("startPairing").assertDoesNotExist()
     }
 
     @Test fun retainedHotspotRequiresFreshBoardCheckBeforeReconnect() {
         var checks = 0
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(hotspotActive = true, boardIp = "192.168.45.20",
                 status = "开发板已接入手机热点"), true, false, {}, {}, { checks++ }, {})
-        } }
-        compose.onNodeWithTag("pairingStatus").assertTextEquals("配对热点已保留，尚未建立 SSH 连接")
+        } } }
+        compose.onNodeWithTag("pairingStatus").assertTextEquals("小车已配网，尚未建立 SSH 连接")
         compose.onNodeWithTag("pairingNetwork").assertTextEquals("上次确认的小车地址 192.168.45.20")
-        compose.onNodeWithTag("reconnectPairedBoard").performClick()
+        compose.onNodeWithTag("reconnectPairedBoard").performScrollTo().performClick()
         assertEquals(1, checks)
     }
 
     @Test fun recoveryLoadingShowsProgressWithoutAnyNewNetworkAction() {
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(recoveryLoading = true), true, false, {}, {}, {}, {},
                 onCheckBluetooth = {})
-        } }
+        } } }
         compose.onNodeWithTag("pairingProgress").assertExists()
         listOf("startPairing", "checkBluetooth", "pairingAdvanced", "checkPairing",
-            "stopPairingHotspot", "cancelPairing").forEach {
+            "forgetPairing", "cancelPairing").forEach {
             compose.onNodeWithTag(it).assertDoesNotExist()
         }
     }
 
     @Test fun loadingRecoveryAlsoHidesActionsForAnExistingInMemoryHotspot() {
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(recoveryLoading = true, hotspotActive = true,
                 boardIp = "192.168.45.20"), true, false, {}, {}, {}, {})
-        } }
-        compose.onNodeWithTag("stopPairingHotspot").assertDoesNotExist()
+        } } }
+        compose.onNodeWithTag("forgetPairing").assertDoesNotExist()
         compose.onNodeWithTag("reconnectPairedBoard").assertDoesNotExist()
         compose.onNodeWithTag("startPairing").assertDoesNotExist()
     }
@@ -113,9 +120,9 @@ class PairingCardTest {
     @Test fun latestRecoveryErrorDoesNotReplaceTheFirstFailure() {
         val state = mutableStateOf(PairingState(confirmationRequired = true,
             error = "读取小车响应超时", firstError = "读取小车响应超时"))
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(state.value, true, false, {}, {}, {}, {})
-        } }
+        } } }
         compose.onNodeWithTag("pairingError").assertTextEquals("读取小车响应超时")
         compose.onNodeWithTag("pairingFirstError").assertDoesNotExist()
 
@@ -126,15 +133,15 @@ class PairingCardTest {
 
     @Test fun automaticRecoveryOffersCancelWithoutConcurrentQueryOrProvision() {
         var cancellations = 0
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(stage = PairingStage.RECOVERING, busy = true,
                 confirmationRequired = true, hotspotActive = true), false, false,
                 {}, { cancellations += 1 }, {}, {}, onCheckBluetooth = {})
-        } }
+        } } }
         compose.onNodeWithTag("pairingProgress").assertExists()
-        compose.onNodeWithTag("cancelPairing").assertIsEnabled().performClick()
+        compose.onNodeWithTag("cancelPairing").assertIsEnabled().performScrollTo().performClick()
         assertEquals(1, cancellations)
-        listOf("checkPairing", "startPairing", "stopPairingHotspot", "checkBluetooth", "pairingAdvanced").forEach {
+        listOf("checkPairing", "startPairing", "forgetPairing", "checkBluetooth", "pairingAdvanced").forEach {
             compose.onNodeWithTag(it).assertDoesNotExist()
         }
     }
@@ -143,11 +150,11 @@ class PairingCardTest {
         val state = mutableStateOf(PairingState(supported = true))
         var checks = 0
         var provisions = 0
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(state.value, true, false, { provisions += 1 }, {}, { checks += 1 }, {},
                 onCheckBluetooth = {})
-        } }
-        compose.onNodeWithTag("pairingAdvanced").performClick()
+        } } }
+        compose.onNodeWithTag("pairingAdvanced").performScrollTo().performClick()
         compose.onNodeWithTag("pairingBoardAddress").assertExists()
 
         compose.runOnIdle {
@@ -158,15 +165,15 @@ class PairingCardTest {
         compose.onNodeWithTag("pairingBoardAddress").assertDoesNotExist()
         compose.onNodeWithTag("startPairing").assertDoesNotExist()
         compose.onNodeWithTag("checkBluetooth").assertDoesNotExist()
-        compose.onNodeWithTag("checkPairing").assertIsEnabled().performClick()
+        compose.onNodeWithTag("checkPairing").assertIsEnabled().performScrollTo().performClick()
         assertEquals(1, checks)
         assertEquals(0, provisions)
     }
 
     @Test fun anUnknownRequestCannotBeCheckedDuringCompetingControl() {
-        compose.setContent { FollowingCarTheme {
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
             PairingCard(PairingState(confirmationRequired = true), false, false, {}, {}, {}, {})
-        } }
+        } } }
         compose.onNodeWithTag("checkPairing").assertIsNotEnabled()
         compose.onNodeWithTag("pairingAdvanced").assertDoesNotExist()
         compose.onNodeWithTag("startPairing").assertDoesNotExist()
@@ -175,13 +182,73 @@ class PairingCardTest {
     @Test fun restoredSelectedBoardIsUsedAfterTheOldRequestIsConfirmed() {
         val state = mutableStateOf(PairingState(recoveryLoading = true))
         var selected: String? = null
-        compose.setContent { FollowingCarTheme {
-            PairingCard(state.value, true, false, { selected = it }, {}, {}, {})
-        } }
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            PairingCard(state.value, true, false, { selected = it }, {}, {}, {},
+                hotspotProfile = SystemHotspotProfileState(loading = false, configured = true, ssid = "Phone"))
+        } } }
         compose.runOnIdle {
             state.value = state.value.copy(recoveryLoading = false, selectedAddress = "12:34:56:78:90:AB")
         }
-        compose.onNodeWithTag("startPairing").performClick()
+        compose.onNodeWithTag("startPairing").performScrollTo().performClick()
         assertEquals("12:34:56:78:90:AB", selected)
+    }
+
+    @Test fun missingCredentialsOpensSetupWithoutProvisioning() {
+        var provisions = 0
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            PairingCard(PairingState(supported = true), true, false, { provisions++ }, {}, {}, {})
+        } } }
+        compose.onNodeWithTag("startPairing").performScrollTo().performClick()
+        compose.onNodeWithTag("systemHotspotSsid").assertExists()
+        compose.onNodeWithTag("systemHotspotPassword").assertExists()
+        compose.onNodeWithTag("saveSystemHotspot").assertIsNotEnabled()
+        assertEquals(0, provisions)
+    }
+
+    @Test fun settingsButtonDoesNotProvisionOrForgetTheNetwork() {
+        var opened = 0
+        var provisions = 0
+        var forgotten = 0
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            PairingCard(PairingState(supported = true), true, false, { provisions++ }, {}, {}, { forgotten++ },
+                onOpenHotspotSettings = { opened++ })
+        } } }
+        compose.onNodeWithTag("systemHotspotSettings").performScrollTo().performClick()
+        assertEquals(1, opened)
+        assertEquals(0, provisions)
+        assertEquals(0, forgotten)
+        compose.onNodeWithTag("stopPairingHotspot").assertDoesNotExist()
+    }
+
+    @Test fun savingProfileDoesNotStartPairingOrRevealStoredPassword() {
+        var saved: Pair<String,String>? = null
+        var provisions = 0
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            PairingCard(PairingState(supported = true), true, false, { provisions++ }, {}, {}, {},
+                hotspotProfile = SystemHotspotProfileState(loading = false, configured = true, ssid = "Phone"),
+                onSaveHotspotProfile = { ssid, password -> saved = ssid to password })
+        } } }
+        compose.onNodeWithTag("editSystemHotspot").performScrollTo().performClick()
+        compose.onNodeWithTag("systemHotspotPassword").assertTextEquals("热点密码（留空保留）", "")
+        compose.onNodeWithTag("saveSystemHotspot").performClick()
+        assertEquals("Phone" to "", saved)
+        assertEquals(0, provisions)
+    }
+
+    @Test fun immediateSaveCompletionClosesEditorWithoutRelyingOnBusyFrame() {
+        val profile = mutableStateOf(SystemHotspotProfileState(loading = false))
+        var provisions = 0
+        compose.setContent { FollowingCarTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            PairingCard(PairingState(supported = true), true, false, { provisions++ }, {}, {}, {},
+                hotspotProfile = profile.value, onSaveHotspotProfile = { ssid, _ ->
+                    profile.value = profile.value.copy(configured = true, ssid = ssid, savedRevision = 1)
+                })
+        } } }
+        compose.onNodeWithTag("startPairing").performScrollTo().performClick()
+        compose.onNodeWithTag("systemHotspotSsid").performTextInput("Phone")
+        compose.onNodeWithTag("systemHotspotPassword").performTextInput("testpassword")
+        compose.onNodeWithTag("saveSystemHotspot").performClick()
+        compose.onNodeWithTag("systemHotspotPassword").assertDoesNotExist()
+        assertEquals(0, provisions)
     }
 }

@@ -1,0 +1,80 @@
+{
+  "recordedAtUtc": "2026-11-05T10:01:25.382714+00:00",
+  "app": {
+    "versionName": "1.8.23-system-hotspot",
+    "versionCode": 34,
+    "apkSha256": "1c16655a3422e66bd8b13e79676e3082a6bdc747cef46b58254f42f8ce121b3c",
+    "built": true,
+    "installedOnPhysicalPhone": false,
+    "physicalPhoneLastInstalledVersion": "1.8.22-system-hotspot"
+  },
+  "changes": [
+    "Use user-enabled system tethering hotspot; no LocalOnlyHotspot creation or ownership",
+    "Encrypt reusable system-hotspot credentials in AndroidKeyStore-backed no-backup storage",
+    "Discover board through actual phone AP interface and verify pinned SSH identity",
+    "Preserve first pairing failure after definitive network restoration",
+    "Opt-in system-hotspot default route; legacy Direct/local-only requests unchanged",
+    "Accept empty current-profile UUID as disconnected only with corresponding settled network state"
+  ],
+  "validation": {
+    "appUnitTests": {
+      "tests": 358,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorUiTests": {
+      "passed": 40,
+      "scope": "pairing UI, encrypted profile storage, recovery UI and persistence; before final non-UI previous-request error reset"
+    },
+    "boardOfflineLinuxTests": {
+      "passed": 145,
+      "skipped": 0
+    },
+    "physicalPhoneSystemHotspotOwnership": {
+      "version": "1.8.22-system-hotspot",
+      "passed": 1,
+      "cycles": 3,
+      "systemApUnchanged": true
+    },
+    "physicalPairingAttempt": {
+      "version": "1.8.22-system-hotspot",
+      "requestId": "2b2f28a4-a7c2-4447-8cef-2ccab21121ad",
+      "success": false,
+      "originalCode": "networkmanager_command_failed",
+      "networkManagerReason": "ssid-not-found",
+      "ssidMatchedUserConfiguration": true,
+      "boardReturnedToOriginalNetwork": true,
+      "testTimeoutAfterDefinitiveFailureFixed": true,
+      "radioCauseStillPending": true
+    },
+    "physicalV34PairingAndProcessRestart": "pending phone USB reconnect",
+    "motorsOrCamerasStarted": false
+  },
+  "board": {
+    "deployedAtUtc": "2026-11-05T09:59:48.964490+00:00",
+    "service": "followingcar-pairing.service",
+    "files": {
+      "app_wifi_direct_join.py": {
+        "oldSha256": "4e01bd657fe55cca233ef0c3c3dd7b80f85451ebbf8cef3a2c642b739528cca5",
+        "newSha256": "7d4627b04bd428de1a32cb205243a49fa0a36a438cc1709e5eb67fbbfab1e1f0",
+        "backup": "/opt/followingcar-pairing/app_wifi_direct_join.py.bak.system-hotspot-20261105T095947737486Z"
+      },
+      "app_bluetooth_provision.py": {
+        "oldSha256": "f51f1124190dd3432310470c4d154d39ac14ecc4da88a7d0a758ce7c1abee9b7",
+        "newSha256": "ecdd6ebbab3f3869aeb99371f3cbe70c45dc61fd85277f2cb6b7a66a1afe37cf",
+        "backup": "/opt/followingcar-pairing/app_bluetooth_provision.py.bak.system-hotspot-20261105T095947737486Z"
+      }
+    },
+    "controlIdleGuardHeld": true,
+    "networkConfigurationUnchanged": true,
+    "controlBridgeUnchanged": true,
+    "supportsSystemHotspot": true
+  },
+  "pending": [
+    "Install 1.8.23 after phone reconnects",
+    "Observe actual system hotspot frequencies while board scans, resolve ssid-not-found",
+    "Validate pairing, independent AP discovery, pinned SSH and real process-restart recovery",
+    "Restore temporary USB testing stay_on_while_plugged_in setting to original value 2; phone absent"
+  ]
+}

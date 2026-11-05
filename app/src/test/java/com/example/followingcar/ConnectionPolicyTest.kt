@@ -53,7 +53,7 @@ class ConnectionPolicyTest {
         assertNull(hotspot.connectionSelectionBlockReason())
         assertNull(hotspot.connectionBlockReason(ConnectionMethod.LAN, WifiDirectState()))
         assertNull(hotspot.connectionBlockReason(ConnectionMethod.REMOTE, WifiDirectState()))
-        assertTrue(hotspot.connectionBlockReason(ConnectionMethod.WIFI_DIRECT, group)!!.contains("配对热点"))
+        assertTrue(hotspot.connectionBlockReason(ConnectionMethod.WIFI_DIRECT, group)!!.contains("系统热点配对"))
         assertFalse(hotspot.canManageWifiDirect)
     }
 

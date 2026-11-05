@@ -11,6 +11,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -27,6 +28,7 @@ internal fun ConnectionRecoveryCard(
     onCancelPairing: () -> Unit,
     onRefreshWireless: () -> Unit,
     modifier: Modifier = Modifier,
+    onOpenSystemHotspotSettings: (() -> Unit)? = null,
 ) {
     val showPairing = pairing.recoveryLoading || pairing.busy || pairing.confirmationRequired
     val showWireless = wireless.confirmationRequired || wireless.busy
@@ -72,6 +74,10 @@ internal fun ConnectionRecoveryCard(
                         modifier = Modifier.testTag("connectionWirelessRecoveryBlocked"))
                 }
             }
+            if (pairing.confirmationRequired && !pairing.busy && onOpenSystemHotspotSettings != null) {
+                TextButton(onClick = onOpenSystemHotspotSettings, enabled = canManagePairing,
+                    modifier = Modifier.testTag("recoverySystemHotspotSettings")) { Text("检查系统热点设置") }
+            }
         }
     }
 }
@@ -84,7 +90,7 @@ private fun pairingRecoveryReason(state: PairingState): String = when {
         PairingStage.PAIRING_BLUETOOTH -> "正在配对小车蓝牙，请确认手机系统的配对提示。"
         PairingStage.CONNECTING_BLUETOOTH -> "正在连接小车蓝牙服务。"
         PairingStage.CHECKING_BOARD -> "正在核对小车状态，确认是否可以配网。"
-        PairingStage.STARTING_HOTSPOT -> "正在创建手机配对热点。"
+        PairingStage.STARTING_HOTSPOT -> "正在检查手机系统热点。"
         PairingStage.SENDING_CREDENTIALS -> "正在发送配网信息，等待小车确认。"
         PairingStage.WAITING_NETWORK -> "正在等待小车接入手机热点。"
         PairingStage.VERIFYING_NETWORK -> "正在核对小车是否已接入配对网络。"

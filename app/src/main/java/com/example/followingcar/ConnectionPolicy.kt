@@ -38,7 +38,7 @@ internal fun BoardUiState.connectionBlockReason(
     // A confirmed phone hotspot is a usable LAN, not permission to replace it with a Direct group.
     if (method == ConnectionMethod.LAN) return null
     return when {
-        pairingHotspotActive -> "手机配对热点仍在使用，请先关闭配对热点，再使用 Wi-Fi 直连。"
+        pairingHotspotActive -> "手机系统热点配对仍在使用，请先解除配对记录，再使用 Wi-Fi 直连。"
         !canManageWifiDirect -> "控制或配网操作尚未结束，暂不能使用 Wi-Fi 直连。"
         wireless.busy -> "正在读取或处理直连状态，请等待完成。"
         wireless.discovering -> "请先停止搜索设备，再连接 Wi-Fi 直连小车。"
