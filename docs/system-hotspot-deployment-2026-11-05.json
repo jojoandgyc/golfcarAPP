@@ -1,12 +1,15 @@
 {
-  "recordedAtUtc": "2026-11-05T10:01:25.382714+00:00",
+  "recordedAtUtc": "2026-11-05T10:30:59.537601+00:00",
   "app": {
     "versionName": "1.8.23-system-hotspot",
     "versionCode": 34,
     "apkSha256": "1c16655a3422e66bd8b13e79676e3082a6bdc747cef46b58254f42f8ce121b3c",
     "built": true,
-    "installedOnPhysicalPhone": false,
-    "physicalPhoneLastInstalledVersion": "1.8.22-system-hotspot"
+    "installedOnPhysicalPhone": true,
+    "physicalPhoneLastInstalledVersion": "1.8.23-system-hotspot",
+    "installedAtUtc": "2026-11-05T10:23:14.321437+00:00",
+    "connectionPreferencesPreserved": true,
+    "encryptedHotspotCredentialsPreserved": true
   },
   "changes": [
     "Use user-enabled system tethering hotspot; no LocalOnlyHotspot creation or ownership",
@@ -46,10 +49,100 @@
       "ssidMatchedUserConfiguration": true,
       "boardReturnedToOriginalNetwork": true,
       "testTimeoutAfterDefinitiveFailureFixed": true,
-      "radioCauseStillPending": true
+      "radioCauseStillPending": false,
+      "resolvedCause": "System dual-band hotspot was actually broadcasting only 5745 MHz. Board supports 2.4 GHz only. User selected 2.4 GHz; observed 2412 MHz and subsequent pairing succeeded."
     },
-    "physicalV34PairingAndProcessRestart": "pending phone USB reconnect",
-    "motorsOrCamerasStarted": false
+    "physicalV34PairingAndProcessRestart": {
+      "pairing": {
+        "kind": "system_hotspot_pairing_and_independent_discovery",
+        "appManagedHotspot": false,
+        "beforeInterfaces": [
+          {
+            "interface": "swlan0",
+            "index": 119,
+            "address": "192.168.201.231",
+            "prefixLength": 24
+          }
+        ],
+        "terminalPairingStage": "PAIRED",
+        "pairedBoardIp": "192.168.201.121",
+        "pairedSshAuthenticated": true,
+        "independentlyDiscoveredIp": "192.168.201.121",
+        "source": "hotspot_mdns",
+        "sourceAddressBound": true,
+        "independentPinnedSshAuthenticated": true,
+        "realMotorCommandsSent": false,
+        "cameraStarted": false,
+        "controlStartEventCount": 0,
+        "afterInterfaces": [
+          {
+            "interface": "swlan0",
+            "index": 119,
+            "address": "192.168.201.231",
+            "prefixLength": 24
+          }
+        ],
+        "success": true,
+        "elapsedMs": 11897
+      },
+      "processRestartRecovery": {
+        "kind": "system_hotspot_process_restart_recovery",
+        "requestIdBefore": "077b3eca-b3cd-456f-8f61-783dad2c47cc",
+        "journalPhaseBefore": "PAIRED",
+        "beforeInterfaces": [
+          {
+            "interface": "swlan0",
+            "index": 119,
+            "address": "192.168.201.231",
+            "prefixLength": 24
+          }
+        ],
+        "pid": 11707,
+        "previousAppInstanceId": "2c8ed574-9db2-4db8-9777-ab0b80cf31cf",
+        "appInstanceId": "957378d0-87b7-4a5d-ab08-244b67992ecc",
+        "newProcessConfirmed": true,
+        "terminalPairingStage": "PAIRED",
+        "requestIdAfter": "077b3eca-b3cd-456f-8f61-783dad2c47cc",
+        "journalPhaseAfter": "PAIRED",
+        "boardIp": "192.168.201.121",
+        "pinnedSshAuthenticated": true,
+        "afterInterfaces": [
+          {
+            "interface": "swlan0",
+            "index": 119,
+            "address": "192.168.201.231",
+            "prefixLength": 24
+          }
+        ],
+        "credentialDispatchEventCount": 0,
+        "provisionRequestsSent": 0,
+        "realMotorCommandsSent": false,
+        "cameraStarted": false,
+        "success": true,
+        "elapsedMs": 4556
+      }
+    },
+    "motorsOrCamerasStarted": false,
+    "boardInternetRouting": {
+      "profileUuid": "3b51f80d-e3e1-40c0-9b58-fd0e6b474b00",
+      "ipv4Settings": "ipv4.method:auto\nipv4.never-default:no",
+      "defaultRoute": "default via 192.168.201.231 dev wlan0 proto dhcp metric 600",
+      "relayRoute": "117.50.34.249 via 192.168.201.231 dev wlan0 src 192.168.201.121 uid 0 \n    cache",
+      "relayServices": [
+        "followingcar-cn-frpc.service loaded active running FollowingCar domestic independent frpc",
+        "followingcar-frpc.service    loaded active running FollowingCar independent frpc relay"
+      ],
+      "relayTcpReachable": true,
+      "pairing": {
+        "requestId": "077b3eca-b3cd-456f-8f61-783dad2c47cc",
+        "ok": true,
+        "phase": "connected",
+        "internetAccessRequested": true,
+        "profileUuid": "3b51f80d-e3e1-40c0-9b58-fd0e6b474b00"
+      },
+      "pinnedSshAuthenticated": true,
+      "boardIp": "192.168.201.121"
+    }
   },
   "board": {
     "deployedAtUtc": "2026-11-05T09:59:48.964490+00:00",
@@ -71,10 +164,7 @@
     "controlBridgeUnchanged": true,
     "supportsSystemHotspot": true
   },
-  "pending": [
-    "Install 1.8.23 after phone reconnects",
-    "Observe actual system hotspot frequencies while board scans, resolve ssid-not-found",
-    "Validate pairing, independent AP discovery, pinned SSH and real process-restart recovery",
-    "Restore temporary USB testing stay_on_while_plugged_in setting to original value 2; phone absent"
-  ]
+  "pending": [],
+  "phoneUsbTestingKeepAwakeRestoredToOriginal": 2,
+  "physicalPhoneFinalState": "Production FollowingCar connection page; system hotspot remains enabled; control never started"
 }

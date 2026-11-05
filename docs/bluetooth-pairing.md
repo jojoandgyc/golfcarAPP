@@ -102,4 +102,6 @@ python -m unittest discover -s board -p "test_app_wifi_direct_join.py" -v
 
 旧版参考：[Android 本地热点 API](https://developer.android.com/reference/android/net/wifi/WifiManager#startLocalOnlyHotspot(android.net.wifi.WifiManager.LocalOnlyHotspotCallback,%20android.os.Handler))、[BlueZ Profile API](https://bluez.readthedocs.io/en/latest/profile-api/)。
 
-2026-11-05 的系统热点改版、兼容协议、已部署哈希与待完成真机验证见 [系统热点部署记录](system-hotspot-deployment-2026-11-05.json)。记录明确区分离线通过、已安装版本和实际配网结果。
+2026-11-05 的系统热点改版、兼容协议、已部署哈希与真机验证结果见 [系统热点部署记录](system-hotspot-deployment-2026-11-05.json)。记录明确区分离线通过、已安装版本和实际配网结果。
+
+2026-11-05 真机验证完成：1.8.23 已安装，保留已有热点凭据；手机改为 2.4 GHz 后，实际广播 2412 MHz，小车通过 DHCP 取得热点地址。完整配网、独立 mDNS 发现与固定 SSH 身份验证约 11.9 秒；真正结束 App 进程后，新实例以同一 requestId 只读恢复约 4.6 秒，未重发凭据，系统热点始终保留。小车默认路由经手机热点，国内中转 TCP 端口可达。测试没有启动电机或摄像头。
