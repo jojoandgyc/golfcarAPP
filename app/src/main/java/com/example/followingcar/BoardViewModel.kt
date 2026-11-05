@@ -114,10 +114,14 @@ data class BoardUiState(
     val canReconnectViaRemote: Boolean get() = canSelectRemoteMode && remoteProfile != null && remoteProfileError == null
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followStopping || followUncertain
-    val canEnableDrive: Boolean get() = connected && !busy && !motorActionUnconfirmed && !driveCleanupUnconfirmed && !pairingBusy && !pairingUnconfirmed && !manualActive && !followBlocksControl && !videoServiceBusy
+    // A saved local pairing journal is not a control fault on an authenticated public route.
+    // Keep the journal for local recovery; an actively running pairing operation still blocks both routes.
+    val pairingBlocksControl: Boolean get() = pairingBusy || (pairingUnconfirmed && !remoteMode)
+    val driveStartBlockReason: String? get() = driveStartBlock()?.message
+    val canEnableDrive: Boolean get() = driveStartBlock() == null
     val canToggleVideoService: Boolean
         get() = connected && !busy && !motorActionUnconfirmed && !videoServiceBusy && !driveStarting && !driveStopping && !followBlocksControl
-    val canInspectFollow: Boolean get() = connected && !busy && !pairingBusy && !pairingUnconfirmed && !manualActive && !followActive && !followStopping && !videoServiceBusy
+    val canInspectFollow: Boolean get() = connected && !busy && !pairingBlocksControl && !manualActive && !followActive && !followStopping && !videoServiceBusy
     // Restoring a lost wireless group must remain possible while the old control lock awaits SSH inspection.
     val canRecoverConnection: Boolean get() = !connected && !busy && !manualActive &&
         !followActive && !followStopping && !videoServiceBusy
@@ -128,7 +132,7 @@ data class BoardUiState(
         get() = canInspectFollow && !motorActionUnconfirmed && !driveCleanupUnconfirmed && !followUncertain && !followConfigurationLoading &&
             runCatching { followLaunchOptions.validate(followCamera) }.isSuccess
     val canReadMotorConfiguration: Boolean get() = connected && !busy && !manualActive &&
-        !followBlocksControl && !driveCleanupUnconfirmed && !videoServiceBusy && !parkingUpdating && !pairingBusy && !pairingUnconfirmed
+        !followBlocksControl && !driveCleanupUnconfirmed && !videoServiceBusy && !parkingUpdating && !pairingBlocksControl
     val canConfigureMotor: Boolean get() = canReadMotorConfiguration && !motorActionUnconfirmed
     val canExecuteTerminal: Boolean get() = connected && !busy && !motorActionUnconfirmed &&
         !videoServiceBusy && !manualActive && !followBlocksControl && !driveCleanupUnconfirmed
@@ -284,7 +288,15 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             } finally { mutableState.update { it.copy(remoteProfileLoading = false) } }
         }
         viewModelScope.launch {
+            var previousDriveGate: Pair<Boolean, DriveStartBlock?>? = null
             state.collect { current ->
+                val gate = current.remoteMode to current.driveStartBlock()
+                if (gate != previousDriveGate) {
+                    previousDriveGate = gate
+                    Diagnostics.event("drive.start_availability", ownerDiagnostic,
+                        fields = mapOf("route" to if (gate.first) "REMOTE" else "LOCAL",
+                            "reason" to (gate.second?.name ?: "AVAILABLE")))
+                }
                 val connectionId = client.diagnosticConnectionId
                 mutableParkingPage.update { parking ->
                     val stale = !current.connected || current.driveStarting || current.driveStopping ||
@@ -1087,7 +1099,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             current.motorActionUnconfirmed -> "上次电机操作尚未确认，请先核对控制占用"
             current.driveCleanupUnconfirmed -> "上次手动控制退出尚未确认，请先检查控制占用"
             current.driveCommunicationDelayed -> "正在等待控制回执恢复，请稍后再保存驻车电流"
-            current.pairingBusy || current.pairingUnconfirmed -> "无线配网尚未结束，请先完成连接确认"
+            current.pairingBlocksControl -> "无线配网尚未结束，请先完成连接确认"
             current.driveStarting || current.driveStopping -> "手动控制正在启动或停用，请等待完成后重试"
             current.busy || current.videoServiceBusy || current.parkingUpdating -> "其他操作正在进行，请稍后重试"
             current.driveEnabled && driveChannel?.ready?.parkingSemantics != PARKING_CURRENT_SEMANTICS ->
@@ -1663,7 +1675,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     /** dryRun simulates motors only; the video service is still managed on the board. */
     fun enableDrive(dryRun: Boolean = false) {
         val current = state.value
-        if (disconnecting || !current.canEnableDrive) return
+        if (disconnecting || !current.canEnableDrive) {
+            Diagnostics.event("drive.start_blocked", activeDiagnostic(), fields = mapOf(
+                "reason" to if (disconnecting) "DISCONNECTING" else current.driveStartBlock()?.name,
+                "route" to if (current.remoteMode) "REMOTE" else "LOCAL"), critical = true)
+            return
+        }
         driveDiagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         preferences.edit().putString("last_drive_operation", driveDiagnostic.operationId).apply()
         firstDriveStopSource = null

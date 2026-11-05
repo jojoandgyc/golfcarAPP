@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 34
-        versionName = "1.8.23-system-hotspot"
+        versionCode = 35
+        versionName = "1.8.24-remote-control"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

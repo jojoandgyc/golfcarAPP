@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "versionName": "1.8.24-remote-control",
+  "versionCode": 35,
+  "apkSha256": "70c772da3546a5460062dcf86669886801fa6aa3be7c3a86c2a4eff9db023b25",
+  "installedAtUtc": "2026-11-05T11:27:14.680211+00:00",
+  "cause": "A successful local pairing journal was restored as unconfirmed after app restart and incorrectly blocked an authenticated remote control route, while video was independent.",
+  "change": "Only historical local pairing uncertainty is route scoped; active pairing and actual motor/follow/manual recovery locks remain. Disabled manual start shows a fixed reason and logs availability changes.",
+  "validation": {
+    "unitTests": {
+      "tests": 365,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulatorUiTests": 20,
+    "phoneRemoteDryRun": {
+      "schemaVersion": 1,
+      "kind": "remote_manual_availability",
+      "versionName": "1.8.24-remote-control",
+      "versionCode": 35,
+      "transport": "mtls_pinned_ssh",
+      "dryRun": true,
+      "realMotorCommandsSent": false,
+      "videoServiceOperations": 0,
+      "wifiOperations": 0,
+      "nonzeroTargetsSent": 0,
+      "remoteCanEnableDrive": true,
+      "remoteCanInspectFollow": true,
+      "localPairingStillUnconfirmed": true,
+      "connectMs": 1022,
+      "pinnedSshAuthenticated": true,
+      "initialInspectionMs": 374,
+      "controlAvailableBefore": true,
+      "readyMs": 320,
+      "readyDryRun": true,
+      "safetyVersion": 2,
+      "watchdogMs": 600,
+      "networkGraceMs": 15000,
+      "runId": "5198ba055719b47b34d61e87e4a3bdd1",
+      "terminalAckReceived": true,
+      "terminalStopMs": 195,
+      "controlAvailableAfter": true,
+      "idleConfirmedMs": 340,
+      "passed": true,
+      "skipped": false,
+      "elapsedMs": 3405,
+      "ackCount": 5,
+      "ackSamplesMs": [
+        124,
+        117,
+        137,
+        116,
+        113
+      ],
+      "ackP50Ms": 117,
+      "ackP95Ms": 137,
+      "ackMaxMs": 137
+    },
+    "productionPhoneUi": {
+      "buttonEnabled": true,
+      "buttonClickable": true,
+      "manualStillInactive": true,
+      "publicSshConnected": true,
+      "videoConnected": true,
+      "realEnableButtonPressed": false
+    }
+  },
+  "deployment": {
+    "phoneInstalled": true,
+    "boardCodeChanged": false,
+    "serverCodeChanged": false,
+    "controlIdleLeaseHeldDuringInstall": true,
+    "connectionPreferencesPreserved": true,
+    "systemHotspotCredentialsPreserved": true,
+    "physicalMotorTestPerformed": false
+  },
+  "artifactsDirectory": "E:\\Temp\\golfcar-remote-drive-2026-11-05"
+}

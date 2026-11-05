@@ -349,7 +349,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
                         !state.connected -> "请先在连接页连接开发板"
                         state.manualActive -> "请先停用手动驾驶，再读取或修改电机配置"
                         state.followBlocksControl -> "自动跟随尚未确认结束，电机配置保持锁定"
-                        state.pairingBusy || state.pairingUnconfirmed -> "网络配对操作尚未确认结束，请先完成连接恢复"
+                        state.pairingBlocksControl -> "网络配对操作尚未确认结束，请先完成连接恢复"
                         state.videoServiceBusy -> "视频操作进行中，请稍后再试"
                         state.busy && !motorConfiguration.busy -> "其他操作进行中，请稍后再试"
                         else -> null
@@ -697,14 +697,8 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                 }
             }
             if (!controlling && manualSection != ManualSection.PARKING) {
-                Button(onClick = {
-                    if (state.driveCleanupUnconfirmed) viewModel.refreshDriveAvailability()
-                    else viewModel.enableDrive()
-                },
-                    enabled = if (state.driveCleanupUnconfirmed) state.canInspectFollow else state.canEnableDrive,
-                    modifier = Modifier.fillMaxWidth().testTag("enableDrive")) {
-                    Text(if (state.driveCleanupUnconfirmed) "检查控制占用" else "启用手动控制")
-                }
+                ManualDriveStartButton(state = state, onEnable = { viewModel.enableDrive() },
+                    onInspect = viewModel::refreshDriveAvailability)
             } else if (controlling) {
                 Button(onClick = { viewModel.disableDrive("已急停 · 重新启用后可操作", emergency = true) },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error,
