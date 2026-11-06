@@ -19,6 +19,8 @@
 
 手机已在控制空闲锁保护下从 v39 更新到 v40（`1.8.29-gemini-manual-video`），旧 APK 已备份，连接配置哈希未变，新 APK 安装哈希与构建哈希一致；见[手机安装记录](gemini335-manual-video-phone-install-2026-11-06.json)。真机基础启停测试通过（1/1，8.242 秒）。增强的 `GeminiManualVideoIntegrationTest` 再次通过（1/1，10.36 秒）：手机 WebView 连续收到至少两帧已解码的 1920×540 画面，截图目视左侧 RGB、右侧深度伪彩均正常。该次手机使用公网连接，截图保留在本机 `E:/Temp/gemini335-video-2026-11-06/phone-gemini335-first-frame.png`，未上传仓库。测试后板端 `rgbd-video.service` 和 `rgbd-mediamtx.service` 均为 `inactive`、`MainPID=0`、`ExecMainStatus=0`，无跟随或摇杆进程。
 
-手机和板端同在 `172.16.16.0/22`，手机能 ping 通板端。局域网首帧测试切到本地连接后，被 App 既有的“上次配网结果尚未确认”恢复锁挡在 SSH 连接前，未启动视频；测试已恢复手机原有远程模式与主机设置，没有清除配网记录。期间发现 Gemini USB 曾被另一项独立长跑实验占用，不属于视频服务残留；该实验自行退出后设备无持有进程。
+手机和板端同在 `172.16.16.0/22`，手机能 ping 通板端。首次局域网自动测试切到本地连接后，被 App 的“上次配网结果尚未确认”恢复锁挡在 SSH 连接前，未启动视频；测试已恢复原连接设置，没有清除配网记录。随后手机日志于 2026-11-06 16:12:39 UTC 记录板端返回 `network_restored` 的确定结果、配网恢复完成，手机配网 journal 已清空。再次只读查看手机当前页面时，App 显示“局域网 SSH 已连接”，Gemini 335 的 RGB 与深度画面均在手动页显示；这是用户正在使用的画面，未重启或关闭服务。只读截图保留在本机 `E:/Temp/gemini335-video-2026-11-06/current-phone-pairing-audit.png`，未上传仓库。局域网自动双帧测试未在用户使用期间重跑。
+
+期间发现 Gemini USB 曾被另一项独立长跑实验占用，不属于视频服务残留；该实验自行退出后设备无持有进程。
 
 板端备份与哈希见[部署记录](gemini335-manual-video-board-deployment-2026-11-06.json)，真实采集指标见[板端测试记录](gemini335-manual-video-live-test-2026-11-06.json)，可复现补丁见[视频服务补丁](../board/patches/gemini335-manual-video-2026-11-06.patch)。本机保留带空闲锁及哈希前置检查的回滚脚本 `E:/Temp/gemini335_video_rollback.py`，尚未执行。
