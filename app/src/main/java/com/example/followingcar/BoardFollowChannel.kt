@@ -28,7 +28,7 @@ import org.json.JSONObject
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-/** One SSH-owned follow run. Only the owning loop sends requests and 500 ms heartbeats. */
+/** One authenticated attachment. Only its owning loop sends requests and 500 ms heartbeats. */
 class BoardFollowChannel private constructor(
     private val channel: ChannelExec,
     private val input: InputStream,
@@ -63,6 +63,7 @@ class BoardFollowChannel private constructor(
         get() = !closed.get() && channel.isConnected && !channel.isClosed
 
     suspend fun start(): FollowReply {
+        check(!ready.resumed) { "恢复的跟随会话不能再次启动" }
         check(!startSent) { "本次跟随会话已发送启动请求" }
         startSent = true
         return transact("start")
@@ -76,7 +77,7 @@ class BoardFollowChannel private constructor(
     /** Cancel a ready-but-not-started session without creating a worker. */
     suspend fun requestClose(): FollowReply = transact("close")
 
-    /** EOF asks the supervisor to stop; a lost network also expires the board-side lease. */
+    /** Legacy EOF stops its worker; persistent EOF only releases this attachment's lease. */
     fun close(reason: String = "requested", invalidateTransport: Boolean = false) {
         if (!closed.compareAndSet(false, true)) return
         val abort = invalidateTransport || blockingIo.get()
@@ -98,7 +99,7 @@ class BoardFollowChannel private constructor(
         try {
             // An already validated terminal reply wins over late EOF and duplicate stop intents.
             terminalReply?.let { return@withContext it }
-            check(isOpen) { "跟随通道已关闭，运行状态未确认" }
+            if (!isOpen) throw IOException("跟随通道已关闭，运行状态未确认")
             val result = withTimeout(ACK_TIMEOUT_MS) {
                 currentCoroutineContext().ensureActive()
                 sequence += 1
@@ -162,7 +163,9 @@ class BoardFollowChannel private constructor(
                 close("terminal_ack")
                 return@withContext it
             }
-            val failure = SocketTimeoutException("跟随回执超时；板端将请求停止，车辆状态未确认")
+            val failure = SocketTimeoutException(if (ready.reconnectable)
+                "跟随回执超时，通信已中断；车端运行状态待重连确认"
+            else "跟随回执超时；板端将请求停止，车辆状态未确认")
             Diagnostics.failure(diagnosticContext, "follow.ack_timeout", failure,
                 diagnosticFields() + mapOf("elapsedMs" to elapsedMillis(started), "timeoutMs" to ACK_TIMEOUT_MS))
             // A completed write does not prove that the SSH transport is still alive. Do not
@@ -175,7 +178,9 @@ class BoardFollowChannel private constructor(
                 if (failure is CancellationException) throw failure
                 return@withContext it
             }
-            val safeFailure = protocolDiagnosticFailure(failure)
+            val safeFailure = if (phase == "ack_validate" && failure !is CancellationException)
+                (failure as? FollowProtocolException) ?: FollowProtocolException("跟随回执字段校验失败")
+            else protocolDiagnosticFailure(failure)
             if (failure is CancellationException) {
                 Diagnostics.event("follow.transaction_cancelled", diagnosticContext,
                     fields = diagnosticFields(), critical = true)
@@ -207,14 +212,14 @@ class BoardFollowChannel private constructor(
                         Diagnostics.event("follow.protocol_error", diagnosticContext,
                             fields = diagnosticFields() + mapOf("protocolStage" to "invalid_json"),
                             critical = true)
-                        throw IOException("开发板跟随响应不是有效 JSON")
+                        throw FollowProtocolException("开发板跟随响应不是有效 JSON")
                     }
                     if (message.opt("type") == "error") {
                         throw sessionError(message)
                     }
                     return message
                 }
-                if (bytes.size() >= MAX_LINE_BYTES) throw IOException("开发板跟随响应过长")
+                if (bytes.size() >= MAX_LINE_BYTES) throw FollowProtocolException("开发板跟随响应过长")
                 bytes.write(value)
             }
             if (channel.isClosed || channel.isEOF || !channel.isConnected) throw endedError()
@@ -243,7 +248,10 @@ class BoardFollowChannel private constructor(
         reported?.let { lastStatus = it }
         val detail = (message.opt("error") as? String)?.takeIf(String::isNotBlank)
             ?: "开发板跟随会话失败"
-        val failure = FollowSessionException(Diagnostics.safeText(detail, 600), reported)
+        val code = (message.opt("code") as? String)?.takeIf {
+            it in setOf("session_busy", "session_not_found", "session_invalid", "session_start_failed")
+        }
+        val failure = FollowSessionException(Diagnostics.safeText(detail, 600), reported, code)
         Diagnostics.failure(diagnosticContext, "follow.session_error", failure,
             diagnosticFields() + statusDiagnosticFields(reported) + mapOf(
                 "errorStatusPresent" to (reported != null), "terminal" to false))
@@ -293,7 +301,7 @@ class BoardFollowChannel private constructor(
             Diagnostics.event("follow.protocol_error", diagnosticContext,
                 fields = diagnosticFields() + mapOf("protocolStage" to "validation", "reason" to message),
                 critical = true)
-            throw IOException(message)
+            throw FollowProtocolException(message)
         }
     }
 
@@ -309,10 +317,14 @@ class BoardFollowChannel private constructor(
             session: Session, camera: FollowCamera, execute: Boolean, dryRun: Boolean,
             options: FollowLaunchOptions,
             diagnostic: DiagnosticContext,
+            reconnectable: Boolean = false,
+            attachRunId: String? = null,
             abortTransport: (reason: String, diagnostic: DiagnosticContext) -> Unit,
         ): BoardFollowChannel = withContext(Dispatchers.IO) {
             options.validate(camera)
             require(!dryRun || !execute) { "纯模拟会话不能启用实车执行" }
+            require(attachRunId == null || attachRunId.matches(Regex("[a-f0-9]{32}"))) { "恢复会话编号无效" }
+            require(!reconnectable || attachRunId != null || options.gesturesEnabled) { "断链继续跟随须启用手势" }
             val started = System.nanoTime()
             var opened: BoardFollowChannel? = null
             Diagnostics.event("follow.channel_open_requested", diagnostic,
@@ -320,8 +332,11 @@ class BoardFollowChannel private constructor(
                     "dryRun" to dryRun, "timeoutMs" to START_TIMEOUT_MS), critical = true)
             try {
                 val channel = (session.openChannel("exec") as ChannelExec).apply {
-                    setCommand("python3 -u $FOLLOW_PROJECT_ROOT/app_follow_bridge.py --camera ${camera.argument}" +
-                        followLaunchArguments(options) +
+                    setCommand(if (attachRunId != null)
+                        "python3 -u $FOLLOW_PROJECT_ROOT/app_follow_session.py --attach-run $attachRunId"
+                    else "python3 -u $FOLLOW_PROJECT_ROOT/" +
+                        (if (reconnectable) "app_follow_session.py --launch --offline-until-gesture" else "app_follow_bridge.py") +
+                        " --camera ${camera.argument}" + followLaunchArguments(options) +
                         (if (execute) " --execute" else "") + (if (dryRun) " --dry-run" else ""))
                     setPty(false)
                     setAgentForwarding(false)
@@ -345,16 +360,37 @@ class BoardFollowChannel private constructor(
                     control.requireMessage(runId is String && runId.isNotBlank() && runId.length <= 128,
                         "跟随会话标识无效")
                     control.diagnosticContext = diagnostic.copy(runId = runId as String)
-                    control.requireMessage(reply.opt("dryRun") == dryRun && reply.opt("execute") == execute &&
-                        reply.opt("camera") == camera.argument, "开发板跟随模式或相机不匹配")
-                    control.requireMessage(reply.optJSONObject("options")?.matches(options) == true,
-                        "开发板跟随参数与 App 选择不一致，请更新车端桥接脚本")
+                    val resumed = attachRunId != null
+                    if (reconnectable || resumed) {
+                        control.requireMessage(runId.matches(Regex("[a-f0-9]{32}")) &&
+                            reply.opt("reconnectable") == true && reply.opt("offlineUntilGesture") == true &&
+                            reply.opt("resumed") == resumed,
+                            "车端未确认可恢复跟随能力，请更新车端程序")
+                        control.requireMessage(attachRunId == null || runId == attachRunId, "恢复响应不属于原跟随会话")
+                    } else control.requireMessage(reply.opt("reconnectable") != true, "车端意外改变断链停止策略")
+                    val actualCamera = FollowCamera.entries.find { it.argument == reply.opt("camera") }
+                        ?: throw FollowProtocolException("跟随会话相机无效")
+                    control.requireMessage(reply.opt("dryRun") is Boolean && reply.opt("execute") is Boolean,
+                        "跟随会话运行模式无效")
+                    val actualDryRun = reply.getBoolean("dryRun")
+                    val actualExecute = reply.getBoolean("execute")
+                    control.requireMessage(!actualDryRun || !actualExecute, "纯模拟会话不能启用实车执行")
+                    val actualOptions = parseFollowLaunchOptions(reply.getJSONObject("options"), actualCamera)
+                    if (!resumed) {
+                        control.requireMessage(actualDryRun == dryRun && actualExecute == execute && actualCamera == camera,
+                            "开发板跟随模式或相机不匹配")
+                        control.requireMessage(actualOptions == options,
+                            "开发板跟随参数与 App 选择不一致，请更新车端桥接脚本")
+                    }
+                    control.requireMessage(!(reconnectable || resumed) || actualOptions.gesturesEnabled,
+                        "可恢复跟随会话未启用停车手势")
                     control.requireMessage(reply.opt("heartbeatMs") == 500 && reply.opt("watchdogMs") == 2000,
                         "开发板跟随心跳参数不匹配")
-                    control.ready = FollowReady(runId, dryRun, execute, camera)
+                    control.ready = FollowReady(runId, actualDryRun, actualExecute, actualCamera,
+                        reconnectable || resumed, reconnectable || resumed, resumed, actualOptions)
                     reply.optJSONObject("status")?.let { json ->
                         val status = parseFollowStatus(json)
-                        control.requireMessage(status.execute == execute && status.camera == camera,
+                        control.requireMessage(status.execute == actualExecute && status.camera == actualCamera,
                             "跟随初始状态的模式或相机不匹配")
                         control.lastStatus = control.preserveFault(status)
                     }
@@ -373,7 +409,9 @@ class BoardFollowChannel private constructor(
                 opened?.close("ready_timeout", invalidateTransport = true)
                 throw failure
             } catch (failure: Exception) {
-                val safeFailure = protocolDiagnosticFailure(failure)
+                val safeFailure = if (opened?.phase == "ready_validate" && failure !is CancellationException)
+                    (failure as? FollowProtocolException) ?: FollowProtocolException("跟随就绪字段校验失败")
+                else protocolDiagnosticFailure(failure)
                 val fields = (opened?.diagnosticFields() ?: mapOf("phase" to "channel_create")) +
                     mapOf("elapsedMs" to elapsedMillis(started), "originalExceptionClass" to failure.javaClass.name)
                 if (failure is CancellationException) {
@@ -425,7 +463,13 @@ internal fun followConfigurationCommand(
 }
 
 /** An error response ends the protocol; its optional snapshot never proves a terminal ACK. */
-class FollowSessionException(message: String, val status: FollowStatus?) : IOException(message)
+class FollowSessionException(message: String, val status: FollowStatus?, val code: String? = null) : IOException(message)
+
+/** Protocol corruption is not evidence of an ordinary network interruption. */
+internal class FollowProtocolException(message: String) : IOException(message)
+
+internal fun Throwable.isFollowCommunicationLoss(): Boolean = this is IOException &&
+    this !is FollowProtocolException && this !is FollowSessionException
 
 /** Explicit fields only: never serialize the entire status or response into diagnostics. */
 private fun statusDiagnosticFields(status: FollowStatus?): Map<String, Any?> = mapOf(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+import copy
 import importlib.util
 import json
 import math
@@ -22,6 +23,10 @@ import threading
 import time
 from typing import Any
 
+from app_follow_options import add_follow_arguments, validate_follow_arguments
+
+from app_follow_lifecycle import StartupProgress
+
 RUNTIME_ROOT = Path("/home/topeet/Desktop/rk_car_runtime_module")
 MOTOR_LOCK = Path("/home/topeet/lianzhan/.app_joystick.lock")
 WATCHDOG_SECONDS = 2.0
@@ -32,33 +37,106 @@ class LeaseExpired(RuntimeError):
 
 
 class LeaseGuard:
-    def __init__(self, parent_pid: int, timeout: float = WATCHDOG_SECONDS):
+    def __init__(self, parent_pid: int, timeout: float = WATCHDOG_SECONDS, *, allow_offline=False):
         self.parent_pid = parent_pid
         self.timeout = timeout
         self.last_pulse = time.monotonic()
         self.stopped = threading.Event()
         self.reason: str | None = None
+        self._state_lock = threading.Lock()
         self.pending_signal: str | None = None
         self.runtime: Any = None
+        self.startup_check = None
+        self.allow_offline = allow_offline
+        # Publish one immutable observation across the lease and motor threads.
+        self.network_state = (0, False, None)
+        self._offline_gate_template = None
+        self._offline_observer = None
+
+    @property
+    def network_detached(self):
+        return self.network_state[1]
+
+    @property
+    def detached_at(self):
+        return self.network_state[2]
+
+    def accept_lease(self, value):
+        if value == b"S":
+            self.request_stop("app_stop_requested")
+            return
+        if value not in (b"H", b"D", b"C") or value != b"H" and not self.allow_offline:
+            self.request_stop("app_lease_invalid")
+            return
+        self.ensure_live()
+        if value == b"H":
+            self.pulse()
+        else:
+            detached = value == b"D"
+            with self._state_lock:
+                revision, previous, _ = self.network_state
+                if not self.stopped.is_set() and detached != previous:
+                    self.network_state = (revision + 1, detached, time.monotonic() if detached else None)
+                    self._offline_observer = None
+
+    def observe_gesture_command(self, event, values):
+        # Do not wait on the lease thread from the motor/event path. Recheck and
+        # latch under the same tiny critical section as C/D, so a late event
+        # cannot stop a session that has already reattached. No runtime/IO calls
+        # occur while holding this lock.
+        if not self._state_lock.acquire(blocking=False):
+            # The shadow may already have latched PAUSED. Permit a future,
+            # fresh full hold instead of losing the only possible pause event.
+            self._offline_observer = None
+            return
+        stop = False
+        try:
+            revision, detached, since = self.network_state
+            if (self.allow_offline and detached and not self.stopped.is_set()
+                    and event == "gesture_command" and values.get("action") == "pause"
+                    and values.get("gesture") == "Open_Palm"
+                    and values.get("source") == "offline_stop_gate"
+                    and values.get("app_offline_epoch") == revision
+                    and type(values.get("captured_at")) in (int, float)
+                    and math.isfinite(values["captured_at"]) and values["captured_at"] > since):
+                self.reason = "app_offline_stop_gesture"
+                self.stopped.set()
+                stop = True
+        finally:
+            self._state_lock.release()
+        if stop and self.runtime is not None:
+            self.runtime.request_stop(reason=self.reason)
 
     def pulse(self):
         if not self.stopped.is_set():
             self.last_pulse = time.monotonic()
 
     def request_stop(self, reason: str):
-        if not self.stopped.is_set():
-            self.reason = reason
-            self.stopped.set()
+        with self._state_lock:
+            if not self.stopped.is_set():
+                self.reason = reason
+                self.stopped.set()
         runtime = self.runtime
         if runtime is not None:
             runtime.request_stop(reason=self.reason or reason)
 
     def attach(self, runtime: Any):
         self.runtime = runtime
+        if self.allow_offline:
+            # Runtime construction has not consumed any capture. Snapshot its
+            # already validated classifier/config now, without later file IO.
+            gate = getattr(runtime, "gesture_gate", None)
+            if gate is None or not gate.config.enabled:
+                raise RuntimeError("Offline follow requires an enabled gesture gate")
+            self._offline_gate_template = copy.deepcopy(gate)
+            self._offline_gate_template.state = "RUNNING"
         if self.stopped.is_set():
             runtime.request_stop(reason=self.reason or "app_lease_expired")
 
     def ensure_live(self):
+        if not self.stopped.is_set() and self.startup_check is not None:
+            if self.startup_check():
+                self.request_stop("app_startup_timeout")
         if self.pending_signal is not None:
             self.request_stop(self.pending_signal)
         if os.getppid() != self.parent_pid:
@@ -86,15 +164,8 @@ class LeaseGuard:
                     while b"\n" in buffer:
                         value, _, rest = buffer.partition(b"\n")
                         buffer[:] = rest
-                        if value == b"H":
-                            # A late pulse cannot revive an expired session.
-                            self.ensure_live()
-                            self.pulse()
-                        elif value == b"S":
-                            self.request_stop("app_stop_requested")
-                            return
-                        else:
-                            self.request_stop("app_lease_invalid")
+                        self.accept_lease(value)
+                        if self.stopped.is_set():
                             return
                     if len(buffer) > 8:
                         self.request_stop("app_lease_invalid")
@@ -145,8 +216,19 @@ class FollowSnapshot:
         self.behavior: str | None = None
         self.log_dir: str | None = None
         self.target_ttl = self.range_ttl = .6
+        self.startup = StartupProgress()
+
+    def check_startup(self):
+        error = self.startup.expired()
+        if error:
+            self.failed(error)
+        return error
 
     def note(self, event: str, values: dict):
+        if event == "startup" and not self.stop_requested and self.fault is None:
+            # The fact is recorded immediately, even if the status lock is busy.
+            # A later mailbox drain must not turn timely startup into a timeout.
+            self.startup.complete()
         # A status reader can never delay the motor/capture thread. Losing one
         # snapshot is preferable; data ages will expose stale observations.
         if not self.lock.acquire(blocking=False):
@@ -157,7 +239,8 @@ class FollowSnapshot:
             return
         try:
             if event == "startup":
-                self.state = "STOPPING" if self.stop_requested else "RUNNING"
+                if self.state != "FAULT":
+                    self.state = "STOPPING" if self.stop_requested else "RUNNING"
                 controller = values.get("controller", {})
                 for key, attribute in (("target_ttl_sec", "target_ttl"), ("range_ttl_sec", "range_ttl")):
                     value = controller.get(key)
@@ -188,6 +271,8 @@ class FollowSnapshot:
                 self.state = "FAULT"
             elif event == "shutdown":
                 self.stop_requested = True
+                if self.state != "FAULT":
+                    self.state = "STOPPING"
                 self.reason = str(values.get("reason") or self.reason or "shutdown")[:300]
                 problems = values.get("cleanup_errors") or values.get("unfinished_workers")
                 if problems:
@@ -247,7 +332,7 @@ class FollowSnapshot:
                 behavior=self.behavior if command is not None else None,
                 reason=self.reason, logDir=self.log_dir, statusAgeMs=0, processExited=False,
                 stop=dict(requested=self.stop_requested, acknowledged=self.stop_ack, physicalStopped=None),
-                fault=self.fault)
+                fault=self.fault, startup=self.startup.status())
 
 
 class StatusPublisher:
@@ -257,10 +342,11 @@ class StatusPublisher:
         self.write_lock = threading.Lock()
         os.set_blocking(fd, False)
 
-    def publish(self):
+    def publish(self, *, final=False):
         if self.guard.stopped.is_set():
             self.snapshot.stopping(self.guard.reason)
-        data = (json.dumps(self.snapshot.status(), ensure_ascii=True, allow_nan=False,
+        status = dict(self.snapshot.status(), workerFinal=final)
+        data = (json.dumps(status, ensure_ascii=True, allow_nan=False,
                            separators=(",", ":")) + "\n").encode()
         if len(data) > 4096:
             raise RuntimeError("Follow status exceeds bounded IPC size")
@@ -284,7 +370,7 @@ class StatusPublisher:
         self.finished.set()
         self.thread.join(.5)
         with contextlib.suppress(Exception):
-            self.publish()
+            self.publish(final=True)
 
 
 def prepare_environment(camera: str):
@@ -322,6 +408,57 @@ def preflight():
     reject_other_serial_owners(port)
 
 
+def install_offline_gesture_hook(guard: LeaseGuard, gate_type):
+    """Reuse only fully qualified observations, without changing the online gate.
+
+    Runtime calls observe only after target owner/geometry/freshness checks. A
+    separate fresh gate makes an already-PAUSED hand require a new complete hold,
+    rather than turning diagnostic labels or old pause state into stop authority.
+    """
+    original_observe = gate_type.observe
+    original_reset = gate_type.reset_observation
+
+    def reset_observation(self):
+        original_reset(self)
+        if (self is getattr(guard.runtime, "gesture_gate", None)
+                and not getattr(self, "_app_inside_observe", False)):
+            # Runtime eligibility/zone/queue-gap rejection must also discard
+            # partial offline evidence even when it never calls observe().
+            guard._offline_observer = None
+
+    def observe(self, label, captured_at, capture_id, owner, now, *args, **kwargs):
+        state = guard.network_state
+        self._app_inside_observe = True
+        try:
+            result = original_observe(self, label, captured_at, capture_id, owner, now, *args, **kwargs)
+        finally:
+            self._app_inside_observe = False
+        if (not guard.allow_offline or not state[1] or state != guard.network_state
+                or guard.stopped.is_set() or self is not getattr(guard.runtime, "gesture_gate", None)
+                or type(captured_at) not in (int, float) or not math.isfinite(captured_at)
+                or captured_at <= state[2]):
+            return result
+        cached = guard._offline_observer
+        if cached is None or cached[0] != state[0] or cached[1] is not self:
+            if guard._offline_gate_template is None:
+                return result
+            cached = (state[0], self, copy.deepcopy(guard._offline_gate_template))
+            guard._offline_observer = cached
+        if state != guard.network_state:
+            if guard._offline_observer is cached:
+                guard._offline_observer = None
+            return result
+        pause = original_observe(cached[2], label, captured_at, capture_id, owner, now, *args, **kwargs)
+        if (state == guard.network_state and not guard.stopped.is_set()
+                and isinstance(pause, dict) and pause.get("action") == "pause"
+                and pause.get("gesture") == "Open_Palm"):
+            return dict(pause, source="offline_stop_gate", app_offline_epoch=state[0])
+        return result
+
+    gate_type.observe = observe
+    gate_type.reset_observation = reset_observation
+
+
 def install_runtime_hooks(guard: LeaseGuard, snapshot: FollowSnapshot):
     import continuous_follow.hardware as hardware
     import continuous_follow.runtime as runtime_module
@@ -334,15 +471,35 @@ def install_runtime_hooks(guard: LeaseGuard, snapshot: FollowSnapshot):
             super().__init__(path, *args, **kwargs)
 
         def emit(self, event, **values):
+            guard.observe_gesture_command(event, values)
+            if (event in ("runtime_failure", "process_failure")
+                    and isinstance(sys.exc_info()[1], LeaseExpired)
+                    and guard.stopped.is_set()):
+                # Cancellation can interrupt a synchronous startup stage. It is
+                # not an initialization failure; real deadline faults already
+                # recorded by the guard remain latched in the snapshot.
+                snapshot.stopping(guard.reason)
+                super().emit("app_cancelled", stage=values.get("stage"), reason=guard.reason)
+                return
             snapshot.note(event, values)
             super().emit(event, **values)
     telemetry.EventLog = AppEventLog
+    if guard.allow_offline:
+        from continuous_follow.gesture import GestureGate
+        install_offline_gesture_hook(guard, GestureGate)
 
     original_init = runtime_module.ContinuousRuntime.__init__
     def initialize(self, *args, **kwargs):
         guard.ensure_live()
+        snapshot.startup.begin("runtime_construct")
         original_init(self, *args, **kwargs)
         guard.attach(self)
+        def observe_startup(stage):
+            guard.ensure_live()
+            snapshot.startup.begin(stage)
+            guard.ensure_live()
+        self.startup_observer = observe_startup
+        guard.ensure_live()
     runtime_module.ContinuousRuntime.__init__ = initialize
 
     original_run = runtime_module.ContinuousRuntime.run
@@ -415,10 +572,13 @@ def runtime_arguments(args, settings):
 
 def run_real(args, guard: LeaseGuard, snapshot: FollowSnapshot):
     camera = args.camera
+    snapshot.startup.begin("environment")
     prepare_environment(camera)
     guard.ensure_live()
+    snapshot.startup.begin("preflight")
     preflight()
     guard.ensure_live()
+    snapshot.startup.begin("runtime_import")
     install_runtime_hooks(guard, snapshot)
     guard.ensure_live()
     spec = importlib.util.spec_from_file_location("app_owned_continuous_entry", RUNTIME_ROOT / "request_continuous_follow.py")
@@ -427,6 +587,8 @@ def run_real(args, guard: LeaseGuard, snapshot: FollowSnapshot):
     guard.ensure_live()
     # Python/library output is diagnostic only; IPC uses its own inherited fd.
     with runtime_settings(args.target_distance) as settings, contextlib.redirect_stdout(sys.stderr):
+        snapshot.startup.begin("configuration")
+        guard.ensure_live()
         return module.main(runtime_arguments(args, settings))
 
 
@@ -443,34 +605,15 @@ def check_configuration(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--camera", choices=("config", "astra-pro", "gemini335"), default="config")
-    parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--check-config", action="store_true")
-    gestures = parser.add_mutually_exclusive_group()
-    gestures.add_argument("--gestures", dest="gestures", action="store_true", default=False)
-    gestures.add_argument("--no-gestures", dest="gestures", action="store_false")
-    parser.add_argument("--gesture-resume", choices=("Closed_Fist", "Thumb_Up"), default="Closed_Fist")
-    parser.add_argument("--target-distance", type=float)
-    parser.add_argument("--avoidance", choices=("off", "shadow", "on"), default="off")
-    reverse = parser.add_mutually_exclusive_group()
-    reverse.add_argument("--reverse-follow", dest="reverse_follow", action="store_true", default=False)
-    reverse.add_argument("--no-reverse-follow", dest="reverse_follow", action="store_false")
-    parser.add_argument("--reverse-distance", type=float)
+    add_follow_arguments(parser)
+    parser.add_argument("--offline-until-gesture", action="store_true")
     parser.add_argument("--parent-pid", type=int)
     parser.add_argument("--lock-fd", type=int)
     parser.add_argument("--status-fd", type=int, default=1)
     args = parser.parse_args()
-    if args.dry_run and args.execute:
-        parser.error("dry-run cannot execute motors")
-    if args.check_config and (args.dry_run or args.execute):
-        parser.error("check-config cannot use dry-run or execute")
-    for name, value in (("target-distance", args.target_distance),
-                        ("reverse-distance", args.reverse_distance)):
-        if value is not None and (not math.isfinite(value) or not .5 <= value <= 5.):
-            parser.error(f"{name} must be a finite distance from 0.5 to 5 metres")
-    if args.avoidance == "on" and args.camera != "astra-pro":
-        parser.error("avoidance on requires camera astra-pro")
+    validate_follow_arguments(parser, args)
+    if args.offline_until_gesture and not args.gestures:
+        parser.error("--offline-until-gesture requires --gestures")
     if args.check_config:
         return check_configuration(args)
     if args.parent_pid is None:
@@ -482,8 +625,9 @@ def main():
         expected = MOTOR_LOCK.stat()
         if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
             parser.error("invalid inherited motor ownership lock")
-    guard = LeaseGuard(args.parent_pid)
+    guard = LeaseGuard(args.parent_pid, allow_offline=args.offline_until_gesture)
     snapshot = FollowSnapshot(args.camera, args.execute)
+    guard.startup_check = snapshot.check_startup
     guard.start(sys.stdin.buffer)
     for name in ("SIGTERM", "SIGINT", "SIGHUP"):
         if hasattr(signal, name):

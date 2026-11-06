@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-from dataclasses import dataclass
 import hmac
 import json
-import math
 import os
 from pathlib import Path
 import queue
@@ -19,40 +17,17 @@ import threading
 import time
 
 from app_diagnostic_log import DiagnosticLog, NullDiagnosticLog, report_unavailable_async
+from app_follow_options import FollowOptions, add_follow_arguments, validate_follow_arguments
+from app_follow_lifecycle import STARTUP_TIMEOUT_SECONDS, STAGE_TIMEOUT_SECONDS
 
 RUNTIME_ROOT = Path("/home/topeet/Desktop/rk_car_runtime_module")
 MOTOR_LOCK = Path("/home/topeet/lianzhan/.app_joystick.lock")
 FOLLOW_LOCK = RUNTIME_ROOT / ".follow_session.lock"
 WATCHDOG_SECONDS = 2.0
 STOP_TIMEOUT_SECONDS = 8.0
+FINAL_STATUS_TIMEOUT_SECONDS = 1.0
 REQUEST_KEYS = {"seq", "token", "cmd", "runId"}
 MAX_LINE = 1024
-
-
-@dataclass(frozen=True)
-class FollowOptions:
-    gestures: bool = False
-    gesture_resume: str = "Closed_Fist"
-    target_distance: float | None = None
-    avoidance: str = "off"
-    reverse_follow: bool = False
-    reverse_distance: float | None = None
-
-    def command_args(self):
-        result = ["--gestures" if self.gestures else "--no-gestures",
-                  "--gesture-resume", self.gesture_resume,
-                  "--avoidance", self.avoidance,
-                  "--reverse-follow" if self.reverse_follow else "--no-reverse-follow"]
-        if self.target_distance is not None:
-            result.extend(("--target-distance", str(self.target_distance)))
-        if self.reverse_distance is not None:
-            result.extend(("--reverse-distance", str(self.reverse_distance)))
-        return result
-
-    def response(self):
-        return dict(targetDistanceM=self.target_distance, gesturesEnabled=self.gestures,
-                    resumeGesture=self.gesture_resume, avoidance=self.avoidance,
-                    reverseEnabled=self.reverse_follow, reverseDistanceM=self.reverse_distance)
 
 
 class SessionError(RuntimeError):
@@ -174,9 +149,14 @@ class JsonOutput:
 
 
 class FollowProcess:
-    def __init__(self, camera, execute, dry_run, lock_fd=None, options=None):
+    def __init__(self, camera, execute, dry_run, lock_fd=None, options=None,
+                 offline_until_gesture=False):
         self.camera, self.execute, self.dry_run = camera, execute, dry_run
         self.options = options or FollowOptions()
+        if offline_until_gesture and not self.options.gestures:
+            raise SessionError("Offline follow requires enabled gestures")
+        self.offline_until_gesture = offline_until_gesture
+        self.network_detached = False
         self.lock_fd = lock_fd
         self.process = None
         self.latest = None
@@ -188,6 +168,7 @@ class FollowProcess:
         self.reason = None
         self.fault = None
         self.started_at = None
+        self.exited_at = None
         self.diagnostic = NullDiagnosticLog()
         self._logged_fault = None
         self._logged_exit = False
@@ -202,6 +183,8 @@ class FollowProcess:
         command = [sys.executable, "-u", str(worker), "--camera", self.camera,
                    "--parent-pid", str(os.getpid())]
         command.extend(self.options.command_args())
+        if self.offline_until_gesture:
+            command.append("--offline-until-gesture")
         if self.dry_run:
             command.append("--dry-run")
         elif self.execute:
@@ -236,12 +219,15 @@ class FollowProcess:
         stream = os.fdopen(status_read, "rb") if status_read is not None else self.process.stdout
         def read_status():
             last_state = last_log_dir = None
+            final_seen = False
             try:
                 with stream:
                     while True:
                         line = stream.readline(16 * 1024 + 1)
                         if not line:
                             return
+                        if final_seen:
+                            raise SessionError("Worker status arrived after final publication")
                         if len(line) > 16 * 1024 or not line.endswith(b"\n"):
                             raise SessionError("Worker status too large")
                         value = json.loads(line)
@@ -250,6 +236,7 @@ class FollowProcess:
                             raise SessionError("Invalid worker status")
                         with self.data_lock:
                             self.latest, self.latest_at = value, time.monotonic()
+                        final_seen = value.get("workerFinal") is True
                         if value.get("runState") != last_state or value.get("logDir") != last_log_dir:
                             last_state, last_log_dir = value.get("runState"), value.get("logDir")
                             self.diagnostic.event("worker_state", critical=True,
@@ -279,6 +266,31 @@ class FollowProcess:
                 self.diagnostic.failure("worker_lease_write_failed", error, phase="lease_write")
                 self.request_stop("app_lease_write_failed")
 
+    def set_network_detached(self, detached):
+        """Only the independent supervisor uses D/C; its local worker lease stays live.
+
+        Losing that supervisor, its pipe, or its health pulses still stops the worker.
+        A reconnect never clears a stop already accepted by this process.
+        """
+        if type(detached) is not bool or not self.offline_until_gesture:
+            raise SessionError("Offline follow mode was not negotiated")
+        process = self.process
+        if self.stop_at is not None or process is None or process.poll() is not None:
+            return
+        if self.network_detached == detached:
+            return
+        try:
+            payload = b"D\n" if detached else b"C\n"
+            if os.write(process.stdin.fileno(), payload) != len(payload):
+                raise OSError("partial network state write")
+            self.network_detached = detached
+            self.diagnostic.event("worker_network_state", critical=True,
+                                  detached=detached, workerPid=process.pid)
+        except OSError as error:
+            self.fault = self.fault or f"Worker network state failed: {error}"[:600]
+            self.diagnostic.failure("worker_network_state_failed", error, phase="lease_write")
+            self.request_stop("app_lease_write_failed")
+
     def request_stop(self, reason="app_stop_requested"):
         self.diagnostic.stop_requested(reason, alreadyRequested=self.stop_at is not None,
                                        workerPid=getattr(self.process, "pid", None))
@@ -306,15 +318,24 @@ class FollowProcess:
         exited = process is None or process.poll() is not None
         if exited and process is not None:
             self.reader.join(.05)  # Drain final IPC before reporting process exit.
+            if self.exited_at is None:
+                self.exited_at = now
+        final_status_pending = (exited and process is not None and self.reader.is_alive())
+        final_status_timed_out = (final_status_pending
+            and now - self.exited_at >= FINAL_STATUS_TIMEOUT_SECONDS)
+        if final_status_timed_out:
+            final_status_pending = False
         with self.data_lock:
             status = dict(self.latest) if self.latest is not None else dict(
                 runState="STOPPED" if process is None else "STARTING", execute=self.execute,
                 camera=self.camera, target=None, range=None, command=None, feedback=None,
-                behavior=None, reason=None, logDir=None,
+                behavior=None, reason=None, logDir=None, startup=None,
                 stop=dict(requested=False, acknowledged=None, physicalStopped=None), fault=None)
             age = max(0., now - self.latest_at) if self.latest_at else 0.
         status["statusAgeMs"] = int(age * 1000)
         status["processExited"] = exited
+        status["finalStatusPending"] = final_status_pending
+        worker_final = status.pop("workerFinal", False)
         status["execute"], status["camera"] = self.execute, self.camera
         status["stop"] = dict(status["stop"], physicalStopped=None)
         for key in ("target", "range", "feedback"):
@@ -326,6 +347,14 @@ class FollowProcess:
             status["range"] = None
         if age > .6:
             status["command"] = status["behavior"] = None
+        startup = status.get("startup")
+        if isinstance(startup, dict):
+            startup = dict(startup)
+            if not startup.get("completed"):
+                for key in ("stageElapsedMs", "totalElapsedMs"):
+                    if type(startup.get(key)) in (int, float):
+                        startup[key] += int(age * 1000)
+            status["startup"] = startup
         if self.stop_at is not None:
             status["stop"]["requested"] = True
             status["reason"] = self.reason
@@ -334,19 +363,44 @@ class FollowProcess:
                 if now - self.stop_at >= STOP_TIMEOUT_SECONDS:
                     self.fault = "停止超时，跟随进程仍未退出；停车结果未确认"
         if self.protocol_error:
-            self.fault = "Worker status failed: " + self.protocol_error
+            self.fault = self.fault or "Worker status failed: " + self.protocol_error
         if process is not None and not exited and self.latest_at and age > WATCHDOG_SECONDS:
-            self.fault = "Worker status expired"
+            self.fault = self.fault or "Worker status expired"
         if (process is not None and not exited and not self.latest_at
+                and self.stop_at is None
                 and self.started_at is not None and now - self.started_at > 5.):
             self.fault = "跟随启动未回应，已请求停止"
+        startup_timed_out = (process is not None and not exited and self.stop_at is None
+            and not self.fault and status["runState"] == "STARTING"
+            and self.started_at is not None
+            and now - self.started_at >= STARTUP_TIMEOUT_SECONDS)
+        if startup_timed_out:
+            self.fault = "跟随初始化超时，已请求停止"
+        if (not startup_timed_out and process is not None and not exited
+                and self.stop_at is None and not self.fault and status["runState"] == "STARTING"
+                and isinstance(startup, dict) and not startup.get("completed")):
+            stage, elapsed = startup.get("stage"), startup.get("stageElapsedMs")
+            budget = STAGE_TIMEOUT_SECONDS.get(stage) if isinstance(stage, str) else None
+            if budget is not None and type(elapsed) in (int, float) and elapsed >= budget * 1000:
+                startup_timed_out = True
+                self.fault = f"跟随初始化阶段超时（{stage}，{budget:g}s），已请求停止"
+        child_fault = status.get("fault")
+        if child_fault:
+            self.fault = self.fault or str(child_fault)[:600]
+        if final_status_timed_out:
+            self.fault = self.fault or "Worker final status incomplete; cleanup result unknown"
+        elif (exited and process is not None and not final_status_pending
+                and worker_final is not True):
+            self.fault = self.fault or "Worker final status missing; cleanup result unknown"
         if self.fault and self.fault != self._logged_fault:
             self._logged_fault = self.fault
             self.diagnostic.failure("worker_status_failed", self.fault, phase="worker_status",
                                     statusAgeMs=int(age * 1000), workerPid=getattr(process, "pid", None))
         if self.fault and not exited and self.stop_at is None:
-            self.request_stop("app_status_failed")
+            self.request_stop("app_startup_timeout" if startup_timed_out else
+                              "app_worker_fault" if child_fault else "app_status_failed")
             status["stop"]["requested"] = True
+            status["reason"] = self.reason
         if exited and process is not None:
             code = process.returncode
             status["exitCode"] = code
@@ -355,7 +409,7 @@ class FollowProcess:
             if code and not self.fault and not status.get("fault"):
                 self.fault = (self.stderr_tail.decode("utf-8", errors="replace").strip()
                               or f"Follow worker exited with code {code}")[-600:]
-            status["runState"] = "STOPPED"
+            status["runState"] = "STOPPING" if final_status_pending else "STOPPED"
         if self.fault or status.get("fault"):
             status["fault"] = self.fault or status["fault"]
             status["runState"] = "FAULT"
@@ -381,13 +435,20 @@ class FollowProcess:
         # Never unlock or SIGKILL a still-running motor owner. The child also
         # owns the lock and independently observes stdin EOF/parent death/lease.
         while self.process.poll() is None:
+            # A lost App connection must not also silence shutdown diagnostics.
+            # This only observes the owner; it never writes motor packets or
+            # unlocks/force-kills a worker whose cleanup is still in progress.
+            self.status()
             try:
                 self.process.wait(timeout=.2)
             except subprocess.TimeoutExpired:
                 pass
-        self.status()
+        status = self.status()
+        while status["finalStatusPending"]:
+            status = self.status()
         self.diagnostic.event("cleanup_completed", critical=True, workerPid=self.process.pid,
                               exitCode=self.process.returncode)
+        return status
 
 
 class ProtocolSession:
@@ -428,7 +489,8 @@ class ProtocolSession:
         else:
             self.process.pulse()
         status = self.process.status()
-        terminal = status["processExited"] and (self.process.process is not None or command in ("stop", "close"))
+        terminal = (status["processExited"] and not status.get("finalStatusPending", False)
+                    and (self.process.process is not None or command in ("stop", "close")))
         seq = self.sequence
         self.sequence += 1
         self.token = secrets.token_hex(16)
@@ -486,6 +548,7 @@ def run_session(process, stopped: threading.Event, diagnostic_directory=None):
                              terminal=reply["terminal"], runState=reply["status"]["runState"],
                              processExited=reply["status"]["processExited"])
             if reply["terminal"]:
+                failed = bool(reply["status"].get("fault"))
                 diagnostic.event("terminal_sent", critical=True, seq=reply["seq"])
                 break
     except Exception as error:
@@ -506,7 +569,9 @@ def run_session(process, stopped: threading.Event, diagnostic_directory=None):
             output.send(dict(type="error", error=str(error)[:600], status=process.status(), terminal=False))
     finally:
         try:
-            process.cleanup()
+            final_status = process.cleanup()
+            if isinstance(final_status, dict) and final_status.get("fault"):
+                failed = True
         except Exception as error:
             failed = True
             diagnostic.failure("cleanup_failed", error, phase="cleanup")
@@ -523,43 +588,22 @@ def run_session(process, stopped: threading.Event, diagnostic_directory=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--camera", choices=("config", "astra-pro", "gemini335"), default="config")
-    parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    add_follow_arguments(parser)
     parser.add_argument("--inspect", action="store_true")
-    parser.add_argument("--check-config", action="store_true")
-    gestures = parser.add_mutually_exclusive_group()
-    gestures.add_argument("--gestures", dest="gestures", action="store_true", default=False)
-    gestures.add_argument("--no-gestures", dest="gestures", action="store_false")
-    parser.add_argument("--gesture-resume", choices=("Closed_Fist", "Thumb_Up"), default="Closed_Fist")
-    parser.add_argument("--target-distance", type=float)
-    parser.add_argument("--avoidance", choices=("off", "shadow", "on"), default="off")
-    reverse = parser.add_mutually_exclusive_group()
-    reverse.add_argument("--reverse-follow", dest="reverse_follow", action="store_true", default=False)
-    reverse.add_argument("--no-reverse-follow", dest="reverse_follow", action="store_false")
-    parser.add_argument("--reverse-distance", type=float)
     args = parser.parse_args()
     if args.inspect:
         if len(sys.argv) != 2:
             parser.error("--inspect must be used alone")
         print(json.dumps(inspect_availability(), ensure_ascii=True))
         return 0
-    if args.dry_run and args.execute:
-        parser.error("dry-run cannot execute motors")
-    if args.check_config and (args.dry_run or args.execute):
-        parser.error("check-config cannot use dry-run or execute")
-    for name, value in (("target-distance", args.target_distance),
-                        ("reverse-distance", args.reverse_distance)):
-        if value is not None and (not math.isfinite(value) or not .5 <= value <= 5.):
-            parser.error(f"{name} must be a finite distance from 0.5 to 5 metres")
-    if args.avoidance == "on" and args.camera != "astra-pro":
-        parser.error("avoidance on requires camera astra-pro")
-    options = FollowOptions(args.gestures, args.gesture_resume, args.target_distance,
-                            args.avoidance, args.reverse_follow, args.reverse_distance)
+    validate_follow_arguments(parser, args)
+    options = FollowOptions.from_namespace(args)
     if args.check_config:
         worker = Path(__file__).with_name("app_follow_worker.py")
         command = [sys.executable, "-u", str(worker), "--check-config", "--camera", args.camera]
         command.extend(options.command_args())
+        if args.execute:
+            command.append("--execute")
         return subprocess.call(command)
     stopped = SignalFlag()
     for name in ("SIGTERM", "SIGINT", "SIGHUP"):

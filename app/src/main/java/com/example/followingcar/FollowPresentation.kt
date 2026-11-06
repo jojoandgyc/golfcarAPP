@@ -37,6 +37,11 @@ internal fun followPresentation(state: BoardUiState, nowElapsedMs: Long? = null)
         else FollowPresentation("跟随程序已退出", "本次会话已结束；这不代表车轮已经停稳。")
     }
     if (state.followUncertain) {
+        if (state.followReconnectable) return FollowPresentation(
+            if (state.followStopPending) "停止请求待确认" else if (state.followDetached) "通信中断，等待接回" else "原会话待确认",
+            if (state.followStopPending) "重连后将优先停止原会话；当前尚未确认停车。"
+            else if (state.followDetached) "车端可能仍在跟随；停车手势可结束。重连会接回原会话，不会重复启动。"
+            else "原会话发生异常，请重新接回确认；不会自动创建新跟随。")
         return FollowPresentation("状态待确认", if (state.connected)
             "上次跟随是否结束尚未确认，请检查控制占用；停车结果未知。"
         else "请重新连接开发板；进程退出和车辆停稳尚未确认。")

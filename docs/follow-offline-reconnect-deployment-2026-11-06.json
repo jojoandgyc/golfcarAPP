@@ -1,0 +1,114 @@
+{
+  "recordedAtUtc": "2026-11-06T06:10:01.837091+00:00",
+  "app": {
+    "versionCode": 36,
+    "versionName": "1.8.25-follow-reconnect",
+    "apkSha256": "ffa457fa40490833262f1d32f1322920ccf58e8aee7f181c3fec674162c2941d",
+    "installedOnPhysicalPhone": true,
+    "installedAtUtc": "2026-11-06T06:04:40.342814+00:00",
+    "connectionPreferencesPreserved": true,
+    "encryptedHotspotCredentialsPreserved": true
+  },
+  "policy": {
+    "scope": "Only automatic follow with gestures enabled opts into reconnectable sessions.",
+    "networkLoss": "SSH EOF, attachment heartbeat expiry or output loss detaches the App; supervisor and original worker remain alive.",
+    "offlineStopGesture": "Fresh confirmed Open_Palm after detachment requests stop and exit, including when the normal gesture gate was already PAUSED.",
+    "reconnect": "Attach to the original authenticated runId with a fresh token and sequence; never launch another worker.",
+    "explicitStop": "Accepted stops remain sticky across lost ACK, network loss and App restart; pending App stops are sent first after attach.",
+    "noGestures": "Uses original bridge and original disconnect stop policy.",
+    "connectedBehavior": "Existing gesture pause/resume, user stop, page leave, background and focus rules remain.",
+    "otherFailures": "Local worker lease/status/parent checks and runtime faults still stop. Protocol corruption locks a stop intent; it is not classified as ordinary network loss.",
+    "ui": "Show detached/unknown or stop-pending status; offer original-session reattach and deferred stop; do not claim remote stop was confirmed."
+  },
+  "architecture": {
+    "launchEntry": "app_follow_session.py --launch --offline-until-gesture --gestures",
+    "attachEntry": "app_follow_session.py --attach-run <runId>",
+    "legacyEntry": "app_follow_bridge.py",
+    "workerLease": "Existing H/S semantics preserved; opt-in D/C changes only offline gesture policy and does not extend the local lease.",
+    "sessionStorage": ".app_follow_sessions (0700); uid-verified local socket (0600); bounded terminal archives without tokens.",
+    "terminalEvidence": "Archive final terminal state before sending its ACK; reattaching an exited run cannot restart it."
+  },
+  "board": {
+    "root": "/home/topeet/Desktop/rk_car_runtime_module",
+    "initialBackup": "/home/topeet/Desktop/rk_car_runtime_module/.app_follow_backups/20261106T060126Z",
+    "finalBackup": "/home/topeet/Desktop/rk_car_runtime_module/.app_follow_backups/20261106T060429Z",
+    "deployedAtUtc": "20261106T060429Z",
+    "sha256": {
+      "app_follow_bridge.py": "0132ee62fbd594d02229eb2769fa93b08a58ac546943345dd5d4b5d2f58bdb1c",
+      "app_follow_worker.py": "eac0cfc2d948d1dd70ea27e18bb46f3e1d707aef659c12ac6e66b187a9f2e1fe",
+      "app_follow_options.py": "9faa27522542adae834a6757fd7aa10f32e23a0efdd191bbc4c7e9ac4b3a1516",
+      "app_follow_lifecycle.py": "b039d23ed9ef8dd97f4e018d308d9891f2638cb7a5e1e599a4bb946da7ca2f0c",
+      "app_follow_session.py": "16336b8a70b0fb827e49eb8abcb3111225f91bf39cbf47ac56a4f6a03fe0f397"
+    },
+    "bothControlLocksHeldDuringUpdate": true,
+    "existingMotorParametersChanged": false,
+    "networkChanges": false,
+    "baselineNote": "Repository bridge/worker were behind deployed startup/final-status fixes. Synced the captured deployed baseline first; options/lifecycle contents match the prior deployed versions. Other runtime code was not changed."
+  },
+  "validation": {
+    "jvm": {
+      "tests": 369,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "androidEmulator": {
+      "uniquePassed": 51,
+      "initialSuitePassed": 48,
+      "finalChangedLifecycleSuitePassed": 17
+    },
+    "python": {
+      "uniquePassed": 78,
+      "initialCombinedSuitePassed": 76,
+      "finalChangedSessionSuitePassed": 21
+    },
+    "actualGestureGateSampleReplay": {
+      "passed": 6,
+      "cameraUsed": false,
+      "motorUsed": false
+    },
+    "physicalPhoneDryRun": {
+      "versionName": "1.8.25-follow-reconnect",
+      "dryRun": true,
+      "execute": false,
+      "realMotorCommandsSent": false,
+      "videoOperations": 0,
+      "radioChanges": 0,
+      "runId": "b13b3d3204304c4cdf7dfb66686dd593",
+      "sameRunResumed": true,
+      "survivedOriginalNetworkLease": true,
+      "terminalReceived": true,
+      "completedRunRemainsTerminal": true,
+      "controlAvailableAfter": true,
+      "passed": true
+    },
+    "physicalBoardDryRun": {
+      "passed": 3,
+      "tests": [
+        {
+          "name": "gesture_disconnect_and_same_worker_attach",
+          "runId": "2de5eb5c830eeb3c468e3702331ad4e0",
+          "passed": true
+        },
+        {
+          "name": "legacy_no_gestures_eof_stops_worker",
+          "runId": "7b2757165aed3eeacc399b827509c434",
+          "passed": true
+        },
+        {
+          "name": "accepted_stop_lost_ack_reattaches_terminal",
+          "runId": "6cbe0de098209000c0617b9c0e9dffba",
+          "passed": true
+        }
+      ],
+      "sameWorkerPidAndStartTicksAfterDisconnect": true,
+      "allOwnedWorkersExited": true,
+      "controlAvailableAfter": true
+    },
+    "realMotorTestsPerformed": false,
+    "physicalCameraGestureTestPerformed": false,
+    "phoneRadioChanges": 0
+  },
+  "evidenceDirectory": "E:\\Temp\\golfcar-follow-offline-2026-11-06",
+  "rollback": "While both control owners are idle, restore bridge/worker from initialBackup and remove the new session entry only after no persistent session remains; install saved pre-update APK. Do not replace a running supervisor/worker."
+}

@@ -3,7 +3,7 @@ package com.example.followingcar
 /** The initiating action is kept separately from subsequent channel cleanup. */
 enum class ControlStopSource {
     USER_STOP, EMERGENCY_STOP, PAGE_CHANGED, APP_PAUSED, WINDOW_FOCUS_LOST,
-    DISCONNECT, TRANSPORT_LOST, VIEW_MODEL_CLEARED, CONTROL_SURFACE_HIDDEN,
+    DISCONNECT, TRANSPORT_LOST, PROTOCOL_ERROR, VIEW_MODEL_CLEARED, CONTROL_SURFACE_HIDDEN,
 }
 
 /** A failed recovery check must not replace the first failure of the control session. */
@@ -22,7 +22,10 @@ internal fun BoardUiState.withTransportState(transportConnected: Boolean): Board
     )
 
 /** One unresolved control session survives rotation of the separate ten-entry fault history. */
-internal data class FollowRecoverySnapshot(val context: DiagnosticContext, val firstFailure: DiagnosticFailure? = null) {
+internal data class FollowRecoverySnapshot(
+    val context: DiagnosticContext, val firstFailure: DiagnosticFailure? = null,
+    val reconnectable: Boolean = false, val stopIntent: Boolean = false,
+) {
     /** Keep unresolved evidence in exports even after the ten-entry history has rotated. */
     fun exportMetadata(): Map<String, Any?> = mapOf(
         "pendingFollowOperationId" to context.operationId,
@@ -31,13 +34,17 @@ internal data class FollowRecoverySnapshot(val context: DiagnosticContext, val f
         "pendingFollowFirstFailureTime" to firstFailure?.time,
         "pendingFollowFirstFailureEvent" to firstFailure?.event,
         "pendingFollowFirstFailureMessage" to firstFailure?.message,
-    )
+    ) + if (reconnectable) mapOf("pendingFollowReconnectable" to true, "pendingFollowStopIntent" to stopIntent) else emptyMap()
 
     fun storedValues(): Map<String, String> = buildMap {
         put("pending", "true")
         put("operationId", context.operationId)
         context.connectionId?.let { put("connectionId", it) }
         context.runId?.let { put("runId", it) }
+        if (reconnectable) {
+            put("reconnectable", "true")
+            put("stopIntent", stopIntent.toString())
+        }
         firstFailure?.let {
             put("failureTime", it.time)
             put("failureEvent", it.event)
@@ -55,7 +62,11 @@ internal data class FollowRecoverySnapshot(val context: DiagnosticContext, val f
             val failureMessage = values["failureMessage"] as? String
             val first = if (failureTime != null && failureEvent != null && failureMessage != null)
                 DiagnosticFailure(failureTime, failureEvent, failureMessage, context) else null
-            return FollowRecoverySnapshot(context, first)
+            // Malformed new metadata must not authorize attach or silently discard a stop request.
+            val reconnectable = values["reconnectable"] == "true" &&
+                context.runId?.matches(Regex("[a-f0-9]{32}")) == true
+            return FollowRecoverySnapshot(context, first, reconnectable,
+                reconnectable && values["stopIntent"] != "false")
         }
     }
 }

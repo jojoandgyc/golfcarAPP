@@ -162,6 +162,32 @@ class FollowControlsTest {
         compose.runOnIdle { assertEquals(0, starts); assertEquals(0, inspections); assertEquals(1, connections) }
     }
 
+    @Test fun detachedPersistentRunOffersReconnectAndDeferredStopWithoutStarting() {
+        var starts = 0
+        var connections = 0
+        var inspections = 0
+        var stops = 0
+        val state = mutableStateOf(BoardUiState(followUncertain = true, followReconnectable = true,
+            followDetached = true))
+        compose.setContent {
+            TestPage(state.value, onStart = { starts++ }, onOpenConnection = { connections++ },
+                onInspect = { inspections++ }, onStop = {
+                    stops++
+                    state.value = state.value.copy(followStopPending = true)
+                })
+        }
+        compose.onNodeWithTag("startFollow").assertDoesNotExist()
+        compose.onNodeWithTag("recoverFollow").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("stopFollow").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("stopFollow").assertIsNotEnabled()
+        compose.runOnIdle {
+            assertEquals(0, starts); assertEquals(1, connections); assertEquals(1, stops); assertEquals(0, inspections)
+            state.value = state.value.copy(connected = true)
+        }
+        compose.onNodeWithTag("recoverFollow").performClick()
+        compose.runOnIdle { assertEquals(1, inspections); assertEquals(0, starts) }
+    }
+
     @Test fun staleDistanceAndMissingFeedbackStayUnknownInExpandedDetails() {
         compose.setContent { TestPage(ready().copy(followActive = true, followStatus = status().copy(rangeAgeMs = 900))) }
         openDetails()

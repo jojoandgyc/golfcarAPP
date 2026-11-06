@@ -133,7 +133,9 @@ internal fun FollowPage(
                         }
                     }
                 }
-                if (state.followUncertain) Text("上次控制是否结束尚未确认，控制保持锁定。",
+                if (state.followUncertain) Text(if (state.followReconnectable)
+                    "原跟随会话尚未确认结束，新跟随、手动和电机配置保持锁定。"
+                else "上次控制是否结束尚未确认，控制保持锁定。",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.testTag("followUncertainHint"))
                 state.followFirstFailure?.let { failure ->
@@ -210,6 +212,10 @@ internal fun FollowPage(
                     HorizontalDivider()
                     FollowToggle("手势启动", "识别所选手势后启动或恢复跟随", options.gesturesEnabled,
                         settingsEnabled, "followGestures") { onOptionsChange(options.copy(gesturesEnabled = it)) }
+                    Text(if (options.gesturesEnabled)
+                        "启用手势时，通信中断后车端继续跟随，停车手势结束会话；重连接回原会话。"
+                    else "未启用手势时，通信中断仍按原规则停止跟随。",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (options.gesturesEnabled) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FollowResumeGesture.entries.forEach { gesture ->
                             FilterChip(selected = options.resumeGesture == gesture, enabled = settingsEnabled,
@@ -234,6 +240,17 @@ internal fun FollowPage(
             Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 when {
+                    state.followUncertain && state.followReconnectable && !state.followActive -> {
+                        Button(onClick = if (state.connected) onInspect else onOpenConnection,
+                            enabled = !state.busy && (!state.connected || state.canInspectFollow),
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("recoverFollow")) {
+                            Text(if (state.connected) "接回原跟随会话" else "重新连接并接回")
+                        }
+                        OutlinedButton(onClick = onStop, enabled = !state.followStopPending,
+                            modifier = Modifier.fillMaxWidth().testTag("stopFollow")) {
+                            Text(if (state.followStopPending) "停止请求已记录，等待重连确认" else "请求停止原会话")
+                        }
+                    }
                     state.followActive || state.followStopping -> Button(onClick = onStop,
                         enabled = !state.followStopping, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                         modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("stopFollow")) {

@@ -271,13 +271,205 @@ class FollowLifecycleStateTest {
         assertTrue(engine.snapshot().events.map(::JSONObject).any { it.optString("event") == "follow.preflight_confirmed" })
     }
 
-    private suspend fun startFixture(holdReady: Boolean = false): Fixture {
+    @Test fun persistentEofKeepsRunAndReattachmentUsesHeartbeatWithoutVideoOrRestart() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        assertEquals("start", fixture.bridge.nextRequest().getString("cmd"))
+        fixture.bridge.respond(status("RUNNING"))
+        assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+        val originalRun = fixture.bridge.runId
+        fixture.bridge.endOutput()
+        awaitFinished(fixture)
+        val detached = fixture.vm.state.value
+        assertTrue(detached.followDetached)
+        assertTrue(detached.followReconnectable)
+        assertTrue(detached.followUncertain)
+        assertFalse(detached.followStopPending)
+        assertFalse(detached.canEnableDrive)
+        assertFalse(detached.canStartFollow)
+        withContext(Dispatchers.Main) {
+            fixture.vm.onControlSurfaceHidden("open connection page", ControlStopSource.PAGE_CHANGED)
+            fixture.vm.onControlSurfaceHidden("already detached background", ControlStopSource.APP_PAUSED)
+        }
+        assertFalse(fixture.vm.state.value.followStopPending)
+        val first = detached.followFirstFailure
+        reattachFixture(fixture)
+        assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+        assertEquals(originalRun, fixture.bridge.runId)
+        assertEquals(1, fixture.bridge.requests.single().getInt("seq"))
+        fixture.bridge.respond(status("RUNNING"))
+        fixture.bridge.nextRequest()
+        assertFalse(fixture.vm.state.value.followDetached)
+        assertFalse(fixture.vm.state.value.followUncertain)
+        assertEquals(first, fixture.vm.state.value.followFirstFailure)
+        assertTrue(fixture.vm.state.value.followActive)
+        assertFalse(fixture.bridge.commands().contains("start"))
+    }
+
+    @Test fun persistentStartAckLossAndExplicitStopSurviveAndStopIsFirstAfterAttach() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        fixture.bridge.nextRequest() // The board may already have started; its first ACK is lost.
+        withContext(Dispatchers.Main) { fixture.vm.stopFollow("explicit stop before lost ACK") }
+        fixture.bridge.endOutput()
+        awaitFinished(fixture)
+        assertTrue(fixture.vm.state.value.followStopPending)
+        val stored = application.getSharedPreferences("follow_recovery", Context.MODE_PRIVATE)
+        assertEquals("true", stored.getString("reconnectable", null))
+        assertEquals("true", stored.getString("stopIntent", null))
+        reattachFixture(fixture)
+        assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
+        fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+        awaitFinished(fixture)
+        assertFalse(fixture.vm.state.value.followUncertain)
+        assertFalse(fixture.vm.state.value.followReconnectable)
+        assertTrue(fixture.vm.state.value.followTerminal)
+        assertEquals(listOf("stop"), fixture.bridge.commands())
+        assertNull(stored.getString("runId", null))
+    }
+
+    @Test fun persistentAckTimeoutDropsSshButDoesNotInventStopIntent() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        fixture.bridge.nextRequest()
+        fixture.bridge.respond(status("RUNNING"))
+        fixture.bridge.nextRequest() // Bounded production 1200 ms timeout, no retransmission.
+        awaitFinished(fixture)
+        val failed = fixture.vm.state.value
+        assertFalse(failed.connected)
+        assertTrue(failed.followDetached)
+        assertTrue(failed.followUncertain)
+        assertFalse(failed.followStopPending)
+        assertFalse(fixture.bridge.commands().contains("stop"))
+        reattachFixture(fixture)
+        assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+        fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+        awaitFinished(fixture)
+        assertTrue(fixture.vm.state.value.followTerminal)
+    }
+
+    @Test fun persistentWorkerErrorIsNotMisreportedAsOfflineFollowingOrAnAppStopIntent() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        fixture.bridge.nextRequest()
+        fixture.bridge.failWithStatus(status("FAULT", fault = "invalid session protocol"))
+        awaitFinished(fixture)
+        assertFalse(fixture.vm.state.value.followDetached)
+        assertTrue(fixture.vm.state.value.followReconnectable)
+        assertTrue(fixture.vm.state.value.followUncertain)
+        assertFalse(fixture.vm.state.value.followStopPending)
+        assertEquals("原会话待确认", followPresentation(fixture.vm.state.value).title)
+    }
+
+    @Test fun persistentMalformedAckLatchesStopAndAutomaticallyReattachesBeforeStopping() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        val original = fixture.bridge
+        original.nextRequest()
+        original.respond(status("RUNNING"))
+        original.nextRequest()
+        val replacement = ScriptedFollowChannel(false, persistent = true, resumed = true, runId = original.runId)
+        requireNotNull(fixture.channels).add(replacement)
+        fixture.bridge = replacement
+        original.corruptReplySequence()
+        val stop = replacement.nextRequest()
+        assertEquals("stop", stop.getString("cmd"))
+        assertEquals(1, stop.getInt("seq"))
+        assertEquals(original.runId, stop.getString("runId"))
+        assertTrue(fixture.vm.state.value.followStopPending)
+        assertEquals("true", application.getSharedPreferences("follow_recovery", 0).getString("stopIntent", null))
+        replacement.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+        awaitFinished(fixture)
+        assertTrue(fixture.vm.state.value.followTerminal)
+        assertFalse(fixture.vm.state.value.followUncertain)
+        assertEquals(listOf("stop"), replacement.commands())
+    }
+
+    @Test fun persistentMalformedAckWithLostSshKeepsStopForTheNextAuthenticatedConnection() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        fixture.bridge.nextRequest()
+        fixture.socket.close() // Disable automatic attach; memory channel still supplies its invalid ACK.
+        fixture.bridge.corruptReplySequence()
+        awaitFinished(fixture)
+        assertFalse(fixture.vm.state.value.connected)
+        assertTrue(fixture.vm.state.value.followStopPending)
+        assertFalse(fixture.vm.state.value.followDetached)
+        assertEquals("停止请求待确认", followPresentation(fixture.vm.state.value).title)
+        reattachFixture(fixture)
+        assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
+        fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+        awaitFinished(fixture)
+    }
+
+    @Test fun missingArchivedSessionKeepsRunWithoutConvertingNormalAttachFailureToStop() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        fixture.bridge.nextRequest()
+        fixture.bridge.endOutput()
+        awaitFinished(fixture)
+        val missing = object : ChannelExec() {
+            private var connected = false
+            override fun connect(timeout: Int) { connected = true }
+            override fun isConnected(): Boolean = connected
+            override fun getInputStream(): InputStream =
+                ("{\"type\":\"error\",\"code\":\"session_not_found\",\"error\":\"not found\"}\n").byteInputStream()
+            override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+            override fun disconnect() { connected = false }
+        }
+        fixture.socket.close()
+        fixture.socket = Socket()
+        withContext(Dispatchers.Main) {
+            attachConnection(field(fixture.vm, "client") as BoardSshClient, DiagnosticTestSession(missing), fixture.socket)
+            fixture.vm.refreshFollowAvailability()
+        }
+        withTimeout(3_000) { (field(fixture.vm, "operation") as Job).join() }
+        awaitFinished(fixture)
+        assertTrue(fixture.vm.state.value.followUncertain)
+        assertTrue(fixture.vm.state.value.followReconnectable)
+        assertFalse(fixture.vm.state.value.followStopPending)
+        assertEquals("false", application.getSharedPreferences("follow_recovery", 0).getString("stopIntent", null))
+        // Avoid asking this intentionally missing archive to stop in the test fixture cleanup.
+        fixture.socket.close()
+    }
+
+    @Test fun persistentOnlineBackgroundStillSendsRealStopAndWaitsForTerminal() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        fixture.bridge.nextRequest()
+        fixture.bridge.respond(status("RUNNING"))
+        fixture.bridge.nextRequest()
+        withContext(Dispatchers.Main) {
+            fixture.vm.onControlSurfaceHidden("normal background", ControlStopSource.APP_PAUSED)
+        }
+        fixture.bridge.respond(status("RUNNING"))
+        assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
+        fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+        awaitFinished(fixture)
+        assertTrue(fixture.vm.state.value.followTerminal)
+    }
+
+    private suspend fun reattachFixture(fixture: Fixture) {
+        val previous = fixture.bridge
+        fixture.bridge = ScriptedFollowChannel(false, persistent = true, resumed = true, runId = previous.runId)
+        fixture.socket.close()
+        fixture.socket = Socket()
+        val session = object : DiagnosticTestSession(fixture.bridge) {
+            private var opened = false
+            override fun openChannel(type: String): Channel {
+                check(!opened) { "Attach must not open video/preflight/inspect or a second worker" }
+                opened = true
+                return fixture.bridge
+            }
+        }
+        withContext(Dispatchers.Main) {
+            attachConnection(field(fixture.vm, "client") as BoardSshClient, session, fixture.socket)
+            @Suppress("UNCHECKED_CAST")
+            val flow = field(fixture.vm, "mutableState") as MutableStateFlow<BoardUiState>
+            flow.value = flow.value.copy(connected = true, busy = false)
+            fixture.vm.refreshFollowAvailability()
+        }
+    }
+
+    private suspend fun startFixture(holdReady: Boolean = false, persistent: Boolean = false): Fixture {
         val vm = withContext(Dispatchers.Main) {
             val store = ViewModelStore().also(stores::add)
             ViewModelProvider(store, ViewModelProvider.AndroidViewModelFactory(application))[BoardViewModel::class.java]
         }
         withTimeout(3_000) { vm.state.first { !it.remoteProfileLoading } }
-        val bridge = ScriptedFollowChannel(holdReady)
+        val bridge = ScriptedFollowChannel(holdReady, persistent)
         val channels = ConcurrentLinkedQueue<ChannelExec>().apply { add(VideoStoppedChannel()); add(bridge) }
         val session = object : DiagnosticTestSession(bridge) {
             override fun openChannel(type: String): Channel {
@@ -286,14 +478,14 @@ class FollowLifecycleStateTest {
             }
         }
         val socket = Socket() // Never connected: this suite cannot send network traffic.
-        val fixture = Fixture(vm, bridge, socket).also(fixtures::add)
+        val fixture = Fixture(vm, bridge, socket, channels).also(fixtures::add)
         withContext(Dispatchers.Main) {
             attachConnection(field(vm, "client") as BoardSshClient, session, socket)
             @Suppress("UNCHECKED_CAST")
             val flow = field(vm, "mutableState") as MutableStateFlow<BoardUiState>
             flow.value = flow.value.copy(connected = true, status = "memory fixture connected",
                 remoteMode = false, followUncertain = false, followCamera = FollowCamera.CONFIG,
-                followExecute = false, followLaunchOptions = FollowLaunchOptions(),
+                followExecute = false, followLaunchOptions = FollowLaunchOptions(gesturesEnabled = persistent),
                 pairingBusy = false, pairingUnconfirmed = false)
             assertTrue(vm.state.value.canStartFollow)
             vm.startFollow(dryRun = true)
@@ -352,7 +544,8 @@ class FollowLifecycleStateTest {
     private fun field(vm: BoardViewModel, name: String): Any? =
         BoardViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm)
 
-    private data class Fixture(val vm: BoardViewModel, val bridge: ScriptedFollowChannel, val socket: Socket)
+    private data class Fixture(val vm: BoardViewModel, var bridge: ScriptedFollowChannel, var socket: Socket,
+        val channels: ConcurrentLinkedQueue<ChannelExec>? = null)
     private data class PreflightFixture(val control: Fixture, val preflight: DelayedPreflightChannel,
         val opened: CopyOnWriteArrayList<String>)
 
@@ -363,7 +556,8 @@ class FollowLifecycleStateTest {
         override fun read(): Int = bytes.poll() ?: -1
     }
 
-    private class ScriptedFollowChannel(private val holdReady: Boolean) : ChannelExec() {
+    private class ScriptedFollowChannel(private val holdReady: Boolean, private val persistent: Boolean = false,
+        private val resumed: Boolean = false, val runId: String = UUID.randomUUID().toString().replace("-", "")) : ChannelExec() {
         private val input = QueuedInput()
         private val buffer = ByteArrayOutputStream()
         private val lock = Any()
@@ -373,7 +567,6 @@ class FollowLifecycleStateTest {
         private var pending: JSONObject? = null
         private var readySent = false
         private var cleanup = false
-        private val runId = UUID.randomUUID().toString().replace("-", "")
         @Volatile private var connected = false
         @Volatile private var closed = false
         @Volatile private var eof = false
@@ -381,8 +574,9 @@ class FollowLifecycleStateTest {
         val connectedSignal = CompletableDeferred<Unit>()
 
         override fun setCommand(command: String) {
-            check(command.contains("app_follow_bridge.py"))
-            check(command.contains(" --dry-run") && !command.contains(" --execute"))
+            check(command.contains(if (persistent) "app_follow_session.py" else "app_follow_bridge.py"))
+            if (resumed) check(command.endsWith("--attach-run $runId"))
+            else check(command.contains(" --dry-run") && !command.contains(" --execute"))
         }
         override fun connect(timeout: Int) {
             connected = true
@@ -394,11 +588,12 @@ class FollowLifecycleStateTest {
             readySent = true
             input.append(JSONObject().put("type", "ready").put("runId", runId).put("token", token)
                 .put("dryRun", true).put("execute", false).put("camera", "config")
+                .put("reconnectable", persistent).put("offlineUntilGesture", persistent).put("resumed", resumed)
                 .put("heartbeatMs", 500).put("watchdogMs", 2000)
                 .put("options", JSONObject().put("targetDistanceM", JSONObject.NULL)
-                    .put("gesturesEnabled", false).put("resumeGesture", "Closed_Fist")
+                    .put("gesturesEnabled", persistent).put("resumeGesture", "Closed_Fist")
                     .put("avoidance", "off").put("reverseEnabled", false).put("reverseDistanceM", JSONObject.NULL))
-                .put("status", status("STOPPED", exited = true)))
+                .put("status", if (resumed) status("RUNNING") else status("STOPPED", exited = true)))
         }
         override fun getInputStream(): InputStream = input
         override fun getOutputStream(): OutputStream = object : OutputStream() {
@@ -433,6 +628,13 @@ class FollowLifecycleStateTest {
             input.append(JSONObject().put("type", "error").put("error", "bridge session failed")
                 .put("status", snapshot).put("terminal", false))
             eof = true
+        }
+        fun corruptReplySequence() = synchronized(lock) {
+            val request = checkNotNull(pending)
+            pending = null
+            input.append(JSONObject().put("type", "ack").put("seq", request.getLong("seq") + 100)
+                .put("runId", runId).put("token", tokenFor(999)).put("status", status("RUNNING"))
+                .put("terminal", false))
         }
         fun endOutput() { eof = true }
         fun finishForCleanup() = synchronized(lock) {

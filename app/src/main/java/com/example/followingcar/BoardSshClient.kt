@@ -343,13 +343,32 @@ class BoardSshClient {
         camera: FollowCamera, execute: Boolean, dryRun: Boolean = false,
         options: FollowLaunchOptions = FollowLaunchOptions(),
         diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+        reconnectable: Boolean = false,
     ): BoardFollowChannel = withContext(Dispatchers.IO) {
         operations.withLock {
             val active = synchronized(stateLock) {
                 connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
             } ?: throw IOException("尚未连接开发板，请先连接")
             val context = diagnostic.copy(connectionId = active.diagnostic.connectionId)
-            BoardFollowChannel.open(active.session, camera, execute, dryRun, options, context) { reason, failureContext ->
+            BoardFollowChannel.open(active.session, camera, execute, dryRun, options, context,
+                reconnectable = reconnectable) { reason, failureContext ->
+                invalidateTransport(active, reason, failureContext)
+            }
+        }
+    }
+
+    /** Reattaches to one existing run; this command never launches or restarts a worker. */
+    suspend fun attachFollowChannel(
+        runId: String, diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
+    ): BoardFollowChannel = withContext(Dispatchers.IO) {
+        require(runId.matches(Regex("[a-f0-9]{32}"))) { "恢复会话编号无效" }
+        operations.withLock {
+            val active = synchronized(stateLock) {
+                connection?.takeIf { it.ready && it.session.isConnected && !it.socket.isClosed }
+            } ?: throw IOException("尚未连接开发板，请先连接")
+            BoardFollowChannel.open(active.session, FollowCamera.CONFIG, false, false, FollowLaunchOptions(),
+                diagnostic.copy(connectionId = active.diagnostic.connectionId, runId = runId),
+                reconnectable = true, attachRunId = runId) { reason, failureContext ->
                 invalidateTransport(active, reason, failureContext)
             }
         }

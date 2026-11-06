@@ -94,8 +94,27 @@ data class FollowStatus(
 )
 
 data class FollowReply(val status: FollowStatus, val terminal: Boolean)
-data class FollowReady(val runId: String, val dryRun: Boolean, val execute: Boolean, val camera: FollowCamera)
+data class FollowReady(
+    val runId: String, val dryRun: Boolean, val execute: Boolean, val camera: FollowCamera,
+    val reconnectable: Boolean = false, val offlineUntilGesture: Boolean = false,
+    val resumed: Boolean = false, val options: FollowLaunchOptions = FollowLaunchOptions(),
+)
 data class FollowAvailability(val controlAvailable: Boolean, val reason: String?)
+
+/** Attach learns the immutable launch parameters from the authenticated board, never from UI drafts. */
+internal fun parseFollowLaunchOptions(json: JSONObject, camera: FollowCamera): FollowLaunchOptions {
+    fun distance(key: String): Double? = if (json.has(key) && json.isNull(key)) null else json.strictNumber(key)
+    val gesture = FollowResumeGesture.entries.find { it.argument == json.strictString("resumeGesture") }
+        ?: throw IOException("跟随启动手势无效")
+    val avoidance = json.strictString("avoidance")
+    followRequire(avoidance in setOf("on", "off"), "跟随避障选项无效")
+    return FollowLaunchOptions(distance("targetDistanceM"), json.strictBoolean("gesturesEnabled"), gesture,
+        avoidance == "on", json.strictBoolean("reverseEnabled"), distance("reverseDistanceM")).also {
+        try { it.validate(camera) } catch (failure: IllegalArgumentException) {
+            throw IOException("跟随会话参数无效", failure)
+        }
+    }
+}
 
 /** The launcher may print camera diagnostics before its one, complete configuration object. */
 internal fun parseFollowConfiguration(

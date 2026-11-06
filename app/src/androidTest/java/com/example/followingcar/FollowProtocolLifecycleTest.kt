@@ -255,9 +255,63 @@ class FollowProtocolLifecycleTest {
         assertEquals(0, fake.sent.size())
     }
 
-    private suspend fun open(fake: FakeChannel): BoardFollowChannel = BoardFollowChannel.open(
-        DiagnosticTestSession(fake), FollowCamera.CONFIG, false, true, FollowLaunchOptions(),
-        Diagnostics.newContext(),
+    @Test fun persistentLaunchRequiresCapabilityAndNeverSilentlyFallsBack() = runBlocking {
+        val missing = FakeChannel(wire(ready().apply { getJSONObject("options").put("gesturesEnabled", true) }))
+        assertTrue(runCatching { open(missing, reconnectable = true) }.exceptionOrNull() is FollowProtocolException)
+        assertTrue(missing.requests().isEmpty())
+        val valid = FakeChannel(wire(persistentReady(), ack(1, status("RUNNING"))))
+        val control = open(valid, reconnectable = true)
+        assertTrue(valid.commandText.contains("app_follow_session.py --launch --offline-until-gesture"))
+        assertTrue(control.ready.reconnectable)
+        assertFalse(control.ready.resumed)
+        control.start()
+        assertEquals(listOf("start"), valid.requests().map { it.getString("cmd") })
+    }
+
+    @Test fun attachUsesNewNonceAndAuthoritativeParametersWithoutStartOrLaunchArguments() = runBlocking {
+        val metadata = persistentReady(resumed = true).put("dryRun", false).put("execute", true)
+            .put("camera", "astra-pro").put("status", status("RUNNING").put("camera", "astra-pro").put("execute", true))
+        metadata.getJSONObject("options").put("avoidance", "on").put("targetDistanceM", 1.7)
+        val fake = FakeChannel(wire(metadata,
+            ack(1, status("RUNNING").put("camera", "astra-pro").put("execute", true))))
+        val control = open(fake, attachRunId = runId)
+        assertEquals("python3 -u $FOLLOW_PROJECT_ROOT/app_follow_session.py --attach-run $runId", fake.commandText)
+        assertEquals(FollowCamera.ASTRA_PRO, control.ready.camera)
+        assertEquals(1.7, control.ready.options.targetDistanceMeters!!, 0.0)
+        assertTrue(control.ready.execute)
+        assertFalse(control.ready.dryRun)
+        assertTrue(runCatching { control.start() }.exceptionOrNull() is IllegalStateException)
+        control.heartbeat()
+        assertEquals(listOf("heartbeat"), fake.requests().map { it.getString("cmd") })
+        assertEquals(1, fake.requests().single().getInt("seq"))
+        assertEquals(token(0), fake.requests().single().getString("token"))
+    }
+
+    @Test fun archivedTerminalCanBeAttachedAndConfirmedWithoutStartingAWorker() = runBlocking {
+        val fake = FakeChannel(wire(persistentReady(true), ack(1, status("STOPPED", exited = true), terminal = true)))
+        val control = open(fake, attachRunId = runId)
+        assertTrue(control.heartbeat().terminal)
+        assertEquals(listOf("heartbeat"), fake.requests().map { it.getString("cmd") })
+    }
+
+    @Test fun attachRejectsDifferentRunAndPreservesStructuredBusyCode() = runBlocking {
+        val wrong = FakeChannel(wire(persistentReady(true).put("runId", "d".repeat(32))))
+        assertTrue(runCatching { open(wrong, attachRunId = runId) }.exceptionOrNull() is FollowProtocolException)
+        assertTrue(wrong.requests().isEmpty())
+        val busy = FakeChannel(wire(JSONObject().put("type", "error").put("code", "session_busy").put("error", "busy")))
+        val error = runCatching { open(busy, attachRunId = runId) }.exceptionOrNull()
+        assertEquals("session_busy", (error as FollowSessionException).code)
+        assertFalse(error.isFollowCommunicationLoss())
+    }
+
+    private fun persistentReady(resumed: Boolean = false) = ready().put("reconnectable", true)
+        .put("offlineUntilGesture", true).put("resumed", resumed).apply {
+            getJSONObject("options").put("gesturesEnabled", true)
+        }
+
+    private suspend fun open(fake: FakeChannel, reconnectable: Boolean = false, attachRunId: String? = null): BoardFollowChannel = BoardFollowChannel.open(
+        DiagnosticTestSession(fake), FollowCamera.CONFIG, false, true, FollowLaunchOptions(gesturesEnabled = reconnectable),
+        Diagnostics.newContext(), reconnectable = reconnectable, attachRunId = attachRunId,
     ) { _, _ -> }.also { controls.add(it) }
 
     private fun events() = engine.snapshot().events.map(::JSONObject)
@@ -294,6 +348,8 @@ class FollowProtocolLifecycleTest {
             override fun read(): Int = data.read()
         }
         val sent = ByteArrayOutputStream()
+        var commandText: String = ""
+        override fun setCommand(command: String) { this.commandText = command }
         var errorOutput: OutputStream? = null
         @Volatile var connected = false
         @Volatile var eof = false
