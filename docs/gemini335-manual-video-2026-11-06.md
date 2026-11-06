@@ -15,4 +15,6 @@
 
 板端 35 项无硬件测试通过；App 378 项 JVM 测试、3 项模拟器聚焦界面测试通过。第一次真实相机测试遇到另一个进程短暂占用 USB，服务正确拒绝抢占；该进程自行退出后，第二次测试获得持续递增的 RGB／深度帧：`/api/health` 为 `ok=true`、`source_mode=gemini335`、`depth_status=ok`，RTSP 探测为 H.264 1920×540。结束后服务停止、相机设备无持有进程，控制锁和视频锁释放。全程未运行跟随或电机。
 
+模拟器运行 `GeminiManualVideoIntegrationTest` 通过（1/1，17.6 秒）：连接板端、选择 Gemini 335、启动视频、核对服务为 `RUNNING` 且相机来源为 Gemini、显示预览容器，然后关闭视频并断开。事后板端 `rgbd-video` 为 `inactive`、`MainPID=0`、`ExecMainStatus=0`。该测试验证控制流程，不验证真实手机的视频首帧解码。
+
 板端备份与哈希见[部署记录](gemini335-manual-video-board-deployment-2026-11-06.json)，真实采集指标见[板端测试记录](gemini335-manual-video-live-test-2026-11-06.json)，可复现补丁见[视频服务补丁](../board/patches/gemini335-manual-video-2026-11-06.patch)。本机保留带空闲锁及哈希前置检查的回滚脚本 `E:/Temp/gemini335_video_rollback.py`，尚未执行。手机真机 WebRTC 播放仍需在手机接回后确认；板端健康状态不能替代手机解码首帧验证。
