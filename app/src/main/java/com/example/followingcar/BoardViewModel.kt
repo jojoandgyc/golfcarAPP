@@ -151,7 +151,10 @@ internal fun BoardUiState.withVerifiedPairingNetwork(address: String): BoardUiSt
     pairingHotspotActive = true, error = null,
 )
 
-class BoardViewModel(application: Application) : AndroidViewModel(application) {
+class BoardViewModel @JvmOverloads internal constructor(
+    application: Application,
+    private val followBackground: FollowBackgroundController = FollowBackgroundController.None,
+) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("board_connection", 0)
     private val credentialPreferences = application.getSharedPreferences("board_credentials", 0)
     private val recoveryPreferences = application.getSharedPreferences("follow_recovery", 0)
@@ -1680,6 +1683,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        followBackground.stop()
         networkProbeJob?.cancel()
         networkMonitor.close()
         Diagnostics.event("viewmodel.cleared", activeDiagnostic(), source = ControlStopSource.VIEW_MODEL_CLEARED.name,
@@ -2439,7 +2443,12 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             var firstBoardFault: String? = if (recovery != null) current.followStatus?.fault else null
             var communicationLost = false
             var protocolStopRequired = false
+            var backgroundStarted = false
             try {
+                // Start the connected-device service while the user is still in the App.
+                // It keeps this same session's heartbeat alive when the Activity pauses.
+                followBackground.start()
+                backgroundStarted = true
                 val control = if (recovery != null) {
                     var attached: BoardFollowChannel? = null
                     for (attempt in 0..4) {
@@ -2579,6 +2588,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 Diagnostics.event("follow.cancelled", followDiagnostic, fields = mapOf("startAttempted" to startAttempted), critical = true)
                 throw cancelled
             } catch (failure: Exception) {
+                if (recovery != null && !backgroundStarted) {
+                    // This run already exists on the board. A synchronous service-start failure
+                    // has no service callback, so retain the stop for the next authenticated attach.
+                    // Do not call stopFollow here: launch may not yet have assigned followJob,
+                    // and its detached recovery path could recursively launch another attachment.
+                    if (firstFollowStopSource == null) firstFollowStopSource = ControlStopSource.BACKGROUND_SERVICE_FAILED
+                    followStopRequested = true
+                    mutableState.update { it.copy(followStopPending = true) }
+                    persistFollowRecovery()
+                    Diagnostics.event("follow.stop_requested", followDiagnostic,
+                        source = ControlStopSource.BACKGROUND_SERVICE_FAILED.name,
+                        fields = mapOf("deferredUntilReattach" to true), critical = true)
+                }
                 communicationLost = failure.isFollowCommunicationLoss()
                 protocolStopRequired = failure is FollowProtocolException && startAttempted &&
                     state.value.followReconnectable && followDiagnostic.runId?.matches(Regex("[a-f0-9]{32}")) == true
@@ -2650,6 +2672,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 Diagnostics.event("follow.finished", followDiagnostic, source = firstFollowStopSource?.name,
                     fields = mapOf("uncertain" to uncertain, "terminalReceived" to terminal,
                         "transportConnected" to client.isConnected), critical = true)
+                followBackground.stop()
                 if (uncertain && protocolStopRequired && !followProtocolStopRecoveryAttempted &&
                     !disconnecting && client.isConnected) {
                     followProtocolStopRecoveryAttempted = true
@@ -2684,7 +2707,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         if (state.value.followReconnectable && (state.value.followDetached || followJob?.isActive != true)) {
             // Navigating to connection settings/backgrounding an already detached App is not
             // a new stop intent. Explicit stop/disconnect must survive restart and a lost ACK.
-            if (source !in setOf(ControlStopSource.USER_STOP, ControlStopSource.EMERGENCY_STOP, ControlStopSource.DISCONNECT)) return
+            if (source !in setOf(ControlStopSource.USER_STOP, ControlStopSource.EMERGENCY_STOP,
+                    ControlStopSource.DISCONNECT, ControlStopSource.BACKGROUND_SERVICE_FAILED)) return
             if (firstFollowStopSource == null) firstFollowStopSource = source
             followStopRequested = true
             mutableState.update { it.copy(followStopPending = true,
@@ -2709,12 +2733,27 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         followWakeup.trySend(Unit)
     }
 
+    internal fun onFollowBackgroundUnavailable(failure: Exception) {
+        if (!state.value.followBlocksControl) return
+        val first = recordFollowFailure("follow.background_unavailable", failure)
+        mutableState.update { it.copy(followFirstFailure = first,
+            followError = "后台运行服务不可用，停止结果仍需确认") }
+        stopFollow("后台运行服务不可用，正在请求停止原会话", ControlStopSource.BACKGROUND_SERVICE_FAILED)
+    }
+
     fun onControlSurfaceHidden(reason: String, source: ControlStopSource = ControlStopSource.CONTROL_SURFACE_HIDDEN) {
         Diagnostics.event("ui.control_surface_hidden", activeDiagnostic(), source = source.name,
             fields = mapOf("followActive" to state.value.followActive, "manualActive" to state.value.manualActive), critical = true)
         if (source == ControlStopSource.WINDOW_FOCUS_LOST) return
         disableDrive(reason, source = source)
-        stopFollow("$reason，正在请求结束跟随", source)
+        if (source == ControlStopSource.APP_PAUSED) {
+            // Automatic follow is a user-started background session. Pausing the
+            // Activity must not enqueue an explicit stop or overwrite a pending one.
+            if (state.value.followBlocksControl) Diagnostics.event("follow.background_continued",
+                followDiagnostic, source = source.name, fields = mapOf(
+                    "stopPending" to state.value.followStopPending,
+                    "detached" to state.value.followDetached), critical = true)
+        } else stopFollow("$reason，正在请求结束跟随", source)
         cancelMotorAction(reason, source)
     }
 

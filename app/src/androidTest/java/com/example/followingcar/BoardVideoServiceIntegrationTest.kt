@@ -6,7 +6,6 @@ import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
@@ -33,7 +32,7 @@ class BoardVideoServiceIntegrationTest {
         assumeTrue("Opt in with boardPassword or useSavedBoardCredentials",
             password.isNotEmpty() || arguments.getString("useSavedBoardCredentials") == "true")
         val viewModel = compose.runOnUiThread {
-            ViewModelProvider(compose.activity)[BoardViewModel::class.java]
+            (compose.activity.application as FollowingCarApplication).boardViewModel
         }
         // Do not interfere with a previously unconfirmed follow session.
         assumeTrue("Resolve the existing follow session before this test",

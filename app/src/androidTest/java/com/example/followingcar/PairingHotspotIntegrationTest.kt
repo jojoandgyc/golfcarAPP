@@ -1,6 +1,5 @@
 package com.example.followingcar
 
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -49,21 +48,24 @@ class PairingHotspotIntegrationTest {
         try {
             ActivityScenario.launch(MainActivity::class.java).use { activity ->
                 lateinit var model: BoardViewModel
-                activity.onActivity { model = ViewModelProvider(it)[BoardViewModel::class.java] }
+                activity.onActivity { model = (it.application as FollowingCarApplication).boardViewModel }
                 withTimeout(20_000) {
                     model.state.first { !it.remoteProfileLoading }
                     model.pairing.state.first { !it.recoveryLoading }
                     model.systemHotspotProfile.first { !it.loading && !it.saving }
                 }
                 assertControlIdle(model.state.value)
+                assumeTrue("Start with an idle disconnected shared owner",
+                    !model.state.value.connected && !model.state.value.busy && !model.state.value.videoServiceBusy)
                 assertTrue("Saved system hotspot credentials could not be loaded", model.systemHotspotProfile.value.configured)
+                val lease = SharedOwnerSshTestLease(model)
                 val controlStarted = AtomicBoolean(false)
                 val monitor = launch {
                     model.state.collect { if (it.manualActive || it.followActive || it.followStopping) controlStarted.set(true) }
                 }
                 try {
                     phase = "reconcile_existing_journal"
-                    disconnectIdle(model)
+                    disconnectIdle(model, lease)
                     val oldRecord = PairingRecoveryStore(context).load()
                     assertFalse("Unreadable recovery journal must be repaired before the test", oldRecord is PairingRecoveryLoad.Blocked)
                     if (oldRecord is PairingRecoveryLoad.Pending || model.pairing.state.value.confirmationRequired) {
@@ -73,7 +75,7 @@ class PairingHotspotIntegrationTest {
                         report.put("existingJournalReconciled", true)
                         // Successful read-only recovery can schedule automatic SSH on the main queue.
                         delay(300)
-                        disconnectIdle(model)
+                        disconnectIdle(model, lease)
                     }
                     if (model.pairing.state.value.hotspotActive || PairingRecoveryStore(context).load() is PairingRecoveryLoad.Pending) {
                         // In the system-hotspot implementation this forgets a confirmed App record only.
@@ -119,6 +121,7 @@ class PairingHotspotIntegrationTest {
                     val boardIp = requireNotNull(paired.boardIp)
                     phase = "paired_ssh"
                     withTimeout(35_000) { model.state.first { it.connected && !it.busy } }
+                    lease.rememberEstablishedConnection()
                     assertControlIdle(model.state.value)
                     report.put("pairedBoardIp", boardIp).put("pairedSshAuthenticated", true)
 
@@ -150,9 +153,12 @@ class PairingHotspotIntegrationTest {
                     assertTrue("Unexpected control/video start events: $startEvents", startEvents.isEmpty())
                     report.put("realMotorCommandsSent", false).put("cameraStarted", false)
                         .put("controlStartEventCount", startEvents.size)
-                } finally { monitor.cancelAndJoin() }
+                } finally {
+                    try { lease.closeIfStillOwnedAndIdle() }
+                    finally { monitor.cancelAndJoin() }
+                }
             }
-            // Activity/VM disposal is part of this check: the system AP must outlive the App.
+            // Activity disposal must leave the system AP intact; its shared owner stays alive.
             delay(300)
             val after = currentSystemHotspotObservations(context)
             report.put("afterInterfaces", systemHotspotTestJson(after))
@@ -178,11 +184,12 @@ class PairingHotspotIntegrationTest {
             state.followBlocksControl || state.driveCleanupUnconfirmed || state.motorActionUnconfirmed)
     }
 
-    private suspend fun disconnectIdle(model: BoardViewModel) {
+    private suspend fun disconnectIdle(model: BoardViewModel, lease: SharedOwnerSshTestLease) {
         withTimeout(45_000) { model.state.first { !it.busy && !it.videoServiceBusy } }
         assertControlIdle(model.state.value)
         if (model.state.value.connected) {
-            withContext(Dispatchers.Main) { model.disconnect() }
+            lease.rememberEstablishedConnection()
+            lease.closeIfStillOwnedAndIdle()
             withTimeout(45_000) { model.state.first { !it.connected && !it.busy && !it.videoServiceBusy } }
         }
     }

@@ -43,7 +43,7 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
-/** Settings and details stay in this window: opening a dialog would trigger focus-loss stop. */
+/** Settings and details stay alongside the current session's controls. */
 @Composable
 internal fun FollowPage(
     state: BoardUiState,
@@ -102,6 +102,11 @@ internal fun FollowPage(
                 Text(presentation.subtitle, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.testTag("followStatusSubtitle"))
+                if (state.followActive && !state.followStopping && !state.followUncertain) {
+                    Text("切到后台或锁屏后继续跟随，返回 App 可停止。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
                 if (state.followActive && !state.followUncertain && state.followStatus?.runState == "STARTING") {
                     state.followStatus.startup?.let { startup ->
                         Text("启动已用 ${(startup.totalElapsedMs / 1_000.0).display()} s · 总期限 ${(startup.totalTimeoutMs / 1_000.0).display()} s",

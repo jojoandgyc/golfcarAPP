@@ -5,6 +5,11 @@ import android.app.ActivityManager
 import java.time.Instant
 
 class FollowingCarApplication : Application() {
+    /** Activity recreation must not dispose the owner of an active foreground follow loop. */
+    val boardViewModel: BoardViewModel by lazy {
+        BoardViewModel(this, AndroidFollowBackgroundController(this))
+    }
+
     override fun onCreate() {
         super.onCreate()
         Diagnostics.initialize(this)

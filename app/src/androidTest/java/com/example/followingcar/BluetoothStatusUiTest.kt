@@ -5,7 +5,6 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import org.junit.Assert.*
@@ -22,7 +21,7 @@ class BluetoothStatusUiTest {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue(args.getString("runBluetoothStatus") == "true")
         assumeTrue(args.getString("confirmedControlIdle") == "true")
-        val model = ViewModelProvider(compose.activity)[BoardViewModel::class.java]
+        val model = (compose.activity.application as FollowingCarApplication).boardViewModel
         compose.waitUntil(15_000) {
             !model.state.value.remoteProfileLoading && !model.pairing.state.value.recoveryLoading
         }

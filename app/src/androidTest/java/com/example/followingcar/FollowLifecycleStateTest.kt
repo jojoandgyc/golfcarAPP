@@ -460,19 +460,147 @@ class FollowLifecycleStateTest {
         fixture.socket.close()
     }
 
-    @Test fun persistentOnlineBackgroundStillSendsRealStopAndWaitsForTerminal() = runBlocking {
-        val fixture = startFixture(persistent = true)
-        fixture.bridge.nextRequest()
-        fixture.bridge.respond(status("RUNNING"))
-        fixture.bridge.nextRequest()
-        withContext(Dispatchers.Main) {
-            fixture.vm.onControlSurfaceHidden("normal background", ControlStopSource.APP_PAUSED)
+    @Test fun backgroundKeepsSameFollowAndHeartbeatWithOrWithoutGesturesUntilUserStops() = runBlocking {
+        for (persistent in listOf(false, true)) {
+            val fixture = startFixture(persistent = persistent)
+            assertEquals("start", fixture.bridge.nextRequest().getString("cmd"))
+            fixture.bridge.respond(status("RUNNING"))
+            assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+            withContext(Dispatchers.Main) {
+                fixture.vm.setNetworkForeground(false)
+                repeat(2) { fixture.vm.onControlSurfaceHidden("switch to another app", ControlStopSource.APP_PAUSED) }
+            }
+            repeat(4) {
+                fixture.bridge.respond(status("RUNNING"))
+                assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+                assertTrue(fixture.vm.state.value.followActive)
+                assertFalse(fixture.vm.state.value.followStopping)
+                assertFalse(fixture.vm.state.value.followStopPending)
+            }
+            assertFalse(fixture.bridge.commands().any { it in listOf("stop", "close") })
+            withContext(Dispatchers.Main) { fixture.vm.stopFollow("user explicitly stops after return") }
+            fixture.bridge.respond(status("RUNNING"))
+            assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
+            fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+            awaitFinished(fixture)
+            assertTrue(fixture.vm.state.value.followTerminal)
+            assertEquals(1, fixture.bridge.commands().count { it == "start" })
+            assertEquals(1, fixture.bridge.commands().count { it == "stop" })
         }
+    }
+
+    @Test fun backgroundDuringStartupDoesNotCancelButChangingControlPageStillStops() = runBlocking {
+        val fixture = startFixture(holdReady = true, persistent = true)
+        withTimeout(3_000) { fixture.bridge.connectedSignal.await() }
+        withContext(Dispatchers.Main) {
+            fixture.vm.onControlSurfaceHidden("background while starting", ControlStopSource.APP_PAUSED)
+        }
+        fixture.bridge.releaseReady()
+        assertEquals("start", fixture.bridge.nextRequest().getString("cmd"))
+        fixture.bridge.respond(status("RUNNING"))
+        assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+        withContext(Dispatchers.Main) {
+            fixture.vm.onControlSurfaceHidden("switch control page", ControlStopSource.PAGE_CHANGED)
+            fixture.vm.onControlSurfaceHidden("background after explicit page stop", ControlStopSource.APP_PAUSED)
+        }
+        assertTrue(fixture.vm.state.value.followStopPending)
         fixture.bridge.respond(status("RUNNING"))
         assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
         fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
         awaitFinished(fixture)
+        val stop = engine.snapshot().events.map(::JSONObject).single { it.optString("event") == "follow.stop_sending" }
+        assertEquals("PAGE_CHANGED", stop.getString("source"))
+    }
+
+    @Test fun backgroundServiceFailureDuringDetachedRecoveryKeepsStopIntentUntilOriginalRunEnds() = runBlocking {
+        val fixture = startFixture(persistent = true)
+        fixture.bridge.nextRequest()
+        fixture.bridge.respond(status("RUNNING"))
+        fixture.bridge.nextRequest() // Simulated lost ACK closes only this fake transport.
+        awaitFinished(fixture)
+        val originalRun = fixture.bridge.runId
+        val first = fixture.vm.state.value.followFirstFailure
+        withContext(Dispatchers.Main) {
+            fixture.vm.onFollowBackgroundUnavailable(IllegalStateException("simulated promotion failure"))
+            fixture.vm.onControlSurfaceHidden("background after failure", ControlStopSource.APP_PAUSED)
+        }
+        assertTrue(fixture.vm.state.value.followStopPending)
+        assertEquals(first, fixture.vm.state.value.followFirstFailure)
+        assertEquals("true", application.getSharedPreferences("follow_recovery", 0).getString("stopIntent", null))
+        reattachFixture(fixture)
+        assertEquals(originalRun, fixture.bridge.runId)
+        assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
+        fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+        awaitFinished(fixture)
+        assertEquals(listOf("stop"), fixture.bridge.commands())
         assertTrue(fixture.vm.state.value.followTerminal)
+    }
+
+    @Test fun synchronousBackgroundStartFailureDuringAttachRetainsStopWithoutRecursiveAttach() = runBlocking {
+        var starts = 0
+        var rejectStart = false
+        val background = object : FollowBackgroundController {
+            override fun start() {
+                starts++
+                if (rejectStart) throw IllegalStateException("simulated synchronous background start rejection")
+            }
+            override fun stop() = Unit
+        }
+        val fixture = startFixture(persistent = true, background = background)
+        fixture.bridge.nextRequest()
+        fixture.bridge.respond(status("RUNNING"))
+        fixture.bridge.nextRequest()
+        fixture.bridge.endOutput()
+        awaitFinished(fixture)
+        val originalRun = fixture.bridge.runId
+        val firstFailure = fixture.vm.state.value.followFirstFailure
+        assertFalse(fixture.vm.state.value.followStopPending)
+
+        rejectStart = true
+        reattachFixture(fixture)
+        awaitFinished(fixture)
+        assertEquals("Failed background promotion must not recursively attach", 2, starts)
+        assertFalse("No SSH follow channel is opened after promotion fails", fixture.bridge.connectedSignal.isCompleted)
+        assertTrue(fixture.bridge.commands().isEmpty())
+        assertTrue(fixture.vm.state.value.followUncertain)
+        assertTrue(fixture.vm.state.value.followStopPending)
+        assertEquals(firstFailure, fixture.vm.state.value.followFirstFailure)
+        assertEquals(ControlStopSource.BACKGROUND_SERVICE_FAILED, field(fixture.vm, "firstFollowStopSource"))
+        val saved = application.getSharedPreferences("follow_recovery", 0)
+        assertEquals(originalRun, saved.getString("runId", null))
+        assertEquals("true", saved.getString("stopIntent", null))
+
+        rejectStart = false
+        reattachFixture(fixture)
+        val stop = fixture.bridge.nextRequest()
+        assertEquals(3, starts)
+        assertEquals(originalRun, stop.getString("runId"))
+        assertEquals("stop", stop.getString("cmd"))
+        fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+        awaitFinished(fixture)
+        assertEquals(listOf("stop"), fixture.bridge.commands())
+        assertTrue(fixture.vm.state.value.followTerminal)
+    }
+
+    @Test fun synchronousBackgroundStartFailureBeforeNewRunOpensNoChannelOrRecoveryIntent() = runBlocking {
+        var starts = 0
+        val background = object : FollowBackgroundController {
+            override fun start() {
+                starts++
+                throw IllegalStateException("simulated new-run background start rejection")
+            }
+            override fun stop() = Unit
+        }
+        val fixture = startFixture(persistent = true, background = background)
+        awaitFinished(fixture)
+        assertEquals(1, starts)
+        assertEquals("Neither video nor follow execution was opened", 2, fixture.channels?.size)
+        assertFalse(fixture.bridge.connectedSignal.isCompleted)
+        assertTrue(fixture.bridge.commands().isEmpty())
+        assertFalse(fixture.vm.state.value.followUncertain)
+        assertFalse(fixture.vm.state.value.followStopPending)
+        assertNull(field(fixture.vm, "firstFollowStopSource"))
+        assertNull(application.getSharedPreferences("follow_recovery", 0).getString("runId", null))
     }
 
     private suspend fun reattachFixture(fixture: Fixture) {
@@ -497,10 +625,11 @@ class FollowLifecycleStateTest {
         }
     }
 
-    private suspend fun startFixture(holdReady: Boolean = false, persistent: Boolean = false): Fixture {
+    private suspend fun startFixture(holdReady: Boolean = false, persistent: Boolean = false,
+        background: FollowBackgroundController = FollowBackgroundController.None): Fixture {
         val vm = withContext(Dispatchers.Main) {
             val store = ViewModelStore().also(stores::add)
-            ViewModelProvider(store, ViewModelProvider.AndroidViewModelFactory(application))[BoardViewModel::class.java]
+            BoardViewModel(application, background).also { store.put("follow-lifecycle-owner", it) }
         }
         withTimeout(3_000) { vm.state.first { !it.remoteProfileLoading } }
         val bridge = ScriptedFollowChannel(holdReady, persistent)

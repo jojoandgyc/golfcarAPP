@@ -12,7 +12,6 @@ import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -72,7 +71,7 @@ class BluetoothRecoveryUiTest {
             failureCode = "recovery_ui_launch_failed"
             lateinit var model: BoardViewModel
             scenario = ActivityScenario.launch(MainActivity::class.java)
-            scenario.onActivity { activity -> model = ViewModelProvider(activity)[BoardViewModel::class.java] }
+            scenario.onActivity { activity -> model = (activity.application as FollowingCarApplication).boardViewModel }
             failureCode = "recovery_ui_restore_failed"
             compose.waitUntil(15_000) {
                 !model.state.value.remoteProfileLoading && !model.pairing.state.value.recoveryLoading &&
@@ -111,7 +110,7 @@ class BluetoothRecoveryUiTest {
         } catch (_: Throwable) {
             throw AssertionError("Read-only Bluetooth UI recovery failed: $failureCode")
         } finally {
-            // Closing the observer cancels pending reads. Never clear an unconfirmed record on failure.
+            // The Application owns recovery; closing the UI must not clear an unconfirmed record.
             scenario?.close()
             instrumentation.sendStatus(0, Bundle().apply {
                 putString("bluetoothRecoveryUi", JSONObject()

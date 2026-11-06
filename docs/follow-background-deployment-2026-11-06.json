@@ -1,0 +1,84 @@
+{
+  "deployedAtUtc": "2026-11-06T07:49:35.512704+00:00",
+  "versionName": "1.8.27-follow-background",
+  "versionCode": 38,
+  "apkSha256": "c342cc94cb565fa77f56a97f9183165dac3bc5607474f1141069445c09ecefad",
+  "testApkSha256": "a1f9c2d9944a82aca089ff98a057738cf56836d27873f05d2a5930025d1590d6",
+  "baseCommit": "d39d049871fdf1993cf8c56cd4dc42d4e936e57c",
+  "incident": {
+    "runId": "1da6ef30843607c7367c77d5519ea13d",
+    "firstTrigger": "APP_PAUSED when switching to another app",
+    "stopAckMs": 38,
+    "terminal": "STOPPED, exit 0",
+    "networkLossAfterTerminal": true
+  },
+  "behavior": {
+    "automaticFollowOnAppPause": "continue existing heartbeat and run; no stop intent",
+    "owner": "Application-scoped shared BoardViewModel survives Activity recreation",
+    "backgroundService": "connectedDevice foreground service, bounded renewable partial wake lock, notification return/stop actions",
+    "notificationPermission": "requested once on first follow start; denial does not block the run",
+    "manualDriveOnAppPause": "unchanged: stop",
+    "explicitStopAndControlPageChange": "unchanged",
+    "networkLoss": "unchanged: gesture-enabled persistent run may detach; no-gesture run retains existing stop behavior",
+    "serviceUnavailable": "record failure, request stop or persist stop intent for original run; do not create a new worker",
+    "processKilledOrForceStopped": "not guaranteed to keep App alive; START_NOT_STICKY never restarts driving automatically"
+  },
+  "validation": {
+    "jvm": {
+      "tests": 374,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "emulator": {
+      "FollowLifecycleStateTest": 22,
+      "FollowBackgroundServiceTest": 3,
+      "DriveStartupStateTest": 24,
+      "FollowControlsTest": 16,
+      "BoardPagesTest": 7,
+      "notes": "Lifecycle and service rerun on final APK; other suites passed earlier in this change and their affected paths were unchanged in final service-failure fix."
+    },
+    "phone": {
+      "model": "SM-S9280",
+      "androidApi": 35,
+      "FollowBackgroundServiceTest": 3,
+      "verified": [
+        "Activity CREATED for 3 seconds then RESUMED",
+        "Activity recreation retains same control owner",
+        "notification stop targets only current owner",
+        "queued start cancellation does not trigger Android FGS timeout",
+        "stale notification/start cannot stop replacement",
+        "notification permission denied still permits FGS",
+        "foreground and wake lock released after completion"
+      ],
+      "mode": "synthetic follow owner, no control socket, camera or motor start",
+      "testDurationSeconds": 20.516
+    },
+    "limits": [
+      "No live camera or motor following test",
+      "No long-duration OEM power-management or force-stop guarantee"
+    ]
+  },
+  "deployment": {
+    "phoneInstalled": true,
+    "installedApkHashVerified": true,
+    "connectionPreferencesPreserved": true,
+    "systemHotspotCredentialsPreserved": true,
+    "installationAndPhoneTestHeldBothIdleControlLocks": true,
+    "controlLocksReleased": {
+      "event": "unlocked",
+      "reason": "released"
+    },
+    "boardCodeChanged": false,
+    "motorConfigurationWritten": false,
+    "systemHotspotChanged": false
+  },
+  "sourceSha256": {
+    "app/src/main/java/com/example/followingcar/BoardViewModel.kt": "ce7d0e1d1e23e5a8f01f036e543a37a7663d249e952b7e956621be026ce50f91",
+    "app/src/main/java/com/example/followingcar/MainActivity.kt": "94d3c1bb66562e5584dd47d3345f81a9c1599476045afb859d6f3d9398d5cdd7",
+    "app/src/main/java/com/example/followingcar/FollowingCarApplication.kt": "afe0f7fec589354ea8d48e309270ec2f5615b46de26c8cb3f2cfa0d7af5bd590",
+    "app/src/main/java/com/example/followingcar/FollowBackgroundService.kt": "b3097484d403b58b4e24444024c2d859bcb7158385eb5430ea2645bf98be4c0a",
+    "app/src/main/java/com/example/followingcar/FollowBackgroundController.kt": "6ca94e4a38cae80025022a52b20fbf4dd08f06bac89d19915235fec89cf85661"
+  },
+  "localEvidenceDirectory": "E:\\Temp\\golfcar-follow-background-2026-11-06"
+}

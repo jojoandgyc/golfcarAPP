@@ -1,7 +1,6 @@
 package com.example.followingcar
 
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.Closeable
@@ -39,7 +38,7 @@ class FollowNetworkRecoveryIntegrationTest {
             args.getString("useSavedBoardCredentials") == "true" && args.getString("injectFollowNetworkFaults") == "true")
         if (remoteRecovery) assumeTrue("Public-route recovery requires its own explicit opt-in",
             args.getString("remoteRecovery") == "true")
-        val vm = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        val vm = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
         if (remoteRecovery) compose.waitUntil(15_000) { !vm.state.value.remoteProfileLoading }
         val saved = vm.state.value
         assumeTrue("Saved direct board connection required", saved.password.isNotEmpty() && saved.host != "127.0.0.1")

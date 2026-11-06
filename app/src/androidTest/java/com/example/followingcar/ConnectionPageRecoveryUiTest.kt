@@ -14,7 +14,6 @@ import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -56,7 +55,7 @@ class ConnectionPageRecoveryUiTest {
         lateinit var model: BoardViewModel
         var restoreRemote = false
         try {
-            scenario.onActivity { model = ViewModelProvider(it)[BoardViewModel::class.java] }
+            scenario.onActivity { model = (it.application as FollowingCarApplication).boardViewModel }
             compose.waitUntil(15_000) {
                 !model.state.value.remoteProfileLoading && !model.pairing.state.value.recoveryLoading &&
                     !model.wifiDirect.state.value.busy

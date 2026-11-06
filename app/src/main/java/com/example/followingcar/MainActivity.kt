@@ -1,5 +1,6 @@
 package com.example.followingcar
 
+import android.Manifest
 import android.content.pm.PackageManager
 import android.content.Intent
 import android.os.Build
@@ -67,7 +68,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.followingcar.ui.theme.FollowingCarTheme
 import java.util.Locale
@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        boardViewModel = ViewModelProvider(this)[BoardViewModel::class.java]
+        boardViewModel = (application as FollowingCarApplication).boardViewModel
         boardViewModel.recordUiEvent("ui.activity_created", "restored=${savedInstanceState != null}")
         setContent {
             FollowingCarTheme { BoardScreen(boardViewModel) }
@@ -114,7 +114,7 @@ class MainActivity : ComponentActivity() {
         if (::boardViewModel.isInitialized) {
             boardViewModel.recordUiEvent("ui.window_focus", "hasFocus=$hasFocus")
             // Dialogs and notification shade focus changes do not end control.
-            // Actual backgrounding still follows onPause's stop path.
+            // onPause keeps follow heartbeats; manual driving still follows its stop path.
         }
     }
 }
@@ -144,7 +144,25 @@ private fun BoardScreen(viewModel: BoardViewModel) {
     val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
     val view = LocalView.current
-    var selectedPageIndex by rememberSaveable("motor-configuration-pages") { mutableStateOf(BoardPage.CONNECTION.ordinal) }
+    val notificationPreferences = remember(context) { context.getSharedPreferences("follow_notification_permission", 0) }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+        viewModel.recordUiEvent("ui.follow_notification_permission", "granted=$allowed")
+    }
+    val startFollowWithNotification: () -> Unit = {
+        viewModel.startFollow()
+        // The explicit foreground click requests the FGS before a system permission window can
+        // pause this Activity. A denied notification permission does not cancel the follow run.
+        if (viewModel.state.value.followActive &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !notificationPreferences.getBoolean("requested", false)) {
+            notificationPreferences.edit().putBoolean("requested", true).apply()
+            runCatching { notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) }
+                .onFailure { viewModel.recordUiEvent("ui.follow_notification_permission_unavailable", it.javaClass.simpleName) }
+        }
+    }
+    var selectedPageIndex by rememberSaveable("motor-configuration-pages") {
+        mutableStateOf(if (state.followBlocksControl) BoardPage.FOLLOW.ordinal else BoardPage.CONNECTION.ordinal)
+    }
     var useWifiDirect by rememberSaveable { mutableStateOf(false) }
     var showNetworkDetails by rememberSaveable { mutableStateOf(false) }
     var showPairingSetup by rememberSaveable { mutableStateOf(false) }
@@ -335,7 +353,7 @@ private fun BoardScreen(viewModel: BoardViewModel) {
             } else if (page == BoardPage.FOLLOW) {
                 FollowPage(state = state,
                     onExecuteChange = viewModel::setFollowExecute,
-                    onStart = { viewModel.startFollow() }, onStop = { viewModel.stopFollow() },
+                    onStart = startFollowWithNotification, onStop = { viewModel.stopFollow() },
                     onInspect = viewModel::refreshFollowAvailability,
                     onOptionsChange = viewModel::setFollowLaunchOptions,
                     onCameraChange = viewModel::selectFollowCamera,

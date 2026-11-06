@@ -4,6 +4,7 @@ package com.example.followingcar
 enum class ControlStopSource {
     USER_STOP, EMERGENCY_STOP, PAGE_CHANGED, APP_PAUSED, WINDOW_FOCUS_LOST,
     DISCONNECT, TRANSPORT_LOST, PROTOCOL_ERROR, VIEW_MODEL_CLEARED, CONTROL_SURFACE_HIDDEN,
+    BACKGROUND_SERVICE_FAILED,
 }
 
 /** A failed recovery check must not replace the first failure of the control session. */

@@ -1,7 +1,6 @@
 package com.example.followingcar
 
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
@@ -22,7 +21,7 @@ class DirectFollowStartIntegrationTest {
         val explicitPassword = arguments.getString("boardPassword").orEmpty()
         assumeTrue("Opt in with useSavedBoardCredentials or an explicit boardPassword",
             arguments.getString("useSavedBoardCredentials") == "true" || explicitPassword.isNotEmpty())
-        val vm = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        val vm = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
         if (explicitPassword.isNotEmpty()) compose.runOnUiThread {
             arguments.getString("boardHost")?.let(vm::updateHost)
             arguments.getString("boardUser")?.let(vm::updateUsername)

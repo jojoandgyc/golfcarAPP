@@ -10,7 +10,6 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.performTouchInput
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
@@ -32,7 +31,7 @@ class BoardJoystickIntegrationTest {
     @Test
     fun joystickUsesDryRunAndReleaseAndEmergencyStopAreAcknowledged() {
         val password = passwordOrSkip()
-        val viewModel = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        val viewModel = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
         try {
             connectThroughUi(viewModel, password)
             enableDryRun(viewModel)
@@ -85,7 +84,7 @@ class BoardJoystickIntegrationTest {
     @Test
     fun leavingTheForegroundDisablesDryRunAndReturningDoesNotResumeMotion() {
         val password = passwordOrSkip()
-        val viewModel = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        val viewModel = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
         try {
             connectThroughUi(viewModel, password)
             enableDryRun(viewModel)

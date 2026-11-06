@@ -14,7 +14,6 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Rule
 import org.junit.Test
@@ -31,7 +30,7 @@ class BoardPagesTest {
 
     @Test
     fun parkingControlsAndCurrentInputsShareOnePageWithoutStartingDrive() {
-        val vm = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        val vm = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
         compose.onNodeWithTag("pageJoystick").performClick()
         compose.onNodeWithTag("manualParkingTab").performClick()
         compose.onNodeWithTag("parkingPage").assertIsDisplayed()
@@ -76,7 +75,7 @@ class BoardPagesTest {
 
     @Test
     fun motorPageIsInitiallyLockedAndNavigationDoesNotReadOrAlterFollowOptions() {
-        val vm = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        val vm = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
         val initial = vm.state.value
         assertFalse(initial.connected)
         assertNull(vm.motorConfiguration.value.snapshot)
@@ -225,7 +224,7 @@ class BoardPagesTest {
     }
 
     private fun showLocalLoginSettings() {
-        val model = compose.runOnUiThread { ViewModelProvider(compose.activity)[BoardViewModel::class.java] }
+        val model = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
         compose.waitUntil(15_000) { !model.state.value.remoteProfileLoading }
         compose.onNodeWithTag("connectionLanMode").performScrollTo().performClick()
         // Empty credentials expand automatically; saved credentials start collapsed.

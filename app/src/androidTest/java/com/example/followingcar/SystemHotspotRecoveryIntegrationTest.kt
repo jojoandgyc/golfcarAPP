@@ -1,7 +1,6 @@
 package com.example.followingcar
 
 import android.os.Process
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -74,7 +73,7 @@ class SystemHotspotRecoveryIntegrationTest {
             phase = "load_recovery_state"
             ActivityScenario.launch(MainActivity::class.java).use { activity ->
                 lateinit var model: BoardViewModel
-                activity.onActivity { model = ViewModelProvider(it)[BoardViewModel::class.java] }
+                activity.onActivity { model = (it.application as FollowingCarApplication).boardViewModel }
                 withTimeout(20_000) {
                     model.state.first { !it.remoteProfileLoading && !it.busy && !it.videoServiceBusy }
                     model.pairing.state.first { !it.recoveryLoading }
@@ -83,6 +82,7 @@ class SystemHotspotRecoveryIntegrationTest {
                     model.state.value.followBlocksControl || model.state.value.driveCleanupUnconfirmed ||
                     model.state.value.motorActionUnconfirmed)
                 assertTrue("Disconnect existing SSH before this recovery-only test", model.state.value.canManagePairing)
+                val lease = SharedOwnerSshTestLease(model)
                 assertFalse("A new process must not assume its old pairing is already verified", model.pairing.state.value.hotspotActive)
                 assertTrue("Durable pairing must require read-only reconciliation after restart",
                     model.pairing.state.value.confirmationRequired)
@@ -130,17 +130,21 @@ class SystemHotspotRecoveryIntegrationTest {
 
                     phase = "automatic_pinned_ssh"
                     withTimeout(40_000) { model.state.first { it.connected && !it.busy } }
+                    lease.rememberEstablishedConnection()
                     assertFalse("Recovered AP connection must stay on the local route", model.state.value.remoteMode)
                     assertEquals(boardIp, model.state.value.host)
                     assertFalse(controlStarted.get())
                     assertFalse("Recovery must never dispatch hotspot credentials", credentialDispatchStarted.get())
                     report.put("pinnedSshAuthenticated", true)
                 } finally {
-                    stateMonitor.cancelAndJoin()
-                    pairingMonitor.cancelAndJoin()
+                    try { lease.closeIfStillOwnedAndIdle() }
+                    finally {
+                        stateMonitor.cancelAndJoin()
+                        pairingMonitor.cancelAndJoin()
+                    }
                 }
             }
-            // Closing this Activity/VM still does not own or stop the user's system AP.
+            // Closing the Activity does not dispose its shared owner or stop the user's system AP.
             delay(300)
             phase = "audit_recovery"
             val after = currentSystemHotspotObservations(context)
