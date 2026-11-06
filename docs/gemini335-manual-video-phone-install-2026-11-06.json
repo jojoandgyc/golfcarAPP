@@ -1,0 +1,18 @@
+{
+  "installedAtUtc": "2026-11-06T15:42:54.380873+00:00",
+  "versionCode": 40,
+  "versionName": "1.8.29-gemini-manual-video",
+  "apkSha256": "9308acf1fce14d5769c5f239a3d381eab4158a882d62cb1f41dc61ca453a6f2d",
+  "installedApkSha256": "9308acf1fce14d5769c5f239a3d381eab4158a882d62cb1f41dc61ca453a6f2d",
+  "previousVersionCode": 39,
+  "previousApkSha256": "e6b2c235d22d06546a29514636c34ba81fe426253a28dd2229a0a9c609ef700c",
+  "backup": "E:\\Temp\\gemini335-video-2026-11-06\\phone-before-v39-20261106T154249Z-3f4906f3.apk",
+  "boardRoute": "direct_172.16.16.122",
+  "boardIdleGuardHeld": true,
+  "connectionPreferencesPreserved": true,
+  "motorWritesSent": false,
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  }
+}
