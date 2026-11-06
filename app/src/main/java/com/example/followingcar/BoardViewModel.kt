@@ -49,6 +49,8 @@ data class BoardUiState(
     val error: String? = null,
     val result: CommandResult? = null,
     val videoServiceState: VideoServiceState = VideoServiceState.UNKNOWN,
+    val manualVideoCamera: ManualVideoCamera = ManualVideoCamera.AUTO,
+    val activeVideoCamera: ManualVideoCamera? = null,
     val videoServiceBusy: Boolean = false,
     val videoServiceMessage: String = "连接开发板后可开启视频",
     val videoServiceError: String? = null,
@@ -126,6 +128,9 @@ data class BoardUiState(
     val canEnableDrive: Boolean get() = driveStartBlock() == null
     val canToggleVideoService: Boolean
         get() = connected && !busy && !motorActionUnconfirmed && !videoServiceBusy && !driveStarting && !driveStopping && !followBlocksControl
+    val canSelectManualVideoCamera: Boolean
+        get() = !busy && !videoServiceBusy && !manualActive && !followBlocksControl &&
+            (!connected || videoServiceState == VideoServiceState.STOPPED)
     val canInspectFollow: Boolean get() = connected && !busy && !pairingBlocksControl && !manualActive && !followActive && !followStopping && !videoServiceBusy
     // Restoring a lost wireless group must remain possible while the old control lock awaits SSH inspection.
     val canRecoverConnection: Boolean get() = !connected && !busy && !manualActive &&
@@ -193,6 +198,8 @@ class BoardViewModel @JvmOverloads internal constructor(
             port = preferences.getString("port", null) ?: "22",
             username = preferences.getString("username", null) ?: "topeet",
             password = credentialPreferences.getString("password", null).orEmpty(),
+            manualVideoCamera = ManualVideoCamera.fromArgument(preferences.getString("manual_video_camera", null))
+                ?: ManualVideoCamera.AUTO,
             remoteMode = preferences.getBoolean("remote_mode", false),
             motorActionUnconfirmed = runCatching {
                 motorRecoveryPreferences.getBoolean(MOTOR_ACTION_RECOVERY_KEY, false)
@@ -1519,10 +1526,19 @@ class BoardViewModel @JvmOverloads internal constructor(
         motorActionJob?.cancel(CancellationException(reason))
     }
 
+    fun selectManualVideoCamera(camera: ManualVideoCamera) {
+        val current = state.value
+        if (!current.canSelectManualVideoCamera || current.manualVideoCamera == camera) return
+        preferences.edit().putString("manual_video_camera", camera.argument).apply()
+        mutableState.update { it.copy(manualVideoCamera = camera) }
+        Diagnostics.event("video.camera_selected", activeDiagnostic(), fields = mapOf("camera" to camera.argument))
+    }
+
     fun setVideoServiceEnabled(enabled: Boolean) {
         if (disconnecting || !state.value.canToggleVideoService) return
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
-        Diagnostics.event("video.requested", diagnostic, source = "USER_VIDEO", fields = mapOf("enabled" to enabled))
+        Diagnostics.event("video.requested", diagnostic, source = "USER_VIDEO", fields = mapOf(
+            "enabled" to enabled, "camera" to state.value.manualVideoCamera.argument))
         mutableState.update { it.copy(videoServiceBusy = true, videoServiceError = null,
             videoServiceMessage = if (enabled) "正在开启视频…" else "正在关闭视频…") }
         videoServiceJob = viewModelScope.launch {
@@ -1540,16 +1556,19 @@ class BoardViewModel @JvmOverloads internal constructor(
         val diagnostic = Diagnostics.newContext(client.diagnosticConnectionId)
         mutableState.update { it.copy(videoServiceBusy = true, videoServiceMessage = "正在读取视频服务状态…") }
         try {
-            val videoState = client.readVideoServiceState(diagnostic)
-            Diagnostics.event("video.inspected", diagnostic, fields = mapOf("videoState" to videoState.name))
-            mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
+            val inspection = client.readVideoServiceInspection(diagnostic)
+            val videoState = inspection.state
+            Diagnostics.event("video.inspected", diagnostic, fields = mapOf(
+                "videoState" to videoState.name, "camera" to (inspection.sourceMode ?: "unknown")))
+            mutableState.update { it.copy(videoServiceState = videoState,
+                activeVideoCamera = inspection.activeCamera, videoServiceError = null,
                 videoPreviewWanted = when (videoState) {
                     VideoServiceState.RUNNING -> !disconnecting && !it.followBlocksControl
                     VideoServiceState.STOPPED -> false
                     VideoServiceState.UNKNOWN -> it.videoPreviewWanted
                 },
                 videoServiceMessage = when (videoState) {
-                    VideoServiceState.RUNNING -> "视频服务已开启"
+                    VideoServiceState.RUNNING -> "${inspection.activeCamera?.label ?: "视频"}服务已开启"
                     VideoServiceState.STOPPED -> "视频服务已关闭"
                     VideoServiceState.UNKNOWN -> "视频服务未就绪，可关闭后重试"
                 }) }
@@ -1572,12 +1591,16 @@ class BoardViewModel @JvmOverloads internal constructor(
             videoServiceMessage = if (enabled) "正在开启视频…" else "正在关闭视频…") }
         try {
             check(client.isConnected) { "SSH 已断开，无法确认视频服务状态，请重连后关闭视频。" }
-            val videoState = client.setVideoServiceEnabled(enabled, diagnostic)
-            Diagnostics.event("video.change_confirmed", diagnostic, fields = mapOf("videoState" to videoState.name))
-            mutableState.update { it.copy(videoServiceState = videoState, videoServiceError = null,
+            val camera = state.value.manualVideoCamera
+            val inspection = client.setVideoServiceEnabled(enabled, diagnostic, camera)
+            val videoState = inspection.state
+            Diagnostics.event("video.change_confirmed", diagnostic, fields = mapOf(
+                "videoState" to videoState.name, "camera" to (inspection.sourceMode ?: "unknown")))
+            mutableState.update { it.copy(videoServiceState = videoState,
+                activeVideoCamera = inspection.activeCamera, videoServiceError = null,
                 videoPreviewWanted = enabled && videoState == VideoServiceState.RUNNING &&
                     !disconnecting && !it.followBlocksControl,
-                videoServiceMessage = if (enabled) "视频服务已开启" else "视频服务已关闭",
+                videoServiceMessage = if (enabled) "${inspection.activeCamera?.label ?: "视频"}服务已开启" else "视频服务已关闭",
                 videoPreviewRevision = if (enabled) it.videoPreviewRevision + 1 else it.videoPreviewRevision) }
         } catch (failure: Exception) {
             if (failure !is CancellationException) Diagnostics.failure(diagnostic, "video.change_failed", failure)
@@ -1591,6 +1614,7 @@ class BoardViewModel @JvmOverloads internal constructor(
 
     private fun recordVideoServiceFailure(failure: Exception) {
         mutableState.update { it.withTransportState(client.isConnected).copy(videoServiceState = VideoServiceState.UNKNOWN,
+            activeVideoCamera = null,
             videoServiceMessage = "视频操作失败，状态未确认",
             videoServiceError = failure.message.orEmpty().ifBlank { "视频服务操作未完成，请重试。" }.take(800),
             connected = client.isConnected, status = if (client.isConnected) it.status else "连接已断开") }
@@ -2274,10 +2298,7 @@ class BoardViewModel @JvmOverloads internal constructor(
         if (current.busy || current.followActive || current.manualActive || current.followCamera == camera) return
         Diagnostics.event("follow.camera_selected", activeDiagnostic(), fields = mapOf("camera" to camera.argument))
         mutableState.update {
-            it.copy(followCamera = camera,
-                followLaunchOptions = if (camera == FollowCamera.ASTRA_PRO) it.followLaunchOptions
-                    else it.followLaunchOptions.copy(avoidanceEnabled = false),
-                followConfiguration = null, followConfigurationError = null)
+            it.copy(followCamera = camera, followConfiguration = null, followConfigurationError = null)
         }
     }
 
@@ -2293,8 +2314,7 @@ class BoardViewModel @JvmOverloads internal constructor(
         if (current.followLaunchOptions == options) return
         Diagnostics.event("follow.options_changed", activeDiagnostic(), fields = followOptionFields(options))
         mutableState.update {
-            it.copy(followCamera = if (options.avoidanceEnabled) FollowCamera.ASTRA_PRO else it.followCamera,
-                followLaunchOptions = options, followConfiguration = null,
+            it.copy(followLaunchOptions = options, followConfiguration = null,
                 followConfigurationError = null)
         }
     }

@@ -20,11 +20,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -66,6 +68,7 @@ internal fun BoardCameraPreview(
         { host, endpoint, onStatus, playerModifier, phone ->
             BoardVideoPlayer(host, onStatus, playerModifier, endpoint, phone)
         },
+    onCameraChange: (ManualVideoCamera) -> Unit = {},
 ) {
     var retryKey by remember { mutableIntStateOf(0) }
     var playerStatus by remember(state.host, remoteVideo?.identity, state.videoPreviewRevision, retryKey) {
@@ -81,7 +84,7 @@ internal fun BoardCameraPreview(
         state.videoServiceError != null -> "视频操作失败，可重试"
         state.followBlocksControl -> "自动跟随尚未释放摄像头"
         state.videoServiceState == VideoServiceState.STOPPED -> "视频服务已关闭"
-        canPreview -> playerStatus
+        canPreview -> "${state.activeVideoCamera?.label ?: "视频"} · $playerStatus"
         else -> "视频服务状态未确认"
     }
     Column(modifier.testTag("cameraPreview")) {
@@ -109,6 +112,28 @@ internal fun BoardCameraPreview(
                 modifier = Modifier.testTag("videoServiceToggle")) {
                 Text(if (state.videoServiceBusy) "处理中…" else if (running) "关闭视频" else "开启视频")
             }
+        }
+        Row(Modifier.fillMaxWidth().height(40.dp).testTag("manualVideoCameraSelector"),
+            horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            ManualVideoCamera.entries.forEach { camera ->
+                FilterChip(selected = state.manualVideoCamera == camera,
+                    onClick = { onCameraChange(camera) }, enabled = state.canSelectManualVideoCamera,
+                    label = { Text(camera.label, style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    modifier = Modifier.weight(1f).testTag("manualVideoCamera_${camera.argument}"))
+            }
+        }
+        if (!state.canSelectManualVideoCamera) {
+            val hint = when {
+                state.followBlocksControl -> "跟随占用相机，结束后可切换"
+                state.manualActive -> "先停用手动控制，再切换相机"
+                state.videoServiceBusy -> "视频操作完成后可切换相机"
+                state.connected && state.videoServiceState != VideoServiceState.STOPPED -> "先关闭视频，再切换相机"
+                else -> "当前操作完成后可切换相机"
+            }
+            Text(hint, Modifier.fillMaxWidth().height(20.dp).testTag("manualVideoCameraHint"),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Box(Modifier.fillMaxWidth().weight(1f).background(MaterialTheme.colorScheme.surfaceVariant)) {
             if (canPreview) {

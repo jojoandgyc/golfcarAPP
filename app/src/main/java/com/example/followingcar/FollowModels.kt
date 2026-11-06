@@ -25,15 +25,12 @@ data class FollowLaunchOptions(
     val reverseEnabled: Boolean = false,
     val reverseDistanceMeters: Double? = null,
 ) {
-    fun validate(camera: FollowCamera) {
+    fun validate(@Suppress("UNUSED_PARAMETER") camera: FollowCamera) {
         require(targetDistanceMeters == null || targetDistanceMeters.isFinite() && targetDistanceMeters in 0.5..5.0) {
             "跟随目标距离须在 0.5–5.0 米之间"
         }
         require(reverseDistanceMeters == null || reverseDistanceMeters.isFinite() && reverseDistanceMeters in 0.5..5.0) {
             "倒车目标距离须在 0.5–5.0 米之间"
-        }
-        require(!avoidanceEnabled || camera == FollowCamera.ASTRA_PRO) {
-            "启用实验避障时必须明确选择 Astra Pro 相机"
         }
     }
 }

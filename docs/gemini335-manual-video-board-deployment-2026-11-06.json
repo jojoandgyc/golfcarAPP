@@ -1,0 +1,85 @@
+{
+  "atUtc": "2026-11-06T15:01:59.202188+00:00",
+  "route": "direct_172.16.16.122",
+  "files": [
+    {
+      "path": "scripts/videoctl.sh",
+      "before": "c812b37fa37d2f8ac489b899d7e492c19c74af815556b39ad298416438dee8be",
+      "after": "542fae11d1d7964972a6ac31773226c42d835bad2dcc05373f87e7c4a9b88a96"
+    },
+    {
+      "path": "config/camera_profiles.json",
+      "before": null,
+      "after": "18c933308916ef72c17ffb82f60f9fab2b693714e2615eb5c53156767292d622"
+    },
+    {
+      "path": "rgbd_stream/__main__.py",
+      "before": "ef8b16994571c98bf0aefef9e7f5db92317ab2afca947ec5a4061636aed454d6",
+      "after": "7d34affefb32607932c5d351ce19e140647f15081540b5689c0c8afd53492587"
+    },
+    {
+      "path": "rgbd_stream/camera_select.py",
+      "before": null,
+      "after": "5db51df286265dea7f0c90d0ef5af76d54fbd8311c81639cf5bf94c8f0ea76d8"
+    },
+    {
+      "path": "rgbd_stream/capture.py",
+      "before": "f38b4289901b9ff8138ab9af79f8841d67f15cdad5bf6c87cebb62c1054d3b6d",
+      "after": "4037525372e8f8b5c233001e094554b1fa15512dcb7b1c716d1513c8d595934d"
+    },
+    {
+      "path": "rgbd_stream/config.py",
+      "before": "554e59d5859501cc9bff6125f6a5b2f6e05a8f125b965a21697fca83713b5e47",
+      "after": "e656bf1872420b5a785243433d558d299fcbc868462aa5942a4bda2fb3295ca8"
+    },
+    {
+      "path": "rgbd_stream/gemini.py",
+      "before": null,
+      "after": "ef99047641643dbd07214de2558fc8b07f06500458988c80f45dcfa6018a49f8"
+    },
+    {
+      "path": "rgbd_stream/http_api.py",
+      "before": "42ffda73e13ea7b4e2f96636c74c8608b9a3c14f10349d978d1deccd22780cd9",
+      "after": "81d7efdf86299f2dff5bc148793ec46955b79118edb178755327cbb1df12e834"
+    },
+    {
+      "path": "rgbd_stream/render.py",
+      "before": "e19bba72707f156114038fbff3d000cf89c399a3fb3b75d6a2b5a19c53b476a8",
+      "after": "03d4c253f73508a24066926ae6d9c279ca794c02ff0a6c18a2b3db76e2cd0d15"
+    },
+    {
+      "path": "rgbd_stream/service.py",
+      "before": "71773eb47d0813e2cbfa18899413445d989900d437dd2ef8123469b575caf372",
+      "after": "dc9f617a21ab85aa24be52eb597911b3d457f75dcf743115be7543c282914ea7"
+    },
+    {
+      "path": "tests/test_gemini_video.py",
+      "before": null,
+      "after": "9622654e5e8cb9da2d37cac8e7440d41dfdc165c427f82af2347bb415bf42888"
+    }
+  ],
+  "status": "deployed",
+  "hostKeySha256": "q2zNQ3JiN/xmd0W+f3sk4mNfZKKI2zm60JS6Z6nFNV4",
+  "videoStateBefore": "MainPID=0\nActiveState=failed",
+  "controlIdleGuard": {
+    "event": "locked",
+    "bothControlLocksHeld": true,
+    "leaseSeconds": 120
+  },
+  "videoGuard": {
+    "event": "video_locked",
+    "serviceState": "failed",
+    "mainPid": "0"
+  },
+  "backupDir": "/home/topeet/Desktop/video/.codex_backups/gemini335_video_20261106T150200Z_42b7a536",
+  "videoGuardRelease": {
+    "event": "video_unlocked",
+    "reason": "released"
+  },
+  "videoGuardExit": 0,
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  },
+  "controlGuardExit": 0
+}

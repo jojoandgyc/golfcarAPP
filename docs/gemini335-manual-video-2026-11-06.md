@@ -1,0 +1,18 @@
+# 手动页 Gemini 335 视频适配（2026-11-06）
+
+## 故障原因
+
+原独立视频服务的 `config/video.json` 固定为 Astra Pro，采集程序与 `videoctl.sh` 只识别 `astra` 和 `synthetic`。车上当前接入 Gemini 335 时，手动页的“开启视频”仍查找 Astra 的 V4L 设备路径，`rgbd-video.service` 启动失败；MediaMTX 存活不代表 RGB／深度源已就绪。手机日志显示 SSH 命令到达板端，但就绪检查超时。
+
+## 改动
+
+- 板端视频服务新增 `gemini335` 采集源，复用跟随程序现有的 Gemini SDK 适配器，只在手动视频服务运行时拥有摄像头。RGB 和已配准深度来自同一次采集，按时间戳配对。
+- `videoctl.sh start --camera auto|astra|gemini335` 可选择相机。`auto` 按当前 USB 设备识别；不带参数的旧启动命令仍可使用。视频仍发布到原 `/rgbd` 路径，关闭后释放相机。
+- Gemini 原始两路 1280×720 画面等比例缩为两幅 960×540，合成 H.264 1920×540；Astra 的 1280×480 输出保持原样。健康接口回报实际 `source_mode`，App 核对显式选择的相机。
+- App 手动页新增“自动识别 / Astra Pro / Gemini 335”选择，按相机比例显示 RGB／深度。视频运行或状态未确认时提示先关闭视频再切换。自动跟随页允许板端已支持的 Gemini 335 与避障组合。
+
+## 验证和限制
+
+板端 35 项无硬件测试通过；App 378 项 JVM 测试、3 项模拟器聚焦界面测试通过。第一次真实相机测试遇到另一个进程短暂占用 USB，服务正确拒绝抢占；该进程自行退出后，第二次测试获得持续递增的 RGB／深度帧：`/api/health` 为 `ok=true`、`source_mode=gemini335`、`depth_status=ok`，RTSP 探测为 H.264 1920×540。结束后服务停止、相机设备无持有进程，控制锁和视频锁释放。全程未运行跟随或电机。
+
+板端备份与哈希见[部署记录](gemini335-manual-video-board-deployment-2026-11-06.json)，真实采集指标见[板端测试记录](gemini335-manual-video-live-test-2026-11-06.json)，可复现补丁见[视频服务补丁](../board/patches/gemini335-manual-video-2026-11-06.patch)。本机保留带空闲锁及哈希前置检查的回滚脚本 `E:/Temp/gemini335_video_rollback.py`，尚未执行。手机真机 WebRTC 播放仍需在手机接回后确认；板端健康状态不能替代手机解码首帧验证。

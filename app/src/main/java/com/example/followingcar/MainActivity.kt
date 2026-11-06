@@ -652,11 +652,16 @@ private fun JoystickCard(state: BoardUiState, viewModel: BoardViewModel, modifie
                 Column(Modifier.fillMaxWidth().weight(1f),
                     verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     BoxWithConstraints(Modifier.fillMaxWidth().testTag("drivingCameraPanel")) {
-                        // The board joins two 4:3 frames into one 8:3 video. Reserve the same
-                        // space while disconnected so reconnecting never shifts the controls.
-                        val panelHeight = maxWidth * 3 / 8 + 48.dp
+                        // Astra combines two 4:3 frames (8:3); Gemini 335 combines two 16:9
+                        // frames (32:9). The WebRTC player fits the full composite without cropping.
+                        val geminiVideo = (state.activeVideoCamera ?: state.manualVideoCamera) ==
+                            ManualVideoCamera.GEMINI335
+                        val cameraHintHeight = if (state.canSelectManualVideoCamera) 0.dp else 20.dp
+                        val panelHeight = if (geminiVideo) maxWidth * 9 / 32 + 88.dp + cameraHintHeight
+                            else maxWidth * 3 / 8 + 88.dp + cameraHintHeight
                         BoardCameraPreview(state = state,
                             onVideoServiceEnabledChange = viewModel::setVideoServiceEnabled,
+                            onCameraChange = viewModel::selectManualVideoCamera,
                             remoteVideo = if (state.usesRemoteVideo) remoteVideo else null,
                             phoneNetwork = networkSnapshot.health.phone,
                             modifier = Modifier.fillMaxWidth().height(panelHeight))

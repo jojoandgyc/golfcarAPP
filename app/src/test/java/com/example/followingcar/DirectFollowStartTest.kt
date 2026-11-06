@@ -39,7 +39,8 @@ class DirectFollowStartTest {
                 resumeGesture = FollowResumeGesture.THUMB_UP, avoidanceEnabled = true,
                 reverseEnabled = true, reverseDistanceMeters = 1.4))
         assertTrue(ready.canStartFollow)
-        assertFalse(ready.copy(followCamera = FollowCamera.CONFIG).canStartFollow)
+        assertTrue(ready.copy(followCamera = FollowCamera.CONFIG).canStartFollow)
+        assertTrue(ready.copy(followCamera = FollowCamera.GEMINI335).canStartFollow)
         assertFalse(ready.copy(followLaunchOptions = ready.followLaunchOptions.copy(targetDistanceMeters = 0.4)).canStartFollow)
         assertFalse(ready.copy(followLaunchOptions = ready.followLaunchOptions.copy(reverseDistanceMeters = Double.NaN)).canStartFollow)
     }

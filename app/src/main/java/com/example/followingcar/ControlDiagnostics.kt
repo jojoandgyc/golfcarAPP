@@ -16,7 +16,8 @@ internal fun BoardUiState.afterAvailabilityFailure(message: String, transportCon
 internal fun BoardUiState.withTransportState(transportConnected: Boolean): BoardUiState =
     if (transportConnected) copy(connected = true) else copy(
         connected = false, status = "连接已断开",
-        videoServiceState = VideoServiceState.UNKNOWN, videoServiceMessage = "连接中断，视频服务状态未确认",
+        videoServiceState = VideoServiceState.UNKNOWN, activeVideoCamera = null,
+        videoServiceMessage = "连接中断，视频服务状态未确认",
         followConfiguration = null, followConfigurationError = null,
         followStatus = followStatus?.copy(statusAgeMs = null),
         driveConfirmedStopped = if (manualActive) false else driveConfirmedStopped,

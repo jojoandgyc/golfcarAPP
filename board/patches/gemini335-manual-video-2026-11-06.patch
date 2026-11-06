@@ -1,0 +1,775 @@
+--- a/config/camera_profiles.json
++++ b/config/camera_profiles.json
+@@ -0,0 +1,43 @@
++{
++  "astra": {
++    "camera": {
++      "mode": "astra",
++      "device": "/dev/v4l/by-id/usb-Astra_Pro_HD_Camera_Astra_Pro_HD_Camera-video-index0",
++      "openni_path": "/home/topeet/AstraSDK/arm64_openni2",
++      "width": 640,
++      "height": 480,
++      "fps": 30,
++      "fourcc": "YUYV",
++      "registration": false,
++      "max_frame_age_ms": 1000
++    },
++    "render": {"rgb_panel_width": 640, "depth_panel_width": 640, "output_height": 480}
++  },
++  "gemini335": {
++    "camera": {
++      "mode": "gemini335",
++      "device": "/dev/v4l/by-id/usb-Orbbec_R__Orbbec_Gemini_335_CP1Z842000GZ-video-index0",
++      "width": 1280,
++      "height": 720,
++      "fps": 30,
++      "max_frame_age_ms": 1000,
++      "sdk_python_path": "/home/topeet/Desktop/Gemini335/python_2_1_2_gil_release",
++      "sdk_config_path": "/home/topeet/Desktop/Gemini335/config/OrbbecSDKConfig.low_latency.xml",
++      "serial_number": "CP1Z842000GZ",
++      "align_mode": "software",
++      "color_format": "mjpg",
++      "require_usb3": true,
++      "frame_timeout_ms": 500,
++      "native_depth_width": 1280,
++      "native_depth_height": 800,
++      "native_depth_fps": 30,
++      "native_history_size": 8,
++      "orientation_deg": 0,
++      "color_exposure": -1,
++      "depth_exposure": -1,
++      "color_gain": -1,
++      "depth_gain": -1
++    },
++    "render": {"rgb_panel_width": 960, "depth_panel_width": 960, "output_height": 540}
++  }
++}
+--- a/rgbd_stream/__main__.py
++++ b/rgbd_stream/__main__.py
+@@ -17,13 +17,17 @@
+     os.environ["NO_PROXY"] = os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+     parser = argparse.ArgumentParser(description="RK3588 RGB-D WebRTC streaming service")
+     parser.add_argument("--config", default=str(ROOT / "config/video.json"))
+-    parser.add_argument("--source", choices=("astra", "synthetic"))
++    parser.add_argument("--source", choices=("astra", "gemini335", "synthetic"))
+     parser.add_argument("--port", type=int, help="Override HTTP listener port")
+     args = parser.parse_args()
+     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+     cfg = load_config(args.config)
+     if args.source:
+-        cfg["camera"]["mode"] = args.source
++        if args.source == "synthetic":
++            cfg["camera"]["mode"] = "synthetic"
++        else:
++            from .camera_select import apply_profile
++            apply_profile(cfg, args.source)
+     if args.port:
+         cfg["http"]["port"] = args.port
+     runtime = StreamRuntime(cfg)
+--- a/rgbd_stream/camera_select.py
++++ b/rgbd_stream/camera_select.py
+@@ -0,0 +1,92 @@
++"""Resolve a physical RGB-D camera before starting the standalone video service."""
++import argparse
++import json
++import os
++from pathlib import Path
++
++from .config import ROOT, load_config
++
++PROFILES = ROOT / "config/camera_profiles.json"
++USB_IDS = {"astra": ("2bc5", "0403"), "gemini335": ("2bc5", "0800")}
++
++
++def attached_cameras(sysfs_root=Path("/sys/bus/usb/devices")):
++    found = set()
++    try:
++        devices = list(Path(sysfs_root).iterdir())
++    except OSError:
++        return found
++    for device in devices:
++        try:
++            identity = ((device / "idVendor").read_text().strip().lower(),
++                        (device / "idProduct").read_text().strip().lower())
++        except OSError:
++            continue
++        for mode, expected in USB_IDS.items():
++            if identity == expected:
++                found.add(mode)
++    return found
++
++
++def resolve_camera(requested, configured, attached, *, allow_absent=False):
++    if requested not in {"auto", "astra", "gemini335"}:
++        raise ValueError("camera must be auto, astra or gemini335")
++    if requested != "auto":
++        if requested not in attached and not allow_absent:
++            raise RuntimeError(f"{requested} camera is not connected; attached={','.join(sorted(attached)) or 'none'}")
++        return requested
++    if configured in attached:
++        return configured
++    if len(attached) == 1:
++        return next(iter(attached))
++    if len(attached) > 1:
++        return "astra"  # Preserve the original default when both are attached.
++    raise RuntimeError("No supported Astra Pro or Gemini 335 USB camera is connected")
++
++
++def apply_profile(cfg, selected):
++    profiles = json.loads(PROFILES.read_text(encoding="utf-8"))
++    profile = profiles[selected]
++    cfg["camera"] = dict(profile["camera"])
++    cfg["render"].update(profile["render"])
++    from .config import validate_config
++    return validate_config(cfg)
++
++
++def select_camera(config_path, requested, *, sysfs_root=Path("/sys/bus/usb/devices"),
++                  allow_absent=False):
++    config_path = Path(config_path)
++    cfg = load_config(config_path)
++    selected = resolve_camera(requested, cfg["camera"]["mode"], attached_cameras(sysfs_root),
++                              allow_absent=allow_absent)
++    if selected == cfg["camera"]["mode"]:
++        # Preserve per-camera local tuning on repeated start, including
++        # registration and UVC device selection. Switching profiles is the
++        # only operation that replaces camera-specific values.
++        return selected
++    # Keep remaining render/video/HTTP values and control-independent settings.
++    apply_profile(cfg, selected)
++    temp = config_path.with_name(config_path.name + f".{os.getpid()}.tmp")
++    try:
++        temp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
++        os.chmod(temp, config_path.stat().st_mode & 0o777)
++        os.replace(temp, config_path)
++    finally:
++        temp.unlink(missing_ok=True)
++    return selected
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", default=str(ROOT / "config/video.json"))
++    parser.add_argument("--camera", required=True, choices=("auto", "astra", "gemini335"))
++    parser.add_argument("--allow-absent", action="store_true", help="Only for configuring a stopped service")
++    args = parser.parse_args(argv)
++    try:
++        print(select_camera(args.config, args.camera, allow_absent=args.allow_absent))
++    except (OSError, RuntimeError, ValueError, KeyError) as exc:
++        parser.exit(2, f"Video camera selection failed: {exc}\n")
++
++
++if __name__ == "__main__":
++    main()
+--- a/rgbd_stream/capture.py
++++ b/rgbd_stream/capture.py
+@@ -50,8 +50,8 @@
+     return sorted(holders)
+ 
+ 
+-def astra_depth_usb_nodes(sysfs_root='/sys/bus/usb/devices', dev_root='/dev/bus/usb'):
+-    """Read only Astra 2bc5:0403 identity files; never open a USB device node."""
++def camera_usb_nodes(identity, sysfs_root='/sys/bus/usb/devices', dev_root='/dev/bus/usb'):
++    """Read only matching USB identity files; never open a device node."""
+     nodes = set()
+     try:
+         devices = list(Path(sysfs_root).iterdir())
+@@ -61,7 +61,7 @@
+         try:
+             vendor = (device / 'idVendor').read_text().strip().lower()
+             product = (device / 'idProduct').read_text().strip().lower()
+-            if (vendor, product) != ('2bc5', '0403'):
++            if (vendor, product) != identity:
+                 continue
+             bus = int((device / 'busnum').read_text().strip())
+             address = int((device / 'devnum').read_text().strip())
+@@ -72,6 +72,14 @@
+             # an unrelated device; the SDK open remains the final authority.
+             continue
+     return sorted(nodes)
++
++
++def astra_depth_usb_nodes(sysfs_root='/sys/bus/usb/devices', dev_root='/dev/bus/usb'):
++    return camera_usb_nodes(('2bc5', '0403'), sysfs_root, dev_root)
++
++
++def gemini335_usb_nodes(sysfs_root='/sys/bus/usb/devices', dev_root='/dev/bus/usb'):
++    return camera_usb_nodes(('2bc5', '0800'), sysfs_root, dev_root)
+ 
+ 
+ class _LatestSource:
+@@ -113,7 +121,7 @@
+             return {
+                 'status': self._state,
+                 'running': self._state == 'running' and not self._stop.is_set(),
+-                'mode': 'synthetic' if isinstance(self, SyntheticSource) else 'astra',
++                'mode': self.camera.get('mode', 'synthetic' if isinstance(self, SyntheticSource) else 'astra'),
+                 'error': self._error,
+                 'rgb_age_ms': None if self._last_rgb is None else round((now - self._last_rgb) * 1000, 1),
+                 'depth_age_ms': None if self._last_depth is None else round((now - self._last_depth) * 1000, 1),
+--- a/rgbd_stream/config.py
++++ b/rgbd_stream/config.py
+@@ -11,14 +11,23 @@
+     with open(path, encoding="utf-8") as stream:
+         cfg = json.load(stream)
+     cfg = copy.deepcopy(cfg)
++    return validate_config(cfg)
++
++
++def validate_config(cfg):
+     camera, video, http = cfg["camera"], cfg["video"], cfg["http"]
+-    if camera["mode"] not in {"astra", "synthetic"}:
+-        raise ValueError("camera.mode must be astra or synthetic")
++    if camera["mode"] not in {"astra", "gemini335", "synthetic"}:
++        raise ValueError("camera.mode must be astra, gemini335 or synthetic")
+     for name in ("width", "height", "fps"):
+         if not isinstance(camera[name], int) or camera[name] <= 0:
+             raise ValueError(f"camera.{name} must be a positive integer")
+-    width = camera["width"] + cfg["render"]["depth_panel_width"]
+-    if width % 2 or camera["height"] % 2:
++    render = cfg["render"]
++    rgb_width = int(render.get("rgb_panel_width", camera["width"]))
++    depth_width = int(render["depth_panel_width"])
++    output_height = int(render.get("output_height", camera["height"]))
++    if rgb_width < 8 or depth_width < 8 or output_height < 8:
++        raise ValueError("Rendered video panels must be at least 8 pixels wide/high")
++    if (rgb_width + depth_width) % 2 or output_height % 2:
+         raise ValueError("H.264 output width and height must be even")
+     if video["encoder"] not in {"mpph264enc", "x264enc"}:
+         raise ValueError("Unsupported encoder; no silent software fallback")
+@@ -35,7 +44,6 @@
+         raise ValueError("Invalid listener port")
+     if not 1 <= http["telemetry_hz"] <= 30 or not 1 <= http["max_websockets"] <= 64:
+         raise ValueError("Invalid telemetry limits")
+-    render = cfg["render"]
+     if not 0 < render["min_depth_mm"] < render["max_depth_mm"] <= 65535:
+         raise ValueError("Invalid depth interval")
+     if render["max_depth_age_ms"] <= 0 or render["color_max_mm"] <= 0:
+--- a/rgbd_stream/gemini.py
++++ b/rgbd_stream/gemini.py
+@@ -0,0 +1,143 @@
++"""Gemini 335 RGB-D preview using the car runtime's already validated SDK adapter.
++
++The same SDK Pipeline produces registered RGB and depth. This service owns it
++only while the manual video source runs; no motor or follow runtime is opened.
++"""
++import fcntl
++import logging
++import os
++from pathlib import Path
++import sys
++import threading
++
++import numpy as np
++
++from .capture import (_LatestSource, CameraBusyError, CaptureShutdownError,
++                      camera_holders, gemini335_usb_nodes)
++from .frames import FrameBundle
++
++LOG = logging.getLogger(__name__)
++
++
++class Gemini335Source(_LatestSource):
++    def __init__(self, camera):
++        super().__init__(camera)
++        self._backend = None
++        self._lock_path = Path(camera.get('lock_path', '/home/topeet/Desktop/video/run/camera.lock')).expanduser()
++        self._lock_fd = None
++        self._depth_registered = False
++
++    def _acquire_camera_lock(self):
++        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
++        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError as exc:
++            os.close(fd)
++            raise CameraBusyError(f'camera busy: another video instance holds {self._lock_path}') from exc
++        except BaseException:
++            os.close(fd)
++            raise
++        self._lock_fd = fd
++
++    def _make_backend(self):
++        module_path = str(self.camera.get('runtime_module_path', '/home/topeet/Desktop/rk_car_runtime_module'))
++        if module_path not in sys.path:
++            sys.path.insert(0, module_path)
++        from car_control_modular.astra_depth import AstraDepthConfig
++        from car_control_modular.gemini335_rgbd import Gemini335Config, Gemini335Runtime
++        depth_config = AstraDepthConfig(
++            width=self.width, height=self.height, fps=self.fps,
++            rgb_processing_delay_sec=0.0,
++        )
++        keys = Gemini335Config.__dataclass_fields__
++        native_config = Gemini335Config(**{
++            key: self.camera[key] for key in keys if key in self.camera
++        })
++        return Gemini335Runtime(depth_config, native_config, logger=LOG)
++
++    def start(self):
++        with self._lifecycle_lock:
++            if self._lock_fd is not None:
++                raise CameraBusyError('Gemini335 source is already started or still requires a successful close')
++            self._prepare_start()
++            self._depth_registered = False
++            try:
++                self._acquire_camera_lock()
++                nodes = gemini335_usb_nodes()
++                if not nodes:
++                    raise RuntimeError('Gemini335 USB device 2bc5:0800 is not connected')
++                for node in nodes:
++                    holders = camera_holders(node)
++                    if holders:
++                        raise CameraBusyError(f'camera busy: {node}; held by PIDs {holders}; no device was opened')
++                backend = self._make_backend()
++                self._backend = backend
++                backend.start()
++                self._depth_registered = True  # Gemini SDK D2C registration was requested and validated.
++                with self._lock:
++                    self._state = 'running'
++                self._threads = [threading.Thread(target=self._read_pairs, name='rgbd-gemini335', daemon=True)]
++                self._threads[0].start()
++            except Exception as exc:
++                self._fail(exc)
++                self.close()
++                raise
++
++    def _read_pairs(self):
++        seq = 0
++        try:
++            while not self._stop.is_set():
++                ok, rgb, timestamp = self._backend.read_with_timestamp(timeout_sec=0.5)
++                if not ok or rgb is None or timestamp is None:
++                    continue
++                # Gemini335Runtime publishes the registered depth under the
++                # exact timestamp returned with this BGR frame. Never pair it
++                # with a later, unrelated depth sample.
++                samples = self._backend.copy_depth_history(
++                    after_timestamp=max(0.0, float(timestamp) - 0.000001), max_frames=16)
++                pair = next(((stamp, depth) for stamp, depth in reversed(samples)
++                             if abs(stamp - timestamp) <= 0.000001), None)
++                if pair is None:
++                    continue
++                if rgb.shape[:2] != (self.height, self.width) or pair[1].shape != (self.height, self.width):
++                    raise RuntimeError('Gemini335 RGB/D2C dimensions changed during capture')
++                if rgb.dtype != np.uint8 or pair[1].dtype != np.uint16:
++                    raise RuntimeError('Gemini335 RGB/D2C pixel format changed during capture')
++                seq += 1
++                rgb = np.ascontiguousarray(rgb).copy()
++                rgb.flags.writeable = False
++                depth = pair[1]
++                depth.flags.writeable = False
++                with self._lock:
++                    self._latest = FrameBundle(seq, rgb, depth, float(timestamp), float(pair[0]), True)
++                    self._last_rgb = float(timestamp)
++                    self._last_depth = float(pair[0])
++        except Exception as exc:
++            if not self._stop.is_set():
++                self._fail(exc)
++
++    def close(self):
++        with self._lifecycle_lock:
++            if not self._join_readers():
++                raise CaptureShutdownError(self._error or 'Gemini335 reader did not stop')
++            if self._backend is not None:
++                try:
++                    self._backend.close()
++                except Exception as exc:
++                    message = 'Gemini335 SDK close failed; camera ownership lock retained'
++                    with self._lock:
++                        self._state, self._error = 'error', message
++                    raise CaptureShutdownError(message) from exc
++                self._backend = None
++            if self._lock_fd is not None:
++                os.close(self._lock_fd)
++                self._lock_fd = None
++
++    def health(self):
++        result = super().health()
++        result.update(source='gemini335', synthetic=False,
++                      device=self.camera.get('device'),
++                      depth_registered=self._depth_registered,
++                      ownership_lock_held=self._lock_fd is not None)
++        return result
+--- a/rgbd_stream/http_api.py
++++ b/rgbd_stream/http_api.py
+@@ -28,14 +28,17 @@
+         "source_mode": cfg["camera"]["mode"],
+         "video": {"codec": "H264", "width": runtime.width, "height": runtime.height,
+                   "fps": cfg["video"]["fps"], "bitrate": cfg["video"]["bitrate"],
+-                  "layout": "rgb_left_depth_right", "rgb_width": cfg["camera"]["width"],
++                  "layout": "rgb_left_depth_right", "rgb_width": cfg["render"].get("rgb_panel_width", cfg["camera"]["width"]),
++                  "source_rgb_width": cfg["camera"]["width"],
++                  "source_rgb_height": cfg["camera"]["height"],
+                   "whep_url": f"{media_base}/{path}/whep",
+                   "webrtc_page_url": f"{media_base}/{path}", "preview_url": f"{base}/preview"},
+         "telemetry": {"websocket_url": f"{ws_scheme}://{request.host}/ws",
+                       "interval_ms": round(1000 / cfg["http"]["telemetry_hz"]),
+                       "timebase": "board_monotonic_ns", "synchronized_with_playback": False},
+         "depth": {"unit": "mm", "raw_stream": False,
+-                  "registration_requested": cfg["camera"].get("registration", False),
++                  "registration_requested": (cfg["camera"]["mode"] == "gemini335"
++                                             or cfg["camera"].get("registration", False)),
+                   "color_max_mm": cfg["render"]["color_max_mm"],
+                   "stale_after_ms": cfg["render"]["max_depth_age_ms"],
+                   "measurement": "median_of_valid_pixels_in_depth_image_thirds"},
+--- a/rgbd_stream/render.py
++++ b/rgbd_stream/render.py
+@@ -27,9 +27,14 @@
+     color_max = int(settings.get('color_max_mm', 5000))
+     age_limit = float(settings.get('max_depth_age_ms', 200))
+     panel_width = int(settings.get('depth_panel_width', 640))
+-    if minimum < 1 or maximum <= minimum or color_max <= minimum or age_limit < 0 or panel_width < 3:
++    source_height, source_width = bundle.rgb.shape[:2]
++    rgb_width = int(settings.get('rgb_panel_width', source_width))
++    output_height = int(settings.get('output_height', source_height))
++    if (minimum < 1 or maximum <= minimum or color_max <= minimum or age_limit < 0
++            or panel_width < 3 or rgb_width < 8 or output_height < 8):
+         raise ValueError('invalid depth render limits or panel width')
+-    rgb = bundle.rgb.copy()
++    rgb = (bundle.rgb.copy() if (rgb_width, output_height) == (source_width, source_height)
++           else cv2.resize(bundle.rgb, (rgb_width, output_height), interpolation=cv2.INTER_AREA))
+     height, width = rgb.shape[:2]
+     depth = bundle.depth_mm
+     has_depth = depth is not None and bundle.depth_timestamp is not None
+@@ -104,6 +109,8 @@
+         'synthetic': bundle.synthetic,
+         'video_width': width + panel_width,
+         'video_height': height,
++        'source_rgb_width': source_width,
++        'source_rgb_height': source_height,
+         'depth_color_min_mm': minimum,
+         'depth_color_max_mm': color_max,
+     }
+--- a/rgbd_stream/service.py
++++ b/rgbd_stream/service.py
+@@ -42,11 +42,11 @@
+ 
+     @property
+     def width(self):
+-        return self.config["camera"]["width"] + self.config["render"]["depth_panel_width"]
++        return self.config["render"].get("rgb_panel_width", self.config["camera"]["width"]) + self.config["render"]["depth_panel_width"]
+ 
+     @property
+     def height(self):
+-        return self.config["camera"]["height"]
++        return self.config["render"].get("output_height", self.config["camera"]["height"])
+ 
+     def start(self):
+         self._thread = threading.Thread(target=self._run, name="rgbd-stream-worker", daemon=True)
+@@ -55,6 +55,9 @@
+     def _make_source(self):
+         mode = self.config["camera"]["mode"]
+         from .capture import AstraSource, SyntheticSource
++        if mode == "gemini335":
++            from .gemini import Gemini335Source
++            return Gemini335Source(self.config["camera"])
+         return {"astra": AstraSource, "synthetic": SyntheticSource}[mode](self.config["camera"])
+ 
+     def _placeholder(self, label):
+--- a/scripts/videoctl.sh
++++ b/scripts/videoctl.sh
+@@ -1,10 +1,46 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ VIDEO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
++lock_mutation() {
++  mkdir -p "$VIDEO_ROOT/run"
++  exec 9>"$VIDEO_ROOT/run/videoctl.lock"
++  flock -x 9
++}
+ case "${1:-status}" in
+-  start) sudo systemctl start rgbd-mediamtx.service rgbd-video.service ;;
+-  stop) sudo systemctl stop rgbd-video.service rgbd-mediamtx.service ;;
+-  restart) sudo systemctl restart rgbd-video.service ;;
++  start)
++    lock_mutation
++    if [[ $# -eq 1 ]]; then
++      requested=""
++    elif [[ $# -eq 3 && "${2:-}" == "--camera" ]]; then
++      requested="${3:-}"
++      case "$requested" in auto|astra|gemini335) ;; *) echo 'camera must be auto|astra|gemini335' >&2; exit 2 ;; esac
++    else
++      echo 'Usage: videoctl.sh start [--camera auto|astra|gemini335]' >&2; exit 2
++    fi
++    if systemctl is-active --quiet rgbd-video.service; then
++      active_mode="$(python3 - "$VIDEO_ROOT/config/video.json" <<'PY'
++import json,sys
++print(json.load(open(sys.argv[1], encoding='utf-8'))['camera']['mode'])
++PY
++)"
++      if [[ "$requested" != "" && "$requested" != "auto" && "$requested" != "$active_mode" ]]; then
++        echo "Video already running with camera=$active_mode; stop it before selecting $requested" >&2
++        exit 1
++      fi
++      echo "Video service already active: camera=$active_mode"
++      exit 0
++    fi
++    if [[ -n "$requested" ]]; then
++      selected="$(cd "$VIDEO_ROOT" && python3 -m rgbd_stream.camera_select --camera "$requested")"
++      echo "Video camera selected: $selected"
++    fi
++    sudo systemctl start rgbd-mediamtx.service rgbd-video.service ;;
++  stop)
++    lock_mutation
++    sudo systemctl stop rgbd-video.service rgbd-mediamtx.service ;;
++  restart)
++    lock_mutation
++    sudo systemctl restart rgbd-video.service ;;
+   status)
+     systemctl --no-pager --full status rgbd-mediamtx.service rgbd-video.service || true
+     curl --noproxy '*' --max-time 3 -sS http://127.0.0.1:8080/api/health || true
+@@ -12,12 +48,16 @@
+   logs) journalctl -u rgbd-video.service -u rgbd-mediamtx.service -f ;;
+   mode)
+     VIDEO_MODE="${2:-}"
+-    case "$VIDEO_MODE" in astra|synthetic) ;; *) echo 'Usage: videoctl.sh mode astra|synthetic' >&2; exit 2 ;; esac
++    case "$VIDEO_MODE" in astra|gemini335|synthetic) ;; *) echo 'Usage: videoctl.sh mode astra|gemini335|synthetic' >&2; exit 2 ;; esac
++    lock_mutation
+     if systemctl is-active --quiet rgbd-video.service; then
+       echo 'Stop the video service before changing camera mode.' >&2
+       exit 1
+     fi
+-    python3 - "$VIDEO_ROOT/config/video.json" "$VIDEO_MODE" <<'PY'
++    if [[ "$VIDEO_MODE" != synthetic ]]; then
++      (cd "$VIDEO_ROOT" && python3 -m rgbd_stream.camera_select --camera "$VIDEO_MODE" --allow-absent)
++    else
++      python3 - "$VIDEO_ROOT/config/video.json" "$VIDEO_MODE" <<'PY'
+ import json, pathlib, sys
+ path = pathlib.Path(sys.argv[1])
+ cfg = json.loads(path.read_text())
+@@ -26,6 +66,7 @@
+ temporary.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + '\n')
+ temporary.replace(path)
+ PY
++    fi
+     echo "Configured $VIDEO_MODE; service remains stopped. Start it manually when needed." ;;
+-  *) echo 'Usage: videoctl.sh start|stop|restart|status|logs|mode astra|synthetic' >&2; exit 2 ;;
++  *) echo 'Usage: videoctl.sh start [--camera auto|astra|gemini335]|stop|restart|status|logs|mode astra|gemini335|synthetic' >&2; exit 2 ;;
+ esac
+--- a/tests/test_gemini_video.py
++++ b/tests/test_gemini_video.py
+@@ -0,0 +1,223 @@
++import json
++import fcntl
++from pathlib import Path
++import threading
++import time
++from unittest.mock import patch
++
++import numpy as np
++import pytest
++
++from rgbd_stream.camera_select import attached_cameras, resolve_camera, select_camera
++from rgbd_stream.capture import CameraBusyError, CaptureShutdownError
++from rgbd_stream.config import ROOT, load_config
++from rgbd_stream.gemini import Gemini335Source
++from rgbd_stream.http_api import stream_info
++from rgbd_stream.render import render_bundle
++from rgbd_stream.service import StreamRuntime
++
++
++def _usb(folder, name, vid, pid):
++    path = folder / name
++    path.mkdir()
++    (path / 'idVendor').write_text(vid)
++    (path / 'idProduct').write_text(pid)
++
++
++def test_auto_selects_only_present_camera_and_never_test_source(tmp_path):
++    _usb(tmp_path, 'camera', '2bc5', '0800')
++    attached = attached_cameras(tmp_path)
++    assert attached == {'gemini335'}
++    assert resolve_camera('auto', 'astra', attached) == 'gemini335'
++    with pytest.raises(RuntimeError, match='not connected'):
++        resolve_camera('astra', 'astra', attached)
++    assert resolve_camera('astra', 'astra', attached, allow_absent=True) == 'astra'
++    with pytest.raises(RuntimeError, match='No supported'):
++        resolve_camera('auto', 'synthetic', set())
++
++
++def test_auto_uses_current_camera_when_both_and_original_default_if_unknown():
++    both = {'astra', 'gemini335'}
++    assert resolve_camera('auto', 'gemini335', both) == 'gemini335'
++    assert resolve_camera('auto', 'synthetic', both) == 'astra'
++
++
++def test_selection_preserves_other_video_settings_and_uses_equal_scale(tmp_path):
++    _usb(tmp_path, 'camera', '2bc5', '0800')
++    cfg = load_config(ROOT / 'config/video.json')
++    cfg['video']['bitrate'] = 2_345_678
++    path = tmp_path / 'video.json'
++    path.write_text(json.dumps(cfg), encoding='utf-8')
++    assert select_camera(path, 'auto', sysfs_root=tmp_path) == 'gemini335'
++    selected = load_config(path)
++    assert selected['camera']['mode'] == 'gemini335'
++    assert selected['camera']['width'] == 1280
++    assert selected['camera']['height'] == 720
++    assert selected['render']['rgb_panel_width'] == 960
++    assert selected['render']['depth_panel_width'] == 960
++    assert selected['render']['output_height'] == 540
++    assert selected['video']['bitrate'] == 2_345_678
++    runtime = StreamRuntime(selected)
++    assert (runtime.width, runtime.height) == (1920, 540)
++    info = stream_info(type('Request', (), {'host': '127.0.0.1:8080', 'scheme': 'http'})(), runtime, selected)
++    assert (info['video']['width'], info['video']['height']) == (1920, 540)
++    assert info['video']['rgb_width'] == 960
++    assert info['source_mode'] == 'gemini335'
++    assert info['depth']['registration_requested'] is True
++    assert runtime.health()['source_mode'] == 'gemini335'
++
++
++def test_reselecting_same_camera_preserves_tuned_settings_and_file(tmp_path):
++    _usb(tmp_path, 'camera', '2bc5', '0403')
++    cfg = load_config(ROOT / 'config/video.json')
++    cfg['camera']['registration'] = True
++    cfg['camera']['device'] = '/dev/v4l/by-id/user-selected-astra'
++    cfg['render']['depth_panel_width'] = 700
++    path = tmp_path / 'video.json'
++    path.write_text(json.dumps(cfg), encoding='utf-8')
++    original = path.read_bytes()
++    assert select_camera(path, 'auto', sysfs_root=tmp_path) == 'astra'
++    assert path.read_bytes() == original
++
++
++def test_render_resizes_both_panes_without_cropping_or_changing_depth_stats():
++    from rgbd_stream.frames import FrameBundle
++    rgb = np.zeros((720, 1280, 3), np.uint8)
++    rgb[:, :640] = (0, 0, 255)
++    depth = np.full((720, 1280), 2000, np.uint16)
++    bundle = FrameBundle(1, rgb, depth, 10.0, 10.0, True)
++    canvas, data = render_bundle(bundle, {
++        'rgb_panel_width': 960, 'depth_panel_width': 960, 'output_height': 540,
++    })
++    assert canvas.shape == (540, 1920, 3)
++    assert data['source_rgb_width'] == 1280 and data['source_rgb_height'] == 720
++    assert data['regions']['center']['median_m'] == 2.0
++    assert np.array_equal(bundle.rgb, rgb)
++    assert np.array_equal(bundle.depth_mm, depth)
++
++
++class FakeBackend:
++    def __init__(self, *, fail_start=False, fail_close=False):
++        self.fail_start, self.fail_close = fail_start, fail_close
++        self.started = False
++        self.closed = False
++        self.delivered = False
++        self.stop = threading.Event()
++        self.timestamp = time.monotonic()
++
++    def start(self):
++        if self.fail_start:
++            raise RuntimeError('fake SDK start failed')
++        self.started = True
++
++    def read_with_timestamp(self, timeout_sec=0.5):
++        if self.stop.wait(0.01):
++            return False, None, None
++        if self.delivered:
++            return False, None, None
++        self.delivered = True
++        return True, np.zeros((120, 160, 3), np.uint8), self.timestamp
++
++    def copy_depth_history(self, **kwargs):
++        return ((self.timestamp, np.full((120, 160), 1200, np.uint16)),)
++
++    def close(self):
++        if self.fail_close:
++            raise RuntimeError('fake SDK close failed')
++        self.stop.set()
++        self.closed = True
++
++
++def _source(tmp_path):
++    return Gemini335Source({
++        'mode': 'gemini335', 'width': 160, 'height': 120, 'fps': 10,
++        'lock_path': str(tmp_path / 'camera.lock'),
++    })
++
++
++def test_gemini_source_delivers_registered_pair_and_releases_sdk(tmp_path):
++    source = _source(tmp_path)
++    backend = FakeBackend()
++    with patch('rgbd_stream.gemini.gemini335_usb_nodes', return_value=['/dev/fake-usb']), \
++            patch('rgbd_stream.gemini.camera_holders', return_value=[]), \
++            patch.object(source, '_make_backend', return_value=backend):
++        source.start()
++        deadline = time.monotonic() + 1
++        frame = None
++        while frame is None and time.monotonic() < deadline:
++            frame = source.latest()
++            time.sleep(0.01)
++        assert frame is not None and frame.depth_registered
++        assert frame.depth_mm.shape == frame.rgb.shape[:2]
++        assert frame.rgb_timestamp == frame.depth_timestamp
++        assert source.health()['mode'] == 'gemini335'
++        assert source.health()['ownership_lock_held']
++        source.close()
++    assert backend.closed and not source.health()['ownership_lock_held']
++
++
++def test_busy_gemini_usb_never_opens_sdk_or_releases_other_lock(tmp_path):
++    source = _source(tmp_path)
++    with patch('rgbd_stream.gemini.gemini335_usb_nodes', return_value=['/dev/fake-usb']), \
++            patch('rgbd_stream.gemini.camera_holders', return_value=[456]), \
++            patch.object(source, '_make_backend') as make_backend:
++        with pytest.raises(CameraBusyError, match='camera busy'):
++            source.start()
++        make_backend.assert_not_called()
++    assert not source.health()['ownership_lock_held']
++
++
++def test_gemini_video_lock_owned_by_other_process_blocks_sdk(tmp_path):
++    source = _source(tmp_path)
++    lock_path = tmp_path / 'camera.lock'
++    with lock_path.open('w') as other:
++        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        with patch.object(source, '_make_backend') as make_backend:
++            with pytest.raises(CameraBusyError, match='another video instance'):
++                source.start()
++            make_backend.assert_not_called()
++        assert not source.health()['ownership_lock_held']
++        with lock_path.open('r') as contender:
++            with pytest.raises(BlockingIOError):
++                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
++
++
++def test_sdk_start_failure_closes_backend_and_camera_lock(tmp_path):
++    source = _source(tmp_path)
++    backend = FakeBackend(fail_start=True)
++    with patch('rgbd_stream.gemini.gemini335_usb_nodes', return_value=['/dev/fake-usb']), \
++            patch('rgbd_stream.gemini.camera_holders', return_value=[]), \
++            patch.object(source, '_make_backend', return_value=backend):
++        with pytest.raises(RuntimeError, match='fake SDK start failed'):
++            source.start()
++    assert backend.closed and not source.health()['ownership_lock_held']
++
++
++def test_sdk_close_failure_retains_camera_lock(tmp_path):
++    source = _source(tmp_path)
++    backend = FakeBackend(fail_close=True)
++    with patch('rgbd_stream.gemini.gemini335_usb_nodes', return_value=['/dev/fake-usb']), \
++            patch('rgbd_stream.gemini.camera_holders', return_value=[]), \
++            patch.object(source, '_make_backend', return_value=backend):
++        source.start()
++        with pytest.raises(CaptureShutdownError, match='lock retained'):
++            source.close()
++        assert source.health()['ownership_lock_held']
++        backend.fail_close = False
++        source.close()
++    assert not source.health()['ownership_lock_held']
++
++
++def test_missing_gemini_first_pair_never_reports_ready(tmp_path):
++    source = _source(tmp_path)
++    backend = FakeBackend()
++    backend.delivered = True
++    with patch('rgbd_stream.gemini.gemini335_usb_nodes', return_value=['/dev/fake-usb']), \
++            patch('rgbd_stream.gemini.camera_holders', return_value=[]), \
++            patch.object(source, '_make_backend', return_value=backend):
++        source.start()
++        time.sleep(0.08)
++        assert source.latest() is None
++        assert source.health()['frame_id'] is None
++        source.close()
++    assert backend.closed and not source.health()['ownership_lock_held']

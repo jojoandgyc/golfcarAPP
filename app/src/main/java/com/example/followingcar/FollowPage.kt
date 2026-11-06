@@ -234,7 +234,7 @@ internal fun FollowPage(
                                 label = { Text(gesture.label) }, modifier = Modifier.weight(1f).testTag("followGesture_${gesture.argument}"))
                         }
                     }
-                    FollowToggle("前方避障", "实验功能 · 开启后自动选用 Astra Pro", options.avoidanceEnabled,
+                    FollowToggle("前方避障", "实验功能 · 使用上方选定的相机", options.avoidanceEnabled,
                         settingsEnabled, "followAvoidance") { onOptionsChange(options.copy(avoidanceEnabled = it)) }
                     FollowToggle("倒车跟随", "过近时倒车，保持同一跟随距离", options.reverseEnabled,
                         settingsEnabled, "followReverse") {

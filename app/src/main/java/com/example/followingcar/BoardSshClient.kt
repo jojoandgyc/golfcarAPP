@@ -296,20 +296,21 @@ class BoardSshClient {
     }
 
     /** Read-only: inspect both streaming services and live RGB/depth health without starting them. */
-    suspend fun readVideoServiceState(
+    suspend fun readVideoServiceInspection(
         diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
-    ): VideoServiceState =
-        parseVideoServiceState(execute(videoServiceCommand(), timeoutMillis = 15_000L,
+    ): VideoServiceInspection =
+        parseVideoServiceInspection(execute(videoServiceCommand(), timeoutMillis = 15_000L,
             kind = "video_inspect", diagnostic = diagnostic))
 
     /** Uses the board's videoctl.sh; success includes readiness or confirmed camera release. */
     suspend fun setVideoServiceEnabled(
         enabled: Boolean, diagnostic: DiagnosticContext = Diagnostics.newContext(diagnosticConnectionId),
-    ): VideoServiceState =
-        requireVideoServiceState(
-            execute(videoServiceCommand(enabled), timeoutMillis = if (enabled) 60_000L else 45_000L,
+        camera: ManualVideoCamera = ManualVideoCamera.AUTO,
+    ): VideoServiceInspection =
+        requireVideoServiceInspection(
+            execute(videoServiceCommand(enabled, camera), timeoutMillis = if (enabled) 60_000L else 45_000L,
                 kind = if (enabled) "video_start" else "video_stop", diagnostic = diagnostic),
-            enabled,
+            enabled, camera,
         )
 
     /**

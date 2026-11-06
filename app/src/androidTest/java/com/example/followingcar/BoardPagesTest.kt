@@ -4,6 +4,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.assertWidthIsAtLeast
@@ -164,6 +165,26 @@ class BoardPagesTest {
     }
 
     @Test
+    fun manualVideoCameraCanBeSelectedWithoutStartingCameraOrDrive() {
+        val vm = compose.runOnUiThread { (compose.activity.application as FollowingCarApplication).boardViewModel }
+        compose.onNodeWithTag("pageJoystick").performClick()
+        compose.onNodeWithTag("manualVideoCameraSelector").assertIsDisplayed()
+        compose.onNodeWithTag("manualVideoCamera_astra").assertIsEnabled().performClick()
+        val astraPanelHeight = compose.onNodeWithTag("drivingCameraPanel").fetchSemanticsNode().boundsInRoot.height
+        compose.onNodeWithTag("manualVideoCamera_gemini335").assertIsEnabled().performClick()
+        compose.onNodeWithTag("manualVideoCamera_gemini335").assertIsSelected()
+        val geminiPanelHeight = compose.onNodeWithTag("drivingCameraPanel").fetchSemanticsNode().boundsInRoot.height
+        assertTrue("Gemini 335 32:9 preview should be shorter than Astra 8:3", geminiPanelHeight < astraPanelHeight)
+        compose.runOnIdle {
+            assertEquals(ManualVideoCamera.GEMINI335, vm.state.value.manualVideoCamera)
+            assertFalse(vm.state.value.manualActive)
+            assertFalse(vm.state.value.videoServiceBusy)
+        }
+        compose.onNodeWithTag("videoServiceToggle").assertIsNotEnabled()
+        compose.onNodeWithTag("manualVideoCamera_auto").performClick()
+    }
+
+    @Test
     fun drivingVideoAndControlsFitWithoutPageScrolling() {
         compose.onNodeWithTag("boardHeader").assertIsDisplayed()
         compose.onNodeWithTag("connectionSetupCard").assertIsDisplayed()
@@ -200,12 +221,14 @@ class BoardPagesTest {
     }
 
     @Test
-    fun enablingAvoidanceSelectsAstraAndChoosingAnotherCameraDisablesAvoidance() {
+    fun geminiCameraKeepsAvoidanceEnabled() {
         compose.onNodeWithTag("pageFollow").performClick()
-        compose.onNodeWithTag("followAvoidance").performScrollTo().assertIsEnabled().performClick()
-        compose.onNodeWithTag("followCamera_astra-pro").performScrollTo().assertIsSelected()
         compose.onNodeWithTag("followCamera_gemini335").performScrollTo().performClick()
-        compose.onNodeWithTag("followAvoidance").performScrollTo().assertIsOff()
+        compose.onNodeWithTag("followAvoidance").performScrollTo().assertIsEnabled().performClick()
+        compose.onNodeWithTag("followCamera_gemini335").performScrollTo().assertIsSelected()
+        compose.onNodeWithTag("followAvoidance").performScrollTo().assertIsOn()
+        compose.onNodeWithTag("followCamera_astra-pro").performScrollTo().performClick()
+        compose.onNodeWithTag("followAvoidance").performScrollTo().assertIsOn()
     }
 
     @Test

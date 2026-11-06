@@ -1,0 +1,119 @@
+{
+  "startedUtc": "2026-11-06T15:06:11.917410+00:00",
+  "scope": "Gemini335 video only; no motor/follow",
+  "route": "direct_172.16.16.122",
+  "guard": {
+    "controlIdle": true,
+    "videoExclusive": true,
+    "videoBefore": {
+      "event": "video_locked",
+      "serviceState": "failed",
+      "mainPid": "0"
+    }
+  },
+  "configBeforeSha256": "30fbf86fa462f57d73292ec7fc12906d29910c4d5b65f084f4f9b4841050ae76",
+  "configBackup": "/home/topeet/Desktop/video/.codex_backups/gemini335_video_20261106T150200Z_42b7a536/config/video.json",
+  "configBackupSha256": "ed78698b6cef49f654fe5f9798549346df8110d78eafe14348e2aec27313b297",
+  "selected": "gemini335",
+  "configAfterSha256": "30fbf86fa462f57d73292ec7fc12906d29910c4d5b65f084f4f9b4841050ae76",
+  "configuredMode": "gemini335",
+  "healthSamples": [
+    {
+      "ok": false,
+      "source_mode": "gemini335",
+      "source_status": "waiting",
+      "depth_status": "waiting",
+      "frame_id": null,
+      "rgb_age_ms": null,
+      "depth_age_ms": null,
+      "media_ready": false,
+      "error": null,
+      "source_error": null
+    },
+    {
+      "ok": false,
+      "source_mode": "gemini335",
+      "source_status": "waiting",
+      "depth_status": "missing",
+      "frame_id": null,
+      "rgb_age_ms": null,
+      "depth_age_ms": null,
+      "media_ready": false,
+      "error": null,
+      "source_error": null
+    },
+    {
+      "ok": false,
+      "source_mode": "gemini335",
+      "source_status": "live",
+      "depth_status": "ok",
+      "frame_id": 21,
+      "rgb_age_ms": 66.7,
+      "depth_age_ms": 66.7,
+      "media_ready": false,
+      "error": null,
+      "source_error": null
+    },
+    {
+      "ok": true,
+      "source_mode": "gemini335",
+      "source_status": "live",
+      "depth_status": "ok",
+      "frame_id": 40,
+      "rgb_age_ms": 69.6,
+      "depth_age_ms": 69.6,
+      "media_ready": true,
+      "error": null,
+      "source_error": null
+    },
+    {
+      "ok": true,
+      "source_mode": "gemini335",
+      "source_status": "live",
+      "depth_status": "ok",
+      "frame_id": 59,
+      "rgb_age_ms": 54.6,
+      "depth_age_ms": 54.6,
+      "media_ready": true,
+      "error": null,
+      "source_error": null
+    }
+  ],
+  "streamInfo": {
+    "source_mode": "gemini335",
+    "video": {
+      "codec": "H264",
+      "width": 1920,
+      "height": 540,
+      "fps": 20,
+      "bitrate": 3000000,
+      "layout": "rgb_left_depth_right",
+      "rgb_width": 960,
+      "source_rgb_width": 1280,
+      "source_rgb_height": 720,
+      "whep_url": "http://127.0.0.1:8889/rgbd/whep",
+      "webrtc_page_url": "http://127.0.0.1:8889/rgbd",
+      "preview_url": "http://127.0.0.1:8080/preview"
+    },
+    "registration_requested": true
+  },
+  "rtspProbe": "{\n    \"programs\": [\n\n    ],\n    \"streams\": [\n        {\n            \"codec_name\": \"h264\",\n            \"width\": 1920,\n            \"height\": 540\n        }\n    ]\n}",
+  "status": "healthy_video_verified",
+  "serviceStopped": true,
+  "afterStop": {
+    "cameraLockFree": true,
+    "service": "MainPID=0\nActiveState=inactive",
+    "geminiUsbHolders": {
+      "/dev/bus/usb/010/002": []
+    }
+  },
+  "videoGuardRelease": {
+    "event": "video_unlocked",
+    "reason": "released"
+  },
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  },
+  "finishedUtc": "2026-11-06T15:06:22.991188+00:00"
+}

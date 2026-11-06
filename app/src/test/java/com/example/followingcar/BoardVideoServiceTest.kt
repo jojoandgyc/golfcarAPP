@@ -2,7 +2,9 @@ package com.example.followingcar
 
 import java.io.IOException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BoardVideoServiceTest {
@@ -13,7 +15,40 @@ class BoardVideoServiceTest {
         video: String = running,
         media: String = running,
         health: String = "ready",
-    ) = CommandResult("inspect", "VIDEO_SERVICE_V1\t$video\t$media\t$health\n", "", 0)
+        sourceMode: String? = null,
+    ) = CommandResult("inspect", "VIDEO_SERVICE_V1\t$video\t$media\t$health" +
+        (sourceMode?.let { "\t$it" } ?: "") + "\n", "", 0)
+
+    @Test
+    fun manualCameraStartUsesFixedArgumentAndInspectsActualSource() {
+        val start = videoServiceCommand(true, ManualVideoCamera.GEMINI335)
+        assertTrue(start.contains("CAMERA = 'gemini335'"))
+        assertTrue(start.contains("command += ['--camera', CAMERA]"))
+        val stop = videoServiceCommand(false, ManualVideoCamera.GEMINI335)
+        assertTrue(stop.contains("if ACTION == 'start':"))
+        assertEquals(ManualVideoCamera.GEMINI335,
+            requireVideoServiceInspection(snapshot(sourceMode = "gemini335"), true,
+                ManualVideoCamera.GEMINI335).activeCamera)
+        assertThrows(IOException::class.java) {
+            requireVideoServiceInspection(snapshot(sourceMode = "astra"), true,
+                ManualVideoCamera.GEMINI335)
+        }
+        assertThrows(IOException::class.java) {
+            requireVideoServiceInspection(snapshot(), true, ManualVideoCamera.GEMINI335)
+        }
+    }
+
+    @Test
+    fun videoCameraSelectionRequiresKnownStoppedServiceWhenConnected() {
+        val disconnected = BoardUiState()
+        assertTrue(disconnected.canSelectManualVideoCamera)
+        val stopped = disconnected.copy(connected = true, videoServiceState = VideoServiceState.STOPPED)
+        assertTrue(stopped.canSelectManualVideoCamera)
+        assertFalse(stopped.copy(videoServiceState = VideoServiceState.RUNNING).canSelectManualVideoCamera)
+        assertFalse(stopped.copy(videoServiceState = VideoServiceState.UNKNOWN).canSelectManualVideoCamera)
+        assertFalse(stopped.copy(driveEnabled = true).canSelectManualVideoCamera)
+        assertFalse(stopped.copy(followActive = true).canSelectManualVideoCamera)
+    }
 
     @Test
     fun processStartedWithoutLiveRgbAndDepthIsNotReady() {
