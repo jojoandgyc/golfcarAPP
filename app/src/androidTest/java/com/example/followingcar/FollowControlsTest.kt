@@ -248,7 +248,7 @@ class FollowControlsTest {
         compose.onNodeWithTag("startFollow").assertDoesNotExist()
         compose.runOnIdle { state.value = state.value.copy(followActive = false, followTerminal = true,
             followStatus = state.value.followStatus!!.copy(processExited = true)) }
-        compose.onNodeWithTag("followStatusTitle").assertTextEquals("跟随异常结束")
+        compose.onNodeWithTag("followStatusTitle").assertTextEquals("上次跟随异常结束")
         openDetails()
         compose.onNodeWithTag("followRunState").assertTextEquals("软件状态：故障退出")
         compose.onNodeWithTag("followPhysicalStopped").performScrollTo().assertTextEquals("机械停稳：未知")
@@ -289,8 +289,35 @@ class FollowControlsTest {
         compose.onNodeWithTag("followPhysicalStopped").performScrollTo()
         compose.onNodeWithTag("stopFollow").assertIsDisplayed().assertIsEnabled().performClick()
         assertEquals(stopBottom, compose.onNodeWithTag("stopFollow").fetchSemanticsNode().boundsInRoot.bottom, 1f)
-        compose.runOnIdle { assertEquals(1, stops); state.value = state.value.copy(followStopping = true) }
+        compose.runOnIdle { assertEquals(1, stops); state.value = state.value.copy(followStopping = true, followStopPending = true) }
         compose.onNodeWithTag("stopFollow").assertIsDisplayed().assertIsNotEnabled()
+    }
+
+    @Test fun liveBoardRequestedShutdownStillAllowsOneAppStopAndTerminalHasNoStopButton() {
+        val state = mutableStateOf(ready())
+        var stops = 0
+        compose.setContent { TestPage(state.value, onStop = {
+            stops++
+            state.value = state.value.copy(followStopPending = true)
+        }) }
+        for ((index, phase) in listOf("FAULT", "STOPPING").withIndex()) {
+            compose.runOnIdle {
+                state.value = ready().copy(followActive = true, followStopping = true,
+                    followStatus = status().copy(runState = phase, stopRequested = true, processExited = false))
+            }
+            compose.onNodeWithTag("startFollow").assertDoesNotExist()
+            compose.onNodeWithTag("stopFollow").assertIsDisplayed().assertIsEnabled().performClick()
+            compose.onNodeWithTag("stopFollow").assertIsNotEnabled()
+            compose.runOnIdle { assertEquals(index + 1, stops) }
+        }
+        compose.runOnIdle {
+            state.value = ready().copy(followTerminal = true,
+                followStatus = status().copy(runState = "FAULT", processExited = true, stopRequested = true))
+        }
+        compose.onNodeWithTag("stopFollow").assertDoesNotExist()
+        compose.onNodeWithTag("followStatusTitle").assertTextEquals("上次跟随异常结束")
+        compose.onNodeWithTag("startFollow").assertIsEnabled()
+        compose.runOnIdle { assertEquals(2, stops) }
     }
 
     private fun openDetails() { compose.onNodeWithTag("followDetailsToggle").performScrollTo().performClick() }

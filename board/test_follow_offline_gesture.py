@@ -267,6 +267,68 @@ class OfflineGestureTests(unittest.TestCase):
         self.hold(10.7)
         self.assertTrue(self.guard.stopped.is_set())
 
+    def test_unrelated_telemetry_under_lock_contention_never_discards_offline_hold(self):
+        sequence = []
+        self.detach()
+        sequence.append("D")
+        self.frame(10.1)
+        sequence.append("palm_1")
+        self.frame(10.3)
+        sequence.append("palm_2")
+        cached = self.guard._offline_observer
+        # The state lock may briefly belong to another telemetry/lease thread.
+        # These non-gesture callbacks must not wait or reset any evidence.
+        with self.guard._state_lock:
+            for event in ("feedback", "capture", "target", "gesture_decision"):
+                self.guard.observe_gesture_command(event, {})
+                sequence.append(event)
+                self.assertIs(self.guard._offline_observer, cached)
+        event = self.frame(10.5)
+        sequence.append(event["source"])
+        self.assertEqual(sequence, ["D", "palm_1", "palm_2", "feedback", "capture",
+                                    "target", "gesture_decision", "offline_stop_gate"])
+        self.assertEqual(self.guard.reason, "app_offline_stop_gesture")
+
+    def test_nonqualifying_gesture_telemetry_cannot_clear_offline_evidence(self):
+        self.detach()
+        self.frame(10.1)
+        self.frame(10.3)
+        cached = self.guard._offline_observer
+        candidate = dict(action="pause", gesture="Open_Palm", source="offline_stop_gate",
+                         captured_at=10.4, app_offline_epoch=self.guard.network_state[0])
+        with self.guard._state_lock:
+            for change in ({"source": "online"}, {"action": "resume"},
+                           {"gesture": "Thumb_Up"}, {"captured_at": float("nan")},
+                           {"captured_at": True}):
+                self.guard.observe_gesture_command("gesture_command", dict(candidate, **change))
+                self.assertIs(self.guard._offline_observer, cached)
+        self.frame(10.5)
+        self.assertEqual(self.guard.reason, "app_offline_stop_gesture")
+
+    def test_reconnect_still_clears_hold_after_unrelated_telemetry_is_ignored(self):
+        sequence = []
+        self.detach()
+        self.frame(10.1)
+        self.frame(10.3)
+        with self.guard._state_lock:
+            self.guard.observe_gesture_command("feedback", {})
+        sequence.extend(("D", "palm_1", "palm_2", "feedback"))
+        self.guard.accept_lease(b"C")
+        sequence.append("C")
+        self.assertIsNone(self.guard._offline_observer)
+        self.clock.now = 10.4
+        self.detach()
+        sequence.append("D_new_epoch")
+        self.frame(10.5)
+        self.assertFalse(self.guard.stopped.is_set())
+        self.frame(10.7)
+        self.assertFalse(self.guard.stopped.is_set())
+        event = self.frame(10.9)
+        sequence.append(event["source"])
+        self.assertEqual(sequence, ["D", "palm_1", "palm_2", "feedback", "C",
+                                    "D_new_epoch", "offline_stop_gate"])
+        self.assertEqual(self.guard.reason, "app_offline_stop_gesture")
+
     def test_other_gate_instances_cannot_create_offline_events(self):
         self.detach()
         other = self.Gate()

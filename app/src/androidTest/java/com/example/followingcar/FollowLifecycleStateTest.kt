@@ -175,6 +175,40 @@ class FollowLifecycleStateTest {
         assertTrue(followPresentation(ended).title.contains("异常"))
     }
 
+    @Test fun liveBoardShutdownStillAcceptsOneUserStopWithoutInventingTerminal() = runBlocking {
+        for (phase in listOf("FAULT", "STOPPING")) {
+            val fixture = startFixture()
+            fixture.bridge.nextRequest()
+            fixture.bridge.respond(status(phase, stop = true))
+            assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+            val stopping = fixture.vm.state.value
+            assertTrue(stopping.followStopping)
+            assertFalse(stopping.followStopPending)
+            assertTrue(stopping.canRequestFollowStop)
+            assertFalse(stopping.followTerminal)
+            assertFalse(stopping.canStartFollow)
+            withContext(Dispatchers.Main) {
+                fixture.vm.stopFollow("explicit stop while board shutting down")
+                fixture.vm.stopFollow("duplicate intent")
+            }
+            assertFalse(fixture.vm.state.value.canRequestFollowStop)
+            fixture.bridge.respond(status(phase, stop = true))
+            assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
+            fixture.bridge.respond(status(phase, stop = true))
+            assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+            assertTrue(fixture.vm.state.value.followActive)
+            assertFalse(fixture.vm.state.value.followTerminal)
+            fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
+            awaitFinished(fixture)
+            assertTrue(fixture.vm.state.value.followTerminal)
+            assertFalse(fixture.vm.state.value.canRequestFollowStop)
+            val sent = fixture.bridge.commands()
+            assertEquals(1, sent.count { it == "stop" })
+            withContext(Dispatchers.Main) { fixture.vm.stopFollow("historical run is already terminal") }
+            assertEquals(sent, fixture.bridge.commands())
+        }
+    }
+
     @Test fun errorReplyRetainsItsStatusButDoesNotTreatItAsTerminalOrContinueHeartbeat() = runBlocking {
         val fixture = startFixture()
         fixture.bridge.nextRequest()

@@ -251,10 +251,11 @@ internal fun FollowPage(
                             Text(if (state.followStopPending) "停止请求已记录，等待重连确认" else "请求停止原会话")
                         }
                     }
-                    state.followActive || state.followStopping -> Button(onClick = onStop,
-                        enabled = !state.followStopping, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    (state.followActive || state.followStopping) && !state.followTerminal -> Button(onClick = onStop,
+                        enabled = state.canRequestFollowStop, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                         modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("stopFollow")) {
-                        Text(if (state.followStopping) "正在停止…" else "停止跟随")
+                        Text(if (state.followStopPending) "已请求停止，等待退出…"
+                            else if (state.followStopping) "请求结束跟随" else "停止跟随")
                     }
                     state.followUncertain && state.connected -> {
                         Text("检查确认旧会话结束后解锁", style = MaterialTheme.typography.bodySmall)

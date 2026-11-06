@@ -34,7 +34,7 @@ class FollowPresentationTest {
         val pending = followPresentation(state.copy(followStatus = exited))
         assertEquals("等待会话结束确认", pending.title)
         val result = followPresentation(state.copy(followStatus = exited, followTerminal = true, connected = false))
-        assertEquals("跟随程序已退出", result.title)
+        assertEquals("上次跟随已结束", result.title)
         assertTrue(result.subtitle.contains("不代表车轮已经停稳"))
         assertNoCurrentTelemetry(result)
     }
@@ -48,7 +48,7 @@ class FollowPresentationTest {
         val pending = followPresentation(state.copy(followStatus = fault.copy(processExited = true)))
         assertEquals("故障，等待关闭结果", pending.title)
         val exited = followPresentation(state.copy(followStatus = fault.copy(processExited = true), followTerminal = true))
-        assertEquals("跟随异常结束", exited.title)
+        assertEquals("上次跟随异常结束", exited.title)
         assertNoCurrentTelemetry(exited)
     }
 
@@ -165,10 +165,21 @@ class FollowPresentationTest {
         val terminalCancelled = localCancelled.copy(followTerminal = true,
             followStatus = FollowStatus("STOPPED", false, FollowCamera.ASTRA_PRO, processExited = true))
         assertEquals("启动已取消", followPresentation(terminalCancelled).title)
-        assertEquals("跟随异常结束", followPresentation(terminalCancelled.copy(
+        assertEquals("上次跟随异常结束", followPresentation(terminalCancelled.copy(
             followStatus = terminalCancelled.followStatus!!.copy(fault = "close failed"))).title)
         assertEquals("状态待确认", followPresentation(localCancelled.copy(followUncertain = true)).title)
         assertEquals("上次操作未完成", followPresentation(localCancelled.copy(followError = "close failed")).title)
+    }
+
+    @Test fun boardRequestedStopDoesNotPreventTheFirstExplicitAppStop() {
+        for (phase in listOf("FAULT", "STOPPING")) {
+            val state = running().copy(followStopping = true,
+                followStatus = running().followStatus!!.copy(runState = phase, stopRequested = true))
+            assertTrue(state.canRequestFollowStop)
+            assertFalse(state.canStartFollow)
+            assertFalse(state.copy(followStopPending = true).canRequestFollowStop)
+            assertFalse(state.copy(followTerminal = true).canRequestFollowStop)
+        }
     }
 }
 

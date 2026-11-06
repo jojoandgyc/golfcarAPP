@@ -80,6 +80,15 @@ class LeaseGuard:
                     self._offline_observer = None
 
     def observe_gesture_command(self, event, values):
+        # This hook sees every telemetry event, including camera/feedback from
+        # other threads. Ordinary logging must never contend for the gesture
+        # commit lock or discard a partial, otherwise valid offline hold.
+        if (not self.allow_offline or event != "gesture_command"
+                or values.get("action") != "pause" or values.get("gesture") != "Open_Palm"
+                or values.get("source") != "offline_stop_gate"
+                or type(values.get("captured_at")) not in (int, float)
+                or not math.isfinite(values["captured_at"])):
+            return
         # Do not wait on the lease thread from the motor/event path. Recheck and
         # latch under the same tiny critical section as C/D, so a late event
         # cannot stop a session that has already reattached. No runtime/IO calls
@@ -92,13 +101,9 @@ class LeaseGuard:
         stop = False
         try:
             revision, detached, since = self.network_state
-            if (self.allow_offline and detached and not self.stopped.is_set()
-                    and event == "gesture_command" and values.get("action") == "pause"
-                    and values.get("gesture") == "Open_Palm"
-                    and values.get("source") == "offline_stop_gate"
+            if (detached and not self.stopped.is_set()
                     and values.get("app_offline_epoch") == revision
-                    and type(values.get("captured_at")) in (int, float)
-                    and math.isfinite(values["captured_at"]) and values["captured_at"] > since):
+                    and values["captured_at"] > since):
                 self.reason = "app_offline_stop_gesture"
                 self.stopped.set()
                 stop = True

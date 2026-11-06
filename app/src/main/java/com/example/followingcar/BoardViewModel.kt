@@ -117,6 +117,8 @@ data class BoardUiState(
     val canReconnectViaRemote: Boolean get() = canSelectRemoteMode && remoteProfile != null && remoteProfileError == null
     val manualActive: Boolean get() = driveStarting || driveEnabled || driveStopping
     val followBlocksControl: Boolean get() = followActive || followStopping || followUncertain
+    // A board-requested shutdown is not the same as a stop already requested by this App.
+    val canRequestFollowStop: Boolean get() = (followActive || followStopping) && !followTerminal && !followStopPending
     // A saved local pairing journal is not a control fault on an authenticated public route.
     // Keep the journal for local recovery; an actively running pairing operation still blocks both routes.
     val pairingBlocksControl: Boolean get() = pairingBusy || (pairingUnconfirmed && !remoteMode)

@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 36
-        versionName = "1.8.25-follow-reconnect"
+        versionCode = 37
+        versionName = "1.8.26-follow-status"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

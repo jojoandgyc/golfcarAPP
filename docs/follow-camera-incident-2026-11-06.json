@@ -1,0 +1,113 @@
+{
+  "date": "2026-11-06",
+  "timezone": "Asia/Taipei",
+  "incident": {
+    "runId": "76b3816deea706c071d3c381a6262612",
+    "workerPid": 20395,
+    "logDirectory": "/home/topeet/Desktop/rk_car_runtime_module/run_continuous_follow_logs/run_20261106_141231_20395_0f035e35",
+    "camera": "astra-pro",
+    "configuredCaptureMode": "opencv_v4l2",
+    "timeline": [
+      {
+        "localTime": "14:13:48.572",
+        "event": "Last RGB capture and recorded frame (captureFrameId 1395); depth updates also stop around this time. Event-log and recording drop counters are zero."
+      },
+      {
+        "localTime": "14:13:50",
+        "event": "Vision worker stalled; subsequent recorded control intents request zero wheel RPM."
+      },
+      {
+        "localTime": "14:14:00",
+        "event": "App network attachment detached; original follow worker remained running under the gesture-enabled offline policy."
+      },
+      {
+        "localTime": "14:15:25",
+        "event": "Motor-feedback fault after STOP and its grace period: two fresh right-wheel feedback samples 104 and 107 RPM, left 88 and 91 RPM; configured threshold 100 RPM. These are logged feedback values, not independently measured physical wheel speeds."
+      },
+      {
+        "localTime": "14:15:26",
+        "event": "Original worker exited with code 1; terminal archive records processExited=true, finalStatusPending=false, state=FAULT."
+      },
+      {
+        "localTime": "14:15:30",
+        "event": "App reattached to the original run and received its archived terminal result."
+      }
+    ],
+    "stopGestureEvidence": "No confirmed Open_Palm command after capture stopped. The only gesture command in this run was the initial Thumb_Up resume.",
+    "postIncidentObservation": {
+      "followOrDriveProcesses": 0,
+      "controlLockOwners": 0,
+      "cameraUsbOrVideoFileOwners": 0,
+      "rgbdVideoCaptureService": "inactive",
+      "rgbdMediamtxService": "inactive",
+      "relayGateways": "Running, without camera device handles",
+      "infraredLamp": "User reports lamp remained lit; no emitter state readback was available. Lamp state alone does not establish that a follow process remains alive."
+    },
+    "unresolved": [
+      "Why RGB and depth stopped delivering frames before network detachment.",
+      "Why the camera infrared lamp remained lit after worker exit.",
+      "Whether any SDK close operation failed: Astra cleanup currently suppresses individual close exceptions, so empty cleanup_errors does not prove emitter shutdown."
+    ],
+    "limitations": [
+      "No USB disconnect/reset/UVC errors were found in the inspected incident window; this does not rule out a device, driver or capture failure.",
+      "The recorded diagnostic warnings concern IR proximity sensors, not the camera emitter.",
+      "A fake SDK test demonstrated suppressed cleanup exceptions; it does not establish that such exceptions occurred in this incident.",
+      "The two deployed fixes below do not resolve or explain the pre-disconnect capture stall."
+    ]
+  },
+  "changes": {
+    "app": "A live nonterminal FAULT/STOPPING status reported by the board permits the first explicit App stop request. Pending App stop prevents duplicate requests. Confirmed terminal records are labeled as the previous session and do not show a stop button for an exited process.",
+    "worker": "Filter unrelated telemetry before the offline gesture commit lock, preventing noncandidate logging callbacks from clearing partial offline stop-gesture evidence during lock contention.",
+    "preserved": [
+      "Existing network-loss policy and original-run reconnect behavior",
+      "Online gesture and explicit-stop behavior",
+      "Motor-feedback fault thresholds and motor parameters",
+      "Camera capture and cleanup implementation"
+    ]
+  },
+  "deployment": {
+    "app": {
+      "versionCode": 37,
+      "versionName": "1.8.26-follow-status",
+      "installedAtUtc": "2026-11-06T06:34:59.779526+00:00",
+      "apkSha256": "bd258b8c91c7f995ccec3261b5c32c5bd15e3d0a5e11a09ff29b1daa8850e11c",
+      "previousApkSha256": "ffa457fa40490833262f1d32f1322920ccf58e8aee7f181c3fec674162c2941d",
+      "connectionPreferencesPreserved": true,
+      "encryptedHotspotCredentialsPreserved": true
+    },
+    "board": {
+      "deployedAtUtc": "2026-11-06T06:34:50Z",
+      "file": "/home/topeet/Desktop/rk_car_runtime_module/app_follow_worker.py",
+      "backupDirectory": "/home/topeet/Desktop/rk_car_runtime_module/.app_follow_backups/20261106T063450Z",
+      "oldSha256": "eac0cfc2d948d1dd70ea27e18bb46f3e1d707aef659c12ac6e66b187a9f2e1fe",
+      "newSha256": "b750d8e040469c331d42ac3f7de949005ea85bc3ac3ac4b2548f83e16aea5e84"
+    },
+    "bothControlLocksHeld": true,
+    "controlAndSerialIdleVerified": true,
+    "realMotorCommandsSent": false,
+    "cameraOpenedForTests": false,
+    "networkConfigurationChanged": false
+  },
+  "validation": {
+    "jvmTestsPassed": 370,
+    "emulatorFakeControlTestsPassed": 34,
+    "workerAndBridgePythonTestsPassed": 55,
+    "capturedGestureGateFakeSampleReplaysPassed": 6,
+    "coverage": [
+      "Live board-requested shutdown still accepts one explicit App stop",
+      "No new start while a worker is nonterminal; no fabricated terminal result",
+      "Historical terminal status has no live stop control",
+      "Unrelated telemetry cannot erase offline gesture hold evidence",
+      "Reconnect still clears obsolete gesture evidence and preserves epoch isolation"
+    ],
+    "physicalCameraGestureValidationPerformed": false,
+    "realMotorTestsPerformed": false
+  },
+  "nextDiagnosticRequirements": [
+    "Distinguish capture read in progress, read returned no frame, and last successful frame using nonblocking sampled diagnostics.",
+    "Record depth wait timeouts and reader-thread liveness without flooding the control path.",
+    "Record individual RGB release and Astra stop/close/unload outcomes; do not report unconditional success after suppressed exceptions."
+  ],
+  "evidenceDirectory": "E:/Temp/golfcar-follow-stuck-2026-11-06",
+  "rollback": "Only while control is idle, restore the worker from the recorded backup and install the saved pre-update APK. Do not replace a running worker."
+}

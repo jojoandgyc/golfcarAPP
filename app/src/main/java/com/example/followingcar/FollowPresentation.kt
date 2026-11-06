@@ -33,8 +33,8 @@ internal fun followPresentation(state: BoardUiState, nowElapsedMs: Long? = null)
     }
     // A legal terminal ACK remains authoritative even when the expected EOF closes transport.
     if (state.followTerminal && status != null) {
-        return if (fault) FollowPresentation("跟随异常结束", "跟随进程已退出，故障信息已保留；机械停稳仍未确认。")
-        else FollowPresentation("跟随程序已退出", "本次会话已结束；这不代表车轮已经停稳。")
+        return if (fault) FollowPresentation("上次跟随异常结束", "这是上次会话的终态记录：进程已退出，故障信息已保留；机械停稳仍未确认。")
+        else FollowPresentation("上次跟随已结束", "这是上次会话的终态记录：进程已退出；这不代表车轮已经停稳。")
     }
     if (state.followUncertain) {
         if (state.followReconnectable) return FollowPresentation(
