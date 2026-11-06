@@ -109,7 +109,8 @@ internal fun FollowPage(
                 }
                 if (state.followActive && !state.followUncertain && state.followStatus?.runState == "STARTING") {
                     state.followStatus.startup?.let { startup ->
-                        Text("启动已用 ${(startup.totalElapsedMs / 1_000.0).display()} s · 总期限 ${(startup.totalTimeoutMs / 1_000.0).display()} s",
+                        Text(if (startup.completed) startup.completedSummary() else
+                            "启动已用 ${(startup.totalElapsedMs / 1_000.0).display()} s · 总期限 ${(startup.totalTimeoutMs / 1_000.0).display()} s",
                             style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followStartupProgress"))
                     }
                 }
@@ -151,6 +152,11 @@ internal fun FollowPage(
                     Text("最近操作：$error", color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followError"))
                 }
+                sequenceOf(state.followFirstFailure?.message, state.followError, state.followStatus?.fault)
+                    .mapNotNull(::followFaultExplanation).firstOrNull()?.let { explanation ->
+                        Text(explanation, color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followFaultExplanation"))
+                    }
                 if (state.followStatus != null || state.followFirstFailure != null) {
                     TextButton(onClick = { detailsExpanded = !detailsExpanded },
                         modifier = Modifier.testTag("followDetailsToggle")) {

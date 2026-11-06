@@ -2,6 +2,7 @@ package com.example.followingcar
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -133,6 +134,25 @@ class FollowPresentationTest {
         assertTrue(followPresentation(state.copy(followStatus = starting.copy(startup = startup.copy(stage = "future_stage")))).subtitle.contains("启动中"))
         assertEquals("跟随出现异常", followPresentation(state.copy(followStatus = starting.copy(runState = "FAULT", fault = "startup deadline"))).title)
         assertEquals("正在停止跟随", followPresentation(state.copy(followStatus = starting.copy(runState = "STOPPING", startup = startup.copy(completed = true)))).title)
+    }
+
+    @Test fun completedStartupNeverPresentsLastMotorStageAsAnActiveInitialization() {
+        val startup = FollowStartup("motor", 186, 3_619, 10_000, 30_000, true)
+        val state = running().copy(followStatus = running().followStatus!!.copy(
+            runState = "STARTING", startup = startup))
+        assertEquals("初始化已完成，用时 3.62 秒", startup.completedSummary())
+        assertEquals("初始化已完成，正在等待运行状态；可随时停止。", followPresentation(state).subtitle)
+        val fault = state.copy(followTerminal = true, followActive = false,
+            followStatus = state.followStatus!!.copy(runState = "FAULT", processExited = true,
+                fault = "motor_write: no response from driver"))
+        assertEquals("上次跟随异常结束", followPresentation(fault).title)
+        assertNoCurrentTelemetry(followPresentation(fault))
+    }
+
+    @Test fun driverNoResponseExplainsMissingAcknowledgementWithoutGuessingTheCause() {
+        assertEquals("电机指令未收到驱动器回执", followFaultExplanation("motor_write: no response from driver"))
+        for (other in listOf(null, "", "preflight: serial port occupied", "motor_feedback: no response from driver",
+            "motor_write: invalid response", "network timeout")) assertNull(followFaultExplanation(other))
     }
 
     @Test fun phoneElapsedTimeAgesTelemetryWithoutComparingBoardClocks() {

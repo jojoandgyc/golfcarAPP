@@ -91,7 +91,10 @@ internal fun followPresentation(state: BoardUiState, nowElapsedMs: Long? = null)
     }
     // Startup snapshots can have no worker telemetry yet; a current ACK still reports a phase.
     if (status.runState == "STARTING") {
-        return FollowPresentation("正在启动跟随", status.startup?.let { "${it.stage.startupStageLabel()}；可随时停止。" }
+        return FollowPresentation("正在启动跟随", status.startup?.let {
+            if (it.completed) "初始化已完成，正在等待运行状态；可随时停止。"
+            else "${it.stage.startupStageLabel()}；可随时停止。"
+        }
             ?: "正在等待相机和跟随程序就绪；可随时停止。")
     }
     if (!followAgeIsFresh(status.statusAgeMs, receivedAgeMs, 2_000)) {
@@ -126,6 +129,15 @@ internal fun followPresentation(state: BoardUiState, nowElapsedMs: Long? = null)
     return FollowPresentation(title, "$mode · $detail", fresh = true,
         targetFresh = targetFresh, rangeFresh = rangeFresh)
 }
+
+/** Explain only a known board fault; its communication failure does not identify a root cause. */
+internal fun followFaultExplanation(rawFault: String?): String? = when (rawFault?.trim()) {
+    "motor_write: no response from driver" -> "电机指令未收到驱动器回执"
+    else -> null
+}
+
+internal fun FollowStartup.completedSummary(): String =
+    "初始化已完成，用时 ${(totalElapsedMs / 1_000.0).display()} 秒"
 
 internal fun String.startupStageLabel(): String = when (this) {
     "worker_start", "environment" -> "准备运行环境"

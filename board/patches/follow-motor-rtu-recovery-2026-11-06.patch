@@ -1,0 +1,1031 @@
+--- a/car_control_modular/motor_rtu.py
++++ b/car_control_modular/motor_rtu.py
+@@ -2,8 +2,9 @@
+ 
+ This adapter never opens a device or retransmits a motion request. Ordinary
+ transactions fail latched. The continuous adapter alone may explicitly recover
+-one empty status-read timeout using a bounded, read-only synchronization probe
+-and a fresh, differently sized dual-wheel snapshot. No motion is replayed.
++an empty status-read timeout using a bounded read-only synchronization probe,
++or an empty speed ACK using dual emergency STOPs and verified fresh standstill.
++No motion is replayed; every other transaction failure remains latched.
+ """
+ from __future__ import annotations
+ 
+@@ -292,6 +293,248 @@
+             raise error
+         return bytes(response)
+ 
++    def can_recover_speed_write_timeout(self, failed_sequence: int) -> bool:
++        """Only a complete two-word speed request with an entirely missing ACK."""
++        row = self.last_transaction or {}
++        first = self._first_fault_transaction or {}
++        try:
++            request = bytes.fromhex(row.get("tx_hex", ""))
++            return bool(
++                self.rx_uncertain and failed_sequence is not None
++                and row.get("seq") == first.get("seq") == failed_sequence
++                and self._recovery_attempted_sequence != failed_sequence
++                and row.get("error_type") == "TimeoutError"
++                and not row.get("timeout_restore_error")
++                and row.get("stage") == "read" and row.get("rx_length") == 0
++                and row.get("tx_written") == row.get("tx_length") == 13
++                and len(request) == 13 and request[1] == 0x10
++                and int.from_bytes(request[2:4], "big") in (0x0041, 0x0045)
++                and request[4:7] == b"\x00\x02\x04"
++                and self._reset_owner is not None and self._write_timeout_owner is not None)
++        except (TypeError, ValueError):
++            return False
++
++    def can_recover_emergency_stop_timeout(self, failed_sequence: int) -> bool:
++        """One empty emergency STOP ACK; an already attempted other STOP may follow."""
++        first = self._first_fault_transaction or {}
++        last = self.last_transaction or {}
++        try:
++            packet = bytes.fromhex(first.get("tx_hex", ""))
++            if not (
++                self.rx_uncertain and failed_sequence is not None
++                and first.get("seq") == failed_sequence
++                and self._recovery_attempted_sequence != failed_sequence
++                and first.get("error_type") == "TimeoutError"
++                and not first.get("timeout_restore_error")
++                and first.get("stage") == "read" and first.get("rx_length") == 0
++                and first.get("tx_written") == first.get("tx_length") == 8
++                and len(packet) == 8 and packet[1] == 6
++                and int.from_bytes(packet[2:4], "big") in (0x0040, 0x0044)
++                and packet[4:6] == b"\x00\x01"
++                and self._reset_owner is not None and self._write_timeout_owner is not None):
++                return False
++            if last.get("seq") == failed_sequence:
++                return True
++            # Exactly the successful OTHER wheel's initial STOP may follow.
++            # Any intervening read, write, error, or extra transaction refuses recovery.
++            other = bytes.fromhex(last.get("tx_hex", ""))
++            return bool(last.get("seq") == failed_sequence+1 and last.get("stage") == "complete"
++                and not last.get("error") and not last.get("timeout_restore_error")
++                and last.get("tx_written") == last.get("tx_length") == 8
++                and len(other) == 8 and other[1] == 6 and other[4:6] == b"\x00\x01"
++                and int.from_bytes(other[2:4], "big") == (0x44 if packet[2:4] == b"\x00\x40" else 0x40))
++        except (TypeError, ValueError):
++            return False
++
++    def recover_speed_write_timeout(self, failed_sequence: int, *, budget_sec=.6) -> dict:
++        return self._recover_write_timeout(failed_sequence, budget_sec=budget_sec)
++
++    def recover_emergency_stop_timeout(self, failed_sequence: int, *, budget_sec=.6) -> dict:
++        return self._recover_write_timeout(failed_sequence, budget_sec=budget_sec, stop_refresh=True)
++
++    def _recover_write_timeout(self, failed_sequence: int, *, budget_sec=.6, stop_refresh=False) -> dict:
++        """STOP both sides, fence the stream, then require two fresh zero snapshots.
++
++        This is a continuous-owner opt-in, never a retry of a speed packet.
++        Keep the RTU lock throughout. A late FC10 ACK is identifiable by its
++        exact original address/count, and cannot certify any STOP or feedback.
++        Other corrupt/partial/unknown frames and failed STOPs remain fatal.
++        """
++        if not math.isfinite(float(budget_sec)) or not 0 < float(budget_sec) <= .6:
++            raise ValueError("speed recovery budget must be positive and at most 0.6 seconds")
++        eligible = self.can_recover_emergency_stop_timeout if stop_refresh else self.can_recover_speed_write_timeout
++        if not eligible(failed_sequence):
++            raise RtuLinkUncertain("ineligible write timeout")
++        started = self._clock()
++        deadline = started + float(budget_sec)
++        failed = dict(self._first_fault_transaction if stop_refresh else self.last_transaction)
++        request = bytes.fromhex(failed["tx_hex"])
++        report = dict(kind="periodic_stop_pause" if stop_refresh else "speed_write_pause", failed_sequence=failed_sequence,
++                      failed_transaction=failed, budget_sec=float(budget_sec),
++                      outcome="in_progress", transactions=[], discarded_late_frames=[],
++                      stop_acknowledged=[], zero_samples=0, fence_completed=False,
++                      response_order_assumption="single_master_ordered_rtu")
++        if stop_refresh:
++            report["originalStopOutcome"] = "unknown"
++            report["uncredited_stop_responses"] = []
++        self.last_recovery = report
++        if not self._lock.acquire(timeout=float(budget_sec)):
++            self._recovery_attempted_sequence = failed_sequence
++            report.update(outcome="failed", error="speed recovery lock deadline exceeded",
++                          elapsed_ms=(self._clock()-started)*1000)
++            raise TimeoutError(report["error"])
++        success = False
++        saved = False
++        registers = None
++        try:
++            if not eligible(failed_sequence):
++                raise RtuLinkUncertain("write fault changed before recovery lock")
++            self._recovery_attempted_sequence = failed_sequence
++            saved_timeout = self.transport.timeout
++            saved_write_timeout = self._write_timeout_owner.write_timeout
++            saved = True
++            self._reset_owner.reset_input_buffer()
++            self._last_activity = self._clock()
++
++            def transaction(function, address, value, expected_length):
++                packet = bytes((request[0], function)) + address.to_bytes(2, "big") + value.to_bytes(2, "big")
++                packet += _crc(packet).to_bytes(2, "little")
++                self._sequence += 1
++                detail = dict(started=self._clock(), seq=self._sequence, stage="quiet",
++                    thread=threading.current_thread().name, function="0x%02X" % function,
++                    register="0x%04X" % address, tx_hex=packet.hex(), tx_length=8,
++                    tx_written=0, expected_rx_length=expected_length, read_calls=0,
++                    first_rx_ms=None, quiet_wait_ms=0., write_timeout_supported=True,
++                    rx_reset="speed_recovery", recovery_of=failed_sequence)
++                response = bytearray()
++                error = None
++                # Each STOP also has its original transaction bound, so a dead
++                # first side cannot consume the other side's entire allowance.
++                transaction_deadline = min(deadline, self._clock()+self.timeout)
++                try:
++                    quiet = max(0., self.quiet_sec-(self._clock()-self._last_activity))
++                    if quiet:
++                        self._sleep(min(quiet, self._remaining(transaction_deadline)))
++                        detail["quiet_wait_ms"] = quiet*1000
++                    detail["stage"] = "write"
++                    self._write_timeout_owner.write_timeout = self._remaining(transaction_deadline)
++                    detail["tx_written"] = self.transport.write(packet)
++                    self._last_activity = self._clock()
++                    if detail["tx_written"] != len(packet):
++                        raise RtuProtocolError("short speed-recovery request write")
++                    while True:
++                        detail["stage"] = "read"
++                        self._read_response(response, transaction_deadline, detail)
++                        detail["stage"] = "validate"
++                        late_stop = stop_refresh and not report["fence_completed"] and response[1] == 6
++                        # Before the fence, an exact response to the emergency
++                        # reassertion is UNPROVEN: the missing old ACK is identical.
++                        uncredited_match = late_stop and function == 6 and response[:6] == packet[:6]
++                        late_speed = not stop_refresh and response[1] == 0x10
++                        if late_speed or late_stop and not uncredited_match:
++                            if late_stop:
++                                address = int.from_bytes(response[2:4], "big")
++                                if address not in (0x40, 0x44) or response[4:6] != b"\x00\x01":
++                                    raise RtuProtocolError("unknown late STOP response")
++                                expected = bytes((request[0], 6))+response[2:6]
++                                expected += _crc(expected).to_bytes(2, "little")
++                                self._validate(expected, bytes(response), 8)
++                            else:
++                                self._validate(request, bytes(response), 8)
++                            if len(report["discarded_late_frames"]) >= (3 if stop_refresh else 1):
++                                raise RtuProtocolError("too many late write acknowledgements")
++                            report["discarded_late_frames"].append(bytes(response).hex())
++                            response.clear()
++                            continue
++                        self._validate(packet, bytes(response), expected_length)
++                        self._remaining(transaction_deadline)
++                        detail["stage"] = "complete"
++                        return bytes(response)
++                except Exception as exc:
++                    error = exc
++                    self._last_activity = self._clock()
++                    raise
++                finally:
++                    self._record(detail, response, error)
++                    report["transactions"].append(dict(detail))
++
++            if stop_refresh:
++                # Reassert STOP immediately (failed side first) before a slow
++                # fence can delay a wheel whose original STOP was never applied.
++                # Responses here cannot distinguish old/new identical FC06;
++                # they are never counted as the final STOP confirmation.
++                failed_address = int.from_bytes(request[2:4], "big")
++                uncredited_failures = []
++                for address in (failed_address, 0x44 if failed_address == 0x40 else 0x40):
++                    try:
++                        transaction(6, address, 1, 8)
++                        report["uncredited_stop_responses"].append("right" if address == 0x40 else "left")
++                    except Exception as exc:
++                        uncredited_failures.append(exc)
++                if uncredited_failures:
++                    raise uncredited_failures[0]
++                # Initial and uncredited dual STOPs have already been attempted.
++                # A repeated FC06 ACK is byte-identical to the missing ACK:
++                # never count it until this different-function/length fence
++                # has completed. Requires ordered responses from one RTU slave;
++                # arbitrary response reordering is not a supported protocol.
++                transaction(3, 0x0000, 3, 11)
++                report["fence_completed"] = True
++            failures = []
++            for side, address in (("right", 0x0040), ("left", 0x0044)):
++                try:
++                    transaction(6, address, 1, 8)
++                    report["stop_acknowledged"].append(side)
++                except Exception as exc:
++                    failures.append(exc)
++            if failures:
++                raise failures[0]
++            # Function and length differ from both STOP and the missing speed
++            # ACK. This fence never reads or writes motor configuration.
++            if not stop_refresh:
++                transaction(3, 0x0000, 3, 11)
++                report["fence_completed"] = True
++            for _ in range(16):
++                frame = transaction(3, 0x0008, 20, 45)
++                registers = [int.from_bytes(frame[i:i+2], "big") for i in range(3, 43, 2)]
++                report["error_codes"] = dict(right=registers[3], left=registers[13])
++                if registers[3] or registers[13]:
++                    raise RuntimeError("motor hardware fault during speed recovery")
++                zero = not any(registers[i] for i in (1, 2, 11, 12))
++                report["zero_samples"] = report["zero_samples"]+1 if zero else 0
++                if report["zero_samples"] >= 2:
++                    success = True
++                    break
++                self._sleep(min(.02, self._remaining(deadline)))
++            if not success:
++                raise TimeoutError("motor standstill unconfirmed during speed recovery")
++            self._remaining(deadline)
++        except Exception as exc:
++            success = False
++            report.update(outcome="failed", error="%s:%s" % (type(exc).__name__, exc))
++            raise
++        finally:
++            try:
++                if saved:
++                    self.transport.timeout = saved_timeout
++                    self._write_timeout_owner.write_timeout = saved_write_timeout
++                if success:
++                    self._remaining(deadline)
++            except Exception as exc:
++                success = False
++                report.update(outcome="failed", error="timeout_restore:%s:%s" % (type(exc).__name__, exc))
++                raise
++            finally:
++                report["elapsed_ms"] = (self._clock()-started)*1000
++                if success:
++                    self.rx_uncertain = False
++                    self.fault_reason = None
++                    self.last_error = None
++                    self._first_fault_transaction = None
++                    report["outcome"] = "recovered"
++                self._lock.release()
++        return dict(registers=registers, recovery=dict(report))
++
+     def can_recover_status_read_timeout(self, failed_sequence: int) -> bool:
+         """Narrow opt-in, never a general-purpose clear-fault operation."""
+         row = self.last_transaction or {}
+--- a/car_control_modular/mssd_motor.py
++++ b/car_control_modular/mssd_motor.py
+@@ -38,6 +38,14 @@
+         super().__init__(reason)
+         self.reason = reason
+         self.partial = partial
++
++
++class MotionWriteRecovered(MotionWriteCancelled):
++    """The old pair is discarded after a verified communication-recovery STOP."""
++
++    def __init__(self, diagnostics):
++        super().__init__("motor_write_recovered", partial=False)
++        self.diagnostics = diagnostics
+ 
+ 
+ @dataclass(frozen=True)
+@@ -133,6 +141,8 @@
+         # A failed speed transaction may already have changed either wheel.
+         # Never automatically retry motion after such an ambiguous write.
+         self.motion_write_fault = None
++        self._last_motion_recovery_at = None
++        self.last_motion_recovery = None
+         self._rtu_guard = None
+         self.ramp_diagnostics = None
+         self.last_speed_receipt: Optional[MotorSpeedReceipt] = None
+@@ -527,7 +537,8 @@
+             )
+ 
+     def _write_speed_pair(self, left_target: int, right_target: int, label: str,
+-                          *, history_uid=None, pre_write_check=None) -> None:
++                          *, history_uid=None, pre_write_check=None,
++                          recover_empty_timeout=False) -> None:
+         audit = (self._begin_zero_audit(label, "zero_speed", "speed_pair", (0, 0))
+                  if left_target == right_target == 0 else None)
+         # Preparation can perform register I/O. Recheck only motion after it,
+@@ -570,6 +581,39 @@
+                 label, side, left_target, right_target, right_acknowledged,
+                 (time.monotonic() - started) * 1000.0, exc,
+             )
++            guard = self._rtu_guard
++            sequence = (guard.last_transaction or {}).get("seq") if guard is not None else None
++            now = time.monotonic()
++            last_recovery = getattr(self, "_last_motion_recovery_at", None)
++            if (recover_empty_timeout is True and type(exc) is TimeoutError
++                    and not self.motion_write_fault and not self.parking_release_fault
++                    and guard is not None and guard.can_recover_speed_write_timeout(sequence)
++                    and (last_recovery is None or now-last_recovery >= 2.)):
++                self._last_motion_recovery_at = now
++                self._record_motion_write_fault(label, exc)
++                original_fault = self.motion_write_fault
++                try:
++                    recovered = guard.recover_speed_write_timeout(sequence)
++                    self.last_motion_recovery = recovered["recovery"]
++                    if self.motion_write_fault != original_fault or self.parking_release_fault:
++                        raise RuntimeError("motor fault changed during speed recovery")
++                except Exception as recovery_exc:
++                    self.last_motion_recovery = dict(guard.last_recovery or {})
++                    self._fault_emergency_stop(label + ":recovery_failed")
++                    raise RuntimeError(
++                        f"motor speed recovery failed after {type(exc).__name__}: {exc}; "
++                        f"{type(recovery_exc).__name__}: {recovery_exc}") from recovery_exc
++                self.motion_write_fault = None
++                self.motion_armed = False
++                self.normal_zero_hold = False
++                self._invalidate_speed_evidence()
++                self.stop_write_generation += 1
++                self.logger.warning("motor_write_recovered old_pair_discarded=True "
++                    "motion_authorized=False details=%s", self.last_motion_recovery)
++                # Runtime's existing non-partial cancellation path does not
++                # acknowledge this intent or update its throttle. It returns
++                # to observations and makes a new decision next iteration.
++                raise MotionWriteRecovered(self.last_motion_recovery) from exc
+             self._latch_motion_write_fault(label, exc)
+             raise
+         if (not self.motion_write_fault and not self.parking_release_fault
+@@ -587,13 +631,52 @@
+         self._remember_acknowledged_pair(left_target, right_target)
+         self._finish_zero_audit(audit, "acknowledged", ("right", "left"), ("right", "left"))
+ 
+-    def _checked_stop_wheels(self, label: str, mode: int) -> None:
++    def _checked_stop_wheels(self, label: str, mode: int, *,
++                             recover_empty_timeout=False, recovery_check=None) -> None:
++        guard = self._rtu_guard
++        clean = bool(guard is not None and not guard.rx_uncertain
++                     and not self.motion_write_fault and not self.parking_release_fault)
+         failures = self._try_stop_wheels(label, mode)
+         if failures:
+             # A STOP acknowledgement failure is not a reason to enter speed
+             # mode with 0RPM. Preserve the original exception after trying BOTH
+             # sides. Failed NORMAL/FREE falls back to dual EMERGENCY only.
+             exc = failures[0][1]
++            sequence = (guard._first_fault_transaction or {}).get("seq") if guard is not None else None
++            last_recovery = getattr(self, "_last_motion_recovery_at", None)
++            allowed = False
++            if (recover_empty_timeout is True and mode == 1 and clean and len(failures) == 1
++                    and type(exc) is TimeoutError and callable(recovery_check)
++                    and guard.can_recover_emergency_stop_timeout(sequence)
++                    and (last_recovery is None or time.monotonic()-last_recovery >= 2.)):
++                try:
++                    allowed = recovery_check() is True  # Only the runtime stop-event, not an old motion TTL.
++                except Exception:
++                    pass  # Explicit stop/expired intent must not opt into a recovery pause.
++            if allowed:
++                self._last_motion_recovery_at = time.monotonic()
++                self._record_motion_write_fault(label + ":stop", exc)
++                original_fault = self.motion_write_fault
++                try:
++                    result = guard.recover_emergency_stop_timeout(sequence)
++                    self.last_motion_recovery = result["recovery"]
++                    if self.motion_write_fault != original_fault or self.parking_release_fault:
++                        raise RuntimeError("motor fault changed during STOP recovery")
++                except Exception as recovery_exc:
++                    self.last_motion_recovery = dict(guard.last_recovery or {})
++                    self._fault_emergency_stop(label + ":stop_recovery_failed")
++                    raise RuntimeError(f"periodic STOP recovery failed after {type(exc).__name__}: {exc}; "
++                        f"{type(recovery_exc).__name__}: {recovery_exc}") from recovery_exc
++                self.motion_write_fault = None
++                self.motion_armed = False
++                self.normal_zero_hold = False
++                self._invalidate_speed_evidence()
++                self.logger.warning("motor_periodic_stop_recovered originalStopOutcome=unknown "
++                    "motion_authorized=False details=%s", self.last_motion_recovery)
++                if recovery_check() is not True:
++                    self.last_motion_recovery["stop_requested_after_recovery"] = True
++                    raise MotionWriteCancelled("stop_requested")
++                return
+             self._record_motion_write_fault(label + ":stop", exc)
+             if mode != 1:
+                 self._fault_emergency_stop(label + ":stop_fallback")
+@@ -648,6 +731,7 @@
+         max_target_override: Optional[int] = None,
+         history_uid: Optional[int] = None,
+         pre_write_check=None,
++        recover_empty_timeout: bool = False,
+     ) -> None:
+         if type(history_uid) is not int or history_uid <= 0:
+             history_uid = None
+@@ -696,7 +780,8 @@
+             self.normal_zero_hold = False
+             self.arm_for_motion(driver)
+         self._write_speed_pair(left_target, right_target, label, history_uid=history_uid,
+-                               pre_write_check=pre_write_check)
++                               pre_write_check=pre_write_check,
++                               recover_empty_timeout=recover_empty_timeout)
+         self.normal_zero_hold = False
+         submitted, receipt = self.last_speed_write, self.last_speed_receipt
+         self.logger.info("LZ30EMA 电机命令: 标签=%s 左轮=%d转/分 右轮=%d转/分 "
+@@ -720,7 +805,8 @@
+         self.send_targets(left_target, right_target, label)
+ 
+     def send_stop(self, label: str = "stop", mode: Optional[str] = None,
+-                  *, preserve_zero: bool = False, prepare_parking_current: bool = False) -> None:
++                  *, preserve_zero: bool = False, prepare_parking_current: bool = False,
++                  recover_empty_timeout: bool = False, recovery_check=None) -> None:
+         self.stop_write_generation += 1
+         self._invalidate_speed_evidence()
+         driver = self.ensure_driver()
+@@ -785,7 +871,9 @@
+                 self.motion_armed = False
+                 raise
+         started = time.monotonic()
+-        self._checked_stop_wheels(label, stop_value)
++        self._checked_stop_wheels(label, stop_value,
++            recover_empty_timeout=recover_empty_timeout and stop_mode == "emergency",
++            recovery_check=recovery_check)
+         # Legacy name: an explicitly preserved ordinary stop may also use
+         # EMERGENCY or FREE. Zero keepalives must not re-enter speed mode.
+         self.normal_zero_hold = bool(preserve_zero)
+--- a/continuous_follow/hardware.py
++++ b/continuous_follow/hardware.py
+@@ -241,6 +241,7 @@
+         self._last_write_receipt = None
+         self._last_status = {}
+         self.motion_guard = None
++        self.stop_recovery_guard = None
+ 
+     def open(self):
+         self.backend.ensure_driver()  # Startup STOP and configured ramp readback.
+@@ -282,8 +283,24 @@
+                         or intent.reason == "shutdown")
+             if not dispatch:
+                 return self._receipt("stop", False, since)
+-            self.backend.send_stop("continuous:" + intent.reason, mode="emergency")
++            guard = getattr(self, "stop_recovery_guard", None)
++            reason = str(intent.reason)
++            # Only the established runtime's same-reason periodic hold refresh.
++            # Initial STOP, user/gesture stop and shutdown never opt in. The
++            # guard is rechecked after the initial timeout, before recovery I/O.
++            periodic = bool(self._stopped and last_stop is not None
++                and now-last_stop >= self._STOP_REFRESH_SEC
++                and reason == getattr(self, "_last_stop_reason", None)
++                and callable(guard) and reason not in {
++                    "shutdown", "requested", "stop_requested", "user_stop",
++                    "app_stop_requested", "app_session_closed", "duration_elapsed",
++                    "app_offline_stop_gesture", "gesture_paused", "gesture_pause",
++                })
++            self.backend.send_stop("continuous:" + reason, mode="emergency",
++                recover_empty_timeout=periodic,
++                recovery_check=guard if periodic else None)
+             self._last_stop_write_at = time.monotonic()
++            self._last_stop_reason = reason
+             self._stopped = True
+             self._monitor().observe_command(0, 0, True, self._last_stop_write_at)
+             return self._receipt("stop", True, since)
+@@ -295,9 +312,18 @@
+         if callable(guard) and (intent.left_rpm or intent.right_rpm):
+             options["pre_write_check"] = lambda: guard(intent)
+         self._last_write_receipt = None
+-        self.backend.send_targets(intent.left_rpm * sign * self.config.left_sign,
+-            intent.right_rpm * sign * self.config.right_sign,
+-            "CONTINUOUS", **options)
++        from car_control_modular.mssd_motor import MotionWriteRecovered
++        try:
++            self.backend.send_targets(intent.left_rpm * sign * self.config.left_sign,
++                intent.right_rpm * sign * self.config.right_sign,
++                "CONTINUOUS", recover_empty_timeout=True, **options)
++        except MotionWriteRecovered:
++            self._stopped = True
++            self._last_stop_write_at = time.monotonic()
++            self._last_status = {}
++            self._last_stop_reason = "communication_recovery"
++            self._monitor().observe_command(0, 0, True, self._last_stop_write_at)
++            raise
+         self._stopped = False
+         self._monitor().observe_command(intent.left_rpm, intent.right_rpm, False, time.monotonic())
+         return self._receipt("speed", True, since)
+@@ -410,6 +436,7 @@
+                 if isinstance(recent, (list, tuple, deque)) else [],
+             recent_wire=self._wire_records(),
+             recovery=mapping(getattr(guard, "last_recovery", None)),
++            motion_recovery=mapping(getattr(self.backend, "last_motion_recovery", None)),
+             startup_ramp=mapping(getattr(self.backend, "ramp_diagnostics", None)),
+             parking_current_a=scalar(getattr(self.backend, "parking_current_a", None)),
+             configured_parking_current_a=scalar(getattr(self.config, "parking_current_a", None)),
+--- a/continuous_follow/runtime.py
++++ b/continuous_follow/runtime.py
+@@ -352,6 +352,10 @@
+         # this guard, and factories need not themselves be Python classes.
+         if hasattr(self.motor, "motion_guard"):
+             self.motor.motion_guard = self._check_motion_write
++        if hasattr(self.motor, "stop_recovery_guard"):
++            # A STOP refresh is not motion authority: expired motion TTL or
++            # lost target identity must not block its safe communication pause.
++            self.motor.stop_recovery_guard = lambda: not self.stop_event.is_set()
+         # SIGINT may call request_stop while the main thread holds this lock.
+         self.lock = threading.RLock()
+         self.condition = threading.Condition(self.lock)
+--- /dev/null
++++ b/tests/motor/test_continuous_write_pause.py
+@@ -0,0 +1,328 @@
++"""Fake serial only: no serial import, device open, or board service."""
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++import logging
++import threading
++import time
++import traceback
++
++import pytest
++
++from car_control_modular.motor_rtu import RtuLinkUncertain, RtuProtocolError
++from car_control_modular.mssd_motor import (
++    MssdMotorBackend, MotionWriteCancelled, MotionWriteRecovered,
++)
++from test_motor_rtu import (
++    setup, frame, RIGHT_SPEED, LEFT_SPEED, RIGHT_ACK, LEFT_ACK,
++    RIGHT_STOP, LEFT_STOP, READ_LEFT,
++)
++
++FENCE = frame("01 03 06 00 01 00 02 00 03")
++
++
++def snapshot(left=0, right=0, fault=0):
++    words = [0]*20
++    words[1:3] = [(right & 0xffffffff) >> 16, right & 0xffff]
++    words[11:13] = [(left & 0xffffffff) >> 16, left & 0xffff]
++    words[3] = fault
++    return frame(bytes((1, 3, 40))+b"".join(v.to_bytes(2, "big") for v in words))
++
++
++def failed_speed(*responses, packet=RIGHT_SPEED):
++    guard, wire, clock = setup(b"", *responses)
++    with pytest.raises(TimeoutError):
++        guard.transact(packet, 8)
++    return guard, wire, clock, guard.last_transaction["seq"]
++
++
++def normal_responses():
++    return [RIGHT_STOP, LEFT_STOP, FENCE, snapshot(), snapshot()]
++
++
++@pytest.mark.parametrize("packet", [RIGHT_SPEED, LEFT_SPEED])
++def test_recovery_stops_both_synchronizes_and_reads_two_fresh_zeros_without_speed_retry(packet):
++    guard, wire, clock, seq = failed_speed(*normal_responses(), packet=packet)
++    result = guard.recover_speed_write_timeout(seq)
++    assert wire.writes[0] == packet
++    assert [p[1] for p in wire.writes] == [16, 6, 6, 3, 3, 3]
++    assert [int.from_bytes(p[2:4], "big") for p in wire.writes] == [
++        int.from_bytes(packet[2:4], "big"), 0x40, 0x44, 0, 8, 8]
++    assert result["recovery"]["stop_acknowledged"] == ["right", "left"]
++    assert result["recovery"]["zero_samples"] == 2
++    assert result["recovery"]["outcome"] == "recovered"
++    assert not guard.rx_uncertain
++    assert wire.timeout == .15 and wire.write_timeout is None
++    assert result["recovery"]["elapsed_ms"] < 600
++
++
++@pytest.mark.parametrize("where", range(5))
++def test_late_old_ack_is_discarded_and_cannot_certify_any_recovery_step(where):
++    responses = normal_responses()
++    responses[where] = RIGHT_ACK+responses[where]
++    guard, wire, _, seq = failed_speed(*responses)
++    result = guard.recover_speed_write_timeout(seq)
++    assert result["recovery"]["discarded_late_frames"] == [RIGHT_ACK.hex()]
++    assert len([p for p in wire.writes if p[1] == 16]) == 1
++
++
++def test_old_speed_ack_alone_never_substitutes_for_stop_and_both_stops_are_attempted():
++    guard, wire, _, seq = failed_speed(RIGHT_ACK, LEFT_STOP)
++    first = guard.fault_reason
++    with pytest.raises(TimeoutError):
++        guard.recover_speed_write_timeout(seq)
++    assert guard.rx_uncertain and guard.fault_reason == first
++    assert wire.writes == [RIGHT_SPEED, RIGHT_STOP, LEFT_STOP]
++    assert guard.last_recovery["stop_acknowledged"] == ["left"]
++
++
++@pytest.mark.parametrize("packet", [
++    RIGHT_STOP, READ_LEFT, frame("01 10 00 6d 00 01 02 00 00"),
++    frame("01 06 00 41 00 00"),
++])
++def test_stop_read_parameter_or_wrong_function_timeout_is_never_speed_recovery(packet):
++    guard, wire, _, seq = failed_speed(packet=packet)
++    before = list(wire.writes)
++    assert not guard.can_recover_speed_write_timeout(seq)
++    with pytest.raises(RtuLinkUncertain):
++        guard.recover_speed_write_timeout(seq)
++    assert wire.writes == before
++
++
++@pytest.mark.parametrize("response", [
++    RIGHT_ACK[:3], RIGHT_ACK[:-1]+b"\0", LEFT_ACK, frame("01 90 05"), frame("01 90 04"),
++])
++def test_partial_crc_or_mismatched_original_response_stays_fatal(response):
++    guard, wire, _ = setup(response)
++    with pytest.raises((TimeoutError, RtuProtocolError)):
++        guard.transact(RIGHT_SPEED, 8)
++    assert not guard.can_recover_speed_write_timeout(guard.last_transaction["seq"])
++
++
++@pytest.mark.parametrize("side", [0, 1])
++def test_missing_stop_ack_cannot_clear_fault_even_when_other_side_answers(side):
++    responses = normal_responses()
++    responses[side] = b""
++    guard, wire, _, seq = failed_speed(*responses)
++    with pytest.raises(TimeoutError):
++        guard.recover_speed_write_timeout(seq)
++    assert guard.rx_uncertain
++    assert wire.writes[1:3] == [RIGHT_STOP, LEFT_STOP]
++    assert len(wire.writes) == 3
++
++
++@pytest.mark.parametrize("failed_at", [2, 3, 4])
++def test_failed_fence_or_snapshot_cannot_recover(failed_at):
++    responses = normal_responses()
++    responses[failed_at] = b""
++    guard, wire, _, seq = failed_speed(*responses)
++    with pytest.raises(TimeoutError):
++        guard.recover_speed_write_timeout(seq)
++    assert guard.rx_uncertain
++    assert len([p for p in wire.writes if p[1] == 16]) == 1
++
++
++def test_hardware_error_is_not_hidden_by_later_clear_snapshot():
++    guard, wire, _, seq = failed_speed(RIGHT_STOP, LEFT_STOP, FENCE, snapshot(fault=7), snapshot())
++    with pytest.raises(RuntimeError, match="hardware fault"):
++        guard.recover_speed_write_timeout(seq)
++    assert guard.rx_uncertain
++    assert len(wire.writes) == 5
++
++
++def test_nonzero_feedback_requires_two_later_zeros_and_has_bounded_deadline():
++    guard, wire, _, seq = failed_speed(RIGHT_STOP, LEFT_STOP, FENCE,
++        snapshot(left=1), snapshot(), snapshot(right=-2), snapshot(), snapshot())
++    result = guard.recover_speed_write_timeout(seq)
++    assert result["recovery"]["zero_samples"] == 2
++    assert len(wire.writes) == 9
++    guard, wire, clock, seq = failed_speed(RIGHT_STOP, LEFT_STOP, FENCE, *([snapshot(left=1)]*20))
++    start = clock()
++    with pytest.raises(TimeoutError):
++        guard.recover_speed_write_timeout(seq, budget_sec=.1)
++    assert clock()-start <= .100001
++    assert guard.rx_uncertain
++
++
++def test_true_disconnect_attempts_both_stop_sides_and_never_retries_old_motion():
++    guard, wire, clock, seq = failed_speed()
++    start = clock()
++    with pytest.raises(TimeoutError):
++        guard.recover_speed_write_timeout(seq)
++    assert clock()-start <= .300001
++    assert wire.writes == [RIGHT_SPEED, RIGHT_STOP, LEFT_STOP]
++    assert guard.rx_uncertain
++    before = list(wire.writes)
++    with pytest.raises(RtuLinkUncertain):
++        guard.transact(RIGHT_SPEED, 8)
++    assert wire.writes == before
++
++
++def backend_with_responses(*responses):
++    guard, wire, clock = setup(*responses)
++    config = SimpleNamespace(forward_target_sign=1, left_sign=1, right_sign=1,
++        max_target=200, stop_mode="emergency", stop_zero_delay_sec=0)
++    backend = MssdMotorBackend(config, logger=logging.getLogger("fake.backend"))
++    backend._rtu_guard = guard
++    def speed(address, rpm):
++        payload = bytes((1, 16))+address.to_bytes(2, "big")+b"\0\2\4"+int(rpm).to_bytes(4, "big", signed=True)
++        return guard.transact(frame(payload), 8)
++    backend.driver = SimpleNamespace(
++        set_right_speed=lambda rpm: speed(0x41, rpm),
++        set_left_speed=lambda rpm: speed(0x45, rpm),
++        stop=lambda side, mode: guard.transact(frame(bytes((1, 6))+
++            (0x40 if side == "right" else 0x44).to_bytes(2, "big")+int(mode).to_bytes(2, "big")), 8))
++    return backend, guard, wire, clock
++
++
++@pytest.mark.parametrize("failed_side", ["right", "left"])
++def test_backend_discards_old_pair_and_only_a_separate_new_call_can_move(failed_side):
++    prefix = [b""] if failed_side == "right" else [RIGHT_ACK, b""]
++    backend, guard, wire, _ = backend_with_responses(*prefix, *normal_responses(), RIGHT_ACK, LEFT_ACK)
++    with pytest.raises(MotionWriteRecovered) as recovered:
++        backend._write_speed_pair(31, 29, "CONTINUOUS", recover_empty_timeout=True)
++    assert isinstance(recovered.value, MotionWriteCancelled)
++    assert recovered.value.partial is False
++    assert not backend.motion_write_fault and not guard.rx_uncertain
++    assert backend.last_speed_receipt is None and backend.last_speed_write is None
++    assert not backend.motion_armed
++    assert len([p for p in wire.writes if p[1] == 16]) == len(prefix)
++    # New targets prove this is not resending the pair from the exception.
++    backend._write_speed_pair(12, 11, "new_decision")
++    assert backend.last_speed_receipt.left_rpm == 12
++    assert backend.last_speed_receipt.right_rpm == 11
++    assert int.from_bytes(wire.writes[-2][7:11], "big") == 11
++    assert int.from_bytes(wire.writes[-1][7:11], "big") == 12
++
++
++def test_legacy_backend_does_not_opt_in_and_short_repeat_does_not_recover():
++    backend, guard, wire, _ = backend_with_responses(b"", RIGHT_STOP, LEFT_STOP)
++    with pytest.raises(TimeoutError):
++        backend._write_speed_pair(31, 29, "legacy")
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert all(p[1] != 3 for p in wire.writes)
++    backend, guard, wire, _ = backend_with_responses(b"", *normal_responses(),
++        b"", RIGHT_STOP, LEFT_STOP)
++    with pytest.raises(MotionWriteRecovered):
++        backend._write_speed_pair(31, 29, "continuous", recover_empty_timeout=True)
++    with pytest.raises(TimeoutError):
++        backend._write_speed_pair(32, 30, "continuous", recover_empty_timeout=True)
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert len([p for p in wire.writes if p[1] == 3]) == 3
++
++
++def test_recovery_lock_covers_stop_fence_and_feedback():
++    guard, wire, _, seq = failed_speed(*normal_responses())
++    original_write = wire.write
++    def write(packet):
++        assert not guard._lock.acquire(blocking=False)
++        return original_write(packet)
++    wire.write = write
++    guard.recover_speed_write_timeout(seq)
++    assert guard._lock.acquire(blocking=False)
++    guard._lock.release()
++
++
++@pytest.mark.parametrize("replacement", [
++    RIGHT_STOP[:3], RIGHT_STOP[:-1]+b"\0", LEFT_STOP, RIGHT_ACK+RIGHT_ACK+RIGHT_STOP,
++])
++def test_bad_recovery_frames_never_clear_uncertainty_and_do_not_skip_other_stop(replacement):
++    guard, wire, _, seq = failed_speed(replacement, LEFT_STOP)
++    with pytest.raises((TimeoutError, RtuProtocolError)):
++        guard.recover_speed_write_timeout(seq)
++    assert guard.rx_uncertain
++    assert wire.writes[:3] == [RIGHT_SPEED, RIGHT_STOP, LEFT_STOP]
++
++
++def test_backend_failed_recovery_retains_fault_and_attempts_original_safety_stop():
++    backend, guard, wire, _ = backend_with_responses(b"", b"", LEFT_STOP, RIGHT_STOP, LEFT_STOP)
++    with pytest.raises(RuntimeError, match="speed recovery failed"):
++        backend._write_speed_pair(31, 29, "CONTINUOUS", recover_empty_timeout=True)
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert backend.last_speed_receipt is None
++    assert wire.writes[1:] == [RIGHT_STOP, LEFT_STOP, RIGHT_STOP, LEFT_STOP]
++
++
++@pytest.mark.parametrize("explicit_stop", [False, True])
++def test_runtime_continues_from_new_observations_without_acknowledging_or_replaying_old_intent(explicit_stop):
++    # Execute the actual unchanged runtime.run method with fake peripherals.
++    # AST extraction avoids loading vision models/SDK modules, not motor code.
++    path = Path(__file__).parents[2]/"continuous_follow/runtime.py"
++    tree = ast.parse(path.read_text())
++    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ContinuousRuntime")
++    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
++    receipt = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "motor_write_receipt")
++    scope = dict(time=time, traceback=traceback, MotionWriteCancelled=MotionWriteCancelled,
++        BoardStopMotionFault=RuntimeError, MotorShutdownError=RuntimeError,
++        MotionIntent=lambda sequence, behavior, left, right, speed, now, expires, reason, stop:
++            SimpleNamespace(sequence=sequence, behavior=behavior, left_rpm=left, right_rpm=right,
++                reason=reason, stop=stop, session_id=1))
++    exec(compile(ast.Module(body=[receipt, method], type_ignores=[]), str(path), "exec"), scope)
++    from continuous_follow.hardware import BoardMotor
++    new_motion_replies = [] if explicit_stop else [RIGHT_ACK, LEFT_ACK]
++    backend, guard, wire, _ = backend_with_responses(b"", *normal_responses(),
++        *new_motion_replies, RIGHT_STOP, LEFT_STOP)
++    motor = BoardMotor.__new__(BoardMotor)
++    motor.backend, motor.config = backend, backend.config
++    motor._stopped = False
++    motor.stop_monitor = None
++    runtime = SimpleNamespace()
++    runtime.stop_event = threading.Event()
++    intents, acknowledged, events = [], [], []
++    def tick(now, heartbeat, **kwargs):
++        i = len(intents)+1
++        intent = SimpleNamespace(sequence=i, left_rpm=20+i, right_rpm=10+i,
++            stop=False, reason="fresh", session_id=1, behavior="FOLLOW")
++        intents.append(intent)
++        return intent
++    def write(intent):
++        try:
++            result = motor.write(intent)
++        except MotionWriteRecovered:
++            if explicit_stop:
++                request_stop("user_stop")
++            raise
++        if not intent.stop:
++            runtime.stop_event.set()
++        return result
++    def request_stop(reason):
++        runtime.stop_reason = runtime.stop_reason or reason
++        runtime.stop_event.set()
++    runtime.controller = SimpleNamespace(tick=tick, yaw_diagnostics={}, forward_diagnostics={},
++        near_field_diagnostics={}, acknowledge=lambda intent, now: acknowledged.append(intent.sequence) or True)
++    runtime.motor = SimpleNamespace(write=write)
++    runtime.execute = True
++    runtime.lock = threading.Lock()
++    runtime.target = runtime.range = runtime.space = None
++    runtime.candidates = []
++    runtime.capture_heartbeat = runtime.vision_completed_at = time.monotonic()
++    runtime.gestures = runtime.passage = runtime.navigation = runtime.astra_preview = None
++    runtime.imu_heading = runtime.local_pointcloud = None
++    runtime.recorder = runtime.detector = runtime.extractor = runtime.record_dir = None
++    runtime.gesture_gate = None
++    runtime.inputs = SimpleNamespace(obstacle_reason=lambda: None)
++    runtime.events = SimpleNamespace(emit=lambda event, **fields: events.append((event, fields)))
++    runtime.manager = SimpleNamespace(gallery=SimpleNamespace(counts={}))
++    runtime._open = lambda: None
++    runtime._worker = lambda *args: None
++    runtime._capture_loop = runtime._vision_loop = runtime._depth_loop = lambda: None
++    runtime._update_feedback = lambda: None
++    runtime._apply_arc_avoidance = lambda intent, *args: intent
++    runtime._prepare_arc_send = lambda intent, *args: intent
++    runtime._ack_arc_avoidance = lambda *args, **kwargs: None
++    runtime._motor_diagnostics = lambda: {}
++    runtime._motor_opened = True
++    runtime._motor_attempted = runtime._input_attempted = False
++    runtime.failure = runtime.exit_failure = runtime.stop_reason = None
++    runtime.threads = []
++    runtime.request_stop = request_stop
++    scope["run"](runtime, duration=.5)
++    assert len(intents) == (1 if explicit_stop else 2)
++    assert acknowledged == ([] if explicit_stop else [2])
++    assert runtime.exit_failure is None
++    assert [fields["intent"].sequence for event, fields in events if event == "write_skipped"] == [1]
++    assert [event for event, _ in events].count("runtime_failure") == 0
++    speed_packets = [p for p in wire.writes if p[1] == 16]
++    assert [int.from_bytes(p[7:11], "big") for p in speed_packets] == ([11] if explicit_stop else [11, 12, 22])
++    assert wire.writes[-2:] == [RIGHT_STOP, LEFT_STOP]
++    assert all(int.from_bytes(p[2:4], "big") not in (0x6d, 0x76) for p in wire.writes)
+--- /dev/null
++++ b/tests/motor/test_continuous_stop_pause.py
+@@ -0,0 +1,186 @@
++"""Only periodic emergency STOP refresh may recover; fake wire, no hardware."""
++from types import SimpleNamespace
++import time
++
++import pytest
++
++from car_control_modular.mssd_motor import MotionWriteCancelled
++from continuous_follow.hardware import BoardMotor
++from test_motor_rtu import frame, RIGHT_STOP, LEFT_STOP
++from test_continuous_write_pause import backend_with_responses, FENCE, snapshot
++
++
++def responses(side, *, delayed=b""):
++    initial = [b"", LEFT_STOP] if side == "right" else [RIGHT_STOP, b""]
++    uncredited = [RIGHT_STOP, LEFT_STOP] if side == "right" else [LEFT_STOP, RIGHT_STOP]
++    return initial+uncredited+[delayed+FENCE, RIGHT_STOP, LEFT_STOP, snapshot(), snapshot()]
++
++
++def recover(backend, check=lambda: True, mode=1):
++    backend._checked_stop_wheels("continuous:target_lost", mode,
++        recover_empty_timeout=True, recovery_check=check)
++
++
++@pytest.mark.parametrize("side", ["right", "left"])
++def test_initial_single_missing_stop_tries_both_then_reasserts_before_fence(side):
++    backend, guard, wire, _ = backend_with_responses(*responses(side))
++    recover(backend)
++    assert not backend.motion_write_fault and not guard.rx_uncertain
++    assert wire.writes[:2] == [RIGHT_STOP, LEFT_STOP]
++    failed = RIGHT_STOP if side == "right" else LEFT_STOP
++    other = LEFT_STOP if side == "right" else RIGHT_STOP
++    assert wire.writes[2:4] == [failed, other]  # Before any synchronization read.
++    assert [p[1] for p in wire.writes] == [6, 6, 6, 6, 3, 6, 6, 3, 3]
++    report = backend.last_motion_recovery
++    assert report["originalStopOutcome"] == "unknown"
++    assert report["response_order_assumption"] == "single_master_ordered_rtu"
++    assert report["uncredited_stop_responses"] == [side, "left" if side == "right" else "right"]
++    assert report["fence_completed"] and report["stop_acknowledged"] == ["right", "left"]
++    assert report["zero_samples"] == 2 and report["elapsed_ms"] <= 600
++    assert backend.last_speed_receipt is None
++
++
++@pytest.mark.parametrize("side", ["right", "left"])
++def test_old_same_bytes_during_fence_are_not_counted_as_new_stop_confirmation(side):
++    old = RIGHT_STOP if side == "right" else LEFT_STOP
++    backend, guard, wire, _ = backend_with_responses(*responses(side, delayed=old))
++    recover(backend)
++    report = backend.last_motion_recovery
++    assert report["discarded_late_frames"] == [old.hex()]
++    assert report["originalStopOutcome"] == "unknown"
++    assert report["stop_acknowledged"] == ["right", "left"]
++    assert len([p for p in wire.writes if p[1] == 6]) == 6
++
++
++def test_old_ack_alone_cannot_replace_fence_or_authorize_new_motion():
++    backend, guard, wire, _ = backend_with_responses(b"", LEFT_STOP, RIGHT_STOP, LEFT_STOP,
++        RIGHT_STOP, RIGHT_STOP, LEFT_STOP)
++    with pytest.raises(RuntimeError, match="STOP recovery failed"):
++        recover(backend)
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert not backend.last_motion_recovery["fence_completed"]
++    assert backend.last_motion_recovery["stop_acknowledged"] == []
++    assert all(p[1] != 16 for p in wire.writes)
++
++
++def test_late_known_ack_after_fence_in_wrong_slot_is_fatal_not_relabelled():
++    replies = responses("right")
++    replies[6] = RIGHT_STOP+LEFT_STOP  # LEFT repeat expects LEFT, not old RIGHT.
++    backend, guard, wire, _ = backend_with_responses(*replies, RIGHT_STOP, LEFT_STOP)
++    with pytest.raises(RuntimeError, match="STOP recovery failed"):
++        recover(backend)
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert backend.last_motion_recovery["zero_samples"] == 0
++    assert all(p[1] != 16 for p in wire.writes)
++
++
++@pytest.mark.parametrize("reply", [RIGHT_STOP[:3], RIGHT_STOP[:-1]+b"\0", frame("01 86 05")])
++def test_partial_crc_or_exception_original_stop_is_never_recoverable(reply):
++    backend, guard, wire, _ = backend_with_responses(reply, LEFT_STOP)
++    with pytest.raises(Exception):
++        recover(backend)
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert wire.writes == [RIGHT_STOP, LEFT_STOP]
++    assert guard.last_recovery is None
++
++
++def test_two_missing_original_stop_acks_are_persistent_loss_not_single_transient():
++    backend, guard, wire, _ = backend_with_responses(b"", b"")
++    with pytest.raises(TimeoutError):
++        recover(backend)
++    assert wire.writes == [RIGHT_STOP, LEFT_STOP]
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert guard.last_recovery is None
++
++
++def test_persistent_loss_in_uncredited_reassertion_still_attempts_both_and_exits():
++    backend, guard, wire, _ = backend_with_responses(b"", LEFT_STOP)
++    with pytest.raises(RuntimeError, match="STOP recovery failed"):
++        recover(backend)
++    assert wire.writes[:4] == [RIGHT_STOP, LEFT_STOP, RIGHT_STOP, LEFT_STOP]
++    assert backend.motion_write_fault and guard.rx_uncertain
++    assert not any(p[1] == 3 for p in wire.writes)
++
++
++@pytest.mark.parametrize("mode", [0, 2])
++def test_normal_or_free_stop_never_uses_recovery(mode):
++    reply = frame(bytes((1, 6, 0, 0x44, 0, mode)))
++    backend, guard, wire, _ = backend_with_responses(b"", reply, RIGHT_STOP, LEFT_STOP)
++    with pytest.raises(TimeoutError):
++        recover(backend, mode=mode)
++    assert guard.last_recovery is None and backend.motion_write_fault
++    assert all(p[1] == 6 for p in wire.writes)
++
++
++def test_user_stop_arriving_during_initial_timeout_disables_recovery():
++    backend, guard, wire, _ = backend_with_responses(b"", LEFT_STOP)
++    def stopped():
++        raise MotionWriteCancelled("stop_requested")
++    with pytest.raises(TimeoutError):
++        recover(backend, check=stopped)
++    assert guard.last_recovery is None
++    assert wire.writes == [RIGHT_STOP, LEFT_STOP]
++
++
++@pytest.mark.parametrize("kind", ["initial", "shutdown", "user_stop", "gesture_paused", "changed", "no_guard"])
++def test_board_adapter_only_opts_in_to_established_periodic_same_reason_stop(kind):
++    backend, guard, wire, _ = backend_with_responses(b"", LEFT_STOP)
++    motor = BoardMotor.__new__(BoardMotor)
++    motor.backend, motor.config = backend, backend.config
++    motor._stopped = kind != "initial"
++    motor._last_stop_write_at = time.monotonic()-.25
++    motor._last_stop_reason = "target_lost"
++    motor.stop_recovery_guard = None if kind == "no_guard" else lambda: True
++    reason = kind if kind in ("shutdown", "user_stop", "gesture_paused") else "target_lost"
++    if kind == "changed":
++        motor._last_stop_reason = "other"
++    if kind in ("shutdown", "user_stop", "gesture_paused"):
++        motor._last_stop_reason = reason
++    with pytest.raises(TimeoutError):
++        motor.write(SimpleNamespace(stop=True, reason=reason))
++    assert guard.last_recovery is None
++    assert all(p[1] == 6 for p in wire.writes)
++
++
++def test_board_periodic_stop_receipt_keeps_original_uncertainty_and_clears_no_configuration():
++    backend, guard, wire, _ = backend_with_responses(*responses("left"))
++    motor = BoardMotor.__new__(BoardMotor)
++    motor.backend, motor.config = backend, backend.config
++    motor._stopped = True
++    motor._last_stop_write_at = time.monotonic()-.25
++    motor._last_stop_reason = "target_lost"
++    motor.stop_recovery_guard = lambda: True
++    result = motor.write(SimpleNamespace(stop=True, reason="target_lost"))
++    assert result["kind"] == "stop" and result["acknowledged"] is True
++    assert result["physical_stillness"] == "unverified"
++    assert backend.last_motion_recovery["originalStopOutcome"] == "unknown"
++    assert all(p[1] != 16 for p in wire.writes)
++
++
++def test_stop_during_recovery_cancels_after_verified_stop_without_rearming_motion():
++    backend, guard, wire, _ = backend_with_responses(*responses("right"))
++    decisions = iter([True, False])
++    with pytest.raises(MotionWriteCancelled, match="stop_requested") as ended:
++        recover(backend, check=lambda: next(decisions))
++    assert ended.value.partial is False
++    assert not backend.motion_write_fault and not guard.rx_uncertain
++    assert not backend.motion_armed and backend.last_speed_receipt is None
++    assert backend.last_motion_recovery["stop_requested_after_recovery"] is True
++    assert all(p[1] != 16 for p in wire.writes)
++
++
++def test_stop_recovery_does_not_consult_stale_motion_ttl_or_identity_guard():
++    backend, guard, wire, _ = backend_with_responses(*responses("right"))
++    motor = BoardMotor.__new__(BoardMotor)
++    motor.backend, motor.config = backend, backend.config
++    motor._stopped = True
++    motor._last_stop_write_at = time.monotonic()-.4
++    motor._last_stop_reason = "target_lost"
++    motor.stop_recovery_guard = lambda: True
++    def expired(intent):
++        raise MotionWriteCancelled("intent_expired")
++    motor.motion_guard = expired
++    receipt = motor.write(SimpleNamespace(stop=True, reason="target_lost", expires_at=0))
++    assert receipt["acknowledged"] is True
++    assert backend.last_motion_recovery["zero_samples"] == 2
++    assert all(p[1] != 16 for p in wire.writes)

@@ -254,6 +254,40 @@ class FollowControlsTest {
         compose.onNodeWithTag("followPhysicalStopped").performScrollTo().assertTextEquals("机械停稳：未知")
     }
 
+    @Test fun completedInitializationIsHistoricalAndDriverFaultKeepsItsOriginalText() {
+        val startup = FollowStartup("motor", 186, 3_619, 10_000, 30_000, false)
+        val state = mutableStateOf(ready().copy(followActive = true, followStatus = status().copy(
+            runState = "STARTING", startup = startup)))
+        compose.setContent { TestPage(state.value) }
+        openDetails()
+        compose.onNodeWithTag("followStartupStage").performScrollTo()
+            .assertTextEquals("启动阶段：初始化电机适配（motor）")
+        compose.onNodeWithTag("followStartupBudget").assertExists()
+        compose.onNodeWithTag("followStartupCompleted").assertDoesNotExist()
+        compose.runOnIdle {
+            state.value = state.value.copy(followStatus = state.value.followStatus!!.copy(
+                runState = "RUNNING", startup = startup.copy(completed = true)))
+        }
+        compose.onNodeWithTag("followStartupStage").assertDoesNotExist()
+        compose.onNodeWithTag("followStartupBudget").assertDoesNotExist()
+        compose.onNodeWithTag("followStartupCompleted").performScrollTo()
+            .assertTextEquals("初始化已完成，用时 3.62 秒")
+        compose.runOnIdle {
+            state.value = state.value.copy(followActive = false, followTerminal = true,
+                followError = "motor_write: no response from driver",
+                followStatus = state.value.followStatus!!.copy(runState = "FAULT", processExited = true,
+                    fault = "motor_write: no response from driver"))
+        }
+        compose.onNodeWithTag("followStartupStage").assertDoesNotExist()
+        compose.onNodeWithTag("followStartupBudget").assertDoesNotExist()
+        compose.onNodeWithTag("followStartupCompleted").assertTextEquals("初始化已完成，用时 3.62 秒")
+        compose.onNodeWithTag("followError").performScrollTo()
+            .assertTextEquals("最近操作：motor_write: no response from driver")
+        compose.onNodeWithTag("followFaultExplanation").performScrollTo()
+            .assertTextEquals("电机指令未收到驱动器回执")
+        compose.onNodeWithTag("stopFollow").assertDoesNotExist()
+    }
+
     @Test fun configurationOnlyLoadsAfterExplicitExpansionAndRead() {
         val state = mutableStateOf(ready())
         var inspections = 0

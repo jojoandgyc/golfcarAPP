@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 38
-        versionName = "1.8.27-follow-background"
+        versionCode = 39
+        versionName = "1.8.28-follow-motor-diagnostics"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

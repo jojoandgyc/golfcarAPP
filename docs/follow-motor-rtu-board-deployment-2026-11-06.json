@@ -1,0 +1,61 @@
+{
+  "observedUtc": "2026-11-06T12:42:38.021509+00:00",
+  "route": "direct_172.16.16.122",
+  "deployRequested": true,
+  "files": [
+    {
+      "path": "tools/runtime_diagnostics.py",
+      "before": null,
+      "after": "260267a9012813a96cb0e33858e6af8ac2c4a1dcb784a9e85b4a57aafd2b67fe"
+    },
+    {
+      "path": "tools/prepare_run_logs.py",
+      "before": "40023043c8c8b9f2ac0ea3afe9c98852c7d4be1e2e92f16007ddbd8fc1d5ce27",
+      "after": "57cc6a49b015842c9ef46d8457a47ea1216f1842f8d2535f5f843af83c5290dc"
+    },
+    {
+      "path": "continuous_follow/telemetry.py",
+      "before": "ddc9c555b05486eeb878659d75cf704b48238bc23981757151a3e147836ffb98",
+      "after": "06ba9b7f86065f7a6672af72a151a6d21b8458ba2d6758d4634d7b39574a81bd"
+    },
+    {
+      "path": "request_continuous_follow.py",
+      "before": "bc80b070c65cd4af2b3ad77e9d0b878f65ad63ad8a90cd2b6896ffa9d68e3939",
+      "after": "bb93ce71dd7416f0e5eac100f6827896235d23927f3accf8488f049a134611b9"
+    },
+    {
+      "path": "car_control_modular/motor_rtu.py",
+      "before": "88ee063b093e82f3d6c878e97c00e025dcacf36d1060184e2110fd42a8272642",
+      "after": "0e3f4d259babc10e79755fa76e8cca0aefda1217e475098912c5787714bec23a"
+    },
+    {
+      "path": "car_control_modular/mssd_motor.py",
+      "before": "3f0600f4bbb64e160399dc445730db4e5d7ecbe9bbd6528dbf421db359ee1bed",
+      "after": "ef15ce483d6d7d8052cd95cd3f4432c3916fa32ae786fe2cbf849b49a8937d32"
+    },
+    {
+      "path": "continuous_follow/hardware.py",
+      "before": "173031ad24aa8710cd0d6cf719dc66cb35ddc1ad7ee619438da5b7b04b102624",
+      "after": "37ce7690dbc8015d0e62a9676c78566ad9446bd7f800aef6a72616381a0c1335"
+    },
+    {
+      "path": "continuous_follow/runtime.py",
+      "before": "2072712d7977bd9f22c1fb8bb401c3a59108144fd095b880dd7d8420ae928684",
+      "after": "d078415861252603d090bac7ab84ed7847503f43ed6c4b9147abbf9ee4f6848e"
+    }
+  ],
+  "boardHostKeySha256": "q2zNQ3JiN/xmd0W+f3sk4mNfZKKI2zm60JS6Z6nFNV4",
+  "controlIdleGuard": {
+    "event": "locked",
+    "bothControlLocksHeld": true,
+    "leaseSeconds": 120
+  },
+  "cleanedPreviousEmptyTemp": true,
+  "status": "deployed",
+  "backupDir": "/home/topeet/Desktop/rk_car_runtime_module/.codex_backups/follow_motor_write_20261106T124239Z_e092bd55",
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  },
+  "controlGuardExit": 0
+}

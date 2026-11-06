@@ -153,12 +153,17 @@ internal fun FollowStatusDetails(
         else "软件状态：$lifecycle", fontWeight = FontWeight.Bold, modifier = Modifier.testTag("followRunState"))
     Text("本次会话：${if (status.execute) "实车" else "影子"} · ${status.camera.label}")
     status.startup?.let { startup ->
-        Text("启动阶段：${startup.stage.startupStageLabel()}（${startup.stage}）",
-            style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followStartupStage"))
-        Text("阶段已用 ${startup.stageElapsedMs} ms / 预算 ${startup.stageTimeoutMs} ms；总计 ${startup.totalElapsedMs} ms / 期限 ${startup.totalTimeoutMs} ms",
-            style = MaterialTheme.typography.bodySmall)
-        Text("初始化：${if (startup.completed) "已完成" else "未完成"}；运行与退出以会话状态为准。",
-            style = MaterialTheme.typography.bodySmall)
+        if (startup.completed) {
+            // The final stage is historical once complete; it is not the phase of a later fault.
+            Text(startup.completedSummary(), style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag("followStartupCompleted"))
+        } else {
+            Text("启动阶段：${startup.stage.startupStageLabel()}（${startup.stage}）",
+                style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followStartupStage"))
+            Text("阶段已用 ${startup.stageElapsedMs} ms / 预算 ${startup.stageTimeoutMs} ms；总计 ${startup.totalElapsedMs} ms / 期限 ${startup.totalTimeoutMs} ms",
+                style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("followStartupBudget"))
+            Text("初始化：未完成；运行与退出以会话状态为准。", style = MaterialTheme.typography.bodySmall)
+        }
     }
     Text(if (freshStatus) "控制行为：${status.behavior ?: "未知"}；原因：${status.reason ?: "未知"}"
         else if (status.processExited) "结束原因：${status.reason ?: "未知"}"

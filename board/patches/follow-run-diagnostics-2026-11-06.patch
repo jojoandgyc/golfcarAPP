@@ -1,0 +1,763 @@
+--- a/tools/runtime_diagnostics.py
++++ b/tools/runtime_diagnostics.py
+@@ -0,0 +1,289 @@
++"""Bounded run evidence, separate from disposable recordings and camera frames.
++
++Only EventLog's writer (or an explicit offline migration) calls this module. No
++control/capture thread waits for filesystem I/O here. The directory is a private
++diagnostic pool; its JSON records contain no recordings or arbitrary stdout.
++"""
++from collections import deque
++from contextlib import contextmanager
++import datetime
++import fcntl
++import json
++import math
++import os
++from pathlib import Path
++import re
++import stat
++import time
++import uuid
++
++OWNER = "rk_car_runtime_diagnostics"
++VERSION = 1
++MAX_AGE_SECONDS = 7 * 24 * 3600
++MAX_BYTES = 20 * 1024 * 1024
++MAX_EVENT_BYTES = 512 * 1024
++MAX_RECORD_BYTES = 2 * 1024 * 1024
++CONTEXT_BYTES = 256 * 1024
++RUN_NAME = re.compile(r"run_[A-Za-z0-9_]{1,120}\Z")
++TEMP_NAME = re.compile(r"\.tmp_[a-f0-9]{32}\.json\Z")
++FAULTS = {"runtime_failure", "process_failure", "worker_failure"}
++CONTEXT_EVENTS = {"process_start", "startup", "write", "feedback", "intent",
++                  "intent_revision", "gesture_command", "diagnostic", "signal"}
++AFTER_EVENTS = {"runtime_failure", "process_failure", "worker_failure", "shutdown",
++                "process_exit", "log_summary", "diagnostic"}
++SECRET_KEY = re.compile(r"password|passwd|token|secret|credential|authorization|private.?key", re.I)
++SECRET_TEXT = re.compile(r"(?i)\b(password|passwd|token|secret|authorization)\s*[:=]\s*[^\s,;]+")
++
++
++def _encode(value):
++    return (json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
++
++
++def _redact(value, depth=0):
++    if depth > 20:
++        return "[DEPTH_LIMIT]"
++    if isinstance(value, dict):
++        return {str(k): "[REDACTED]" if SECRET_KEY.search(str(k)) else _redact(v, depth+1)
++                for k, v in list(value.items())[:256]}
++    if isinstance(value, (list, tuple)):
++        return [_redact(v, depth+1) for v in value[:256]]
++    if isinstance(value, str):
++        return SECRET_TEXT.sub(r"\1=[REDACTED]", value[:131072])
++    return value
++
++
++def _event(row):
++    value = _redact(row)
++    data = _encode(value)
++    if len(data) <= MAX_EVENT_BYTES:
++        return value, len(data)
++    # Never quietly pretend an oversized diagnostic was fully retained.
++    value = {key: value.get(key) for key in ("event", "emitted_at", "stage", "exception_type", "error")}
++    value.update(archiveTruncated=True, originalBytes=len(data),
++                 excerpt=data[:32768].decode("utf-8", "replace"))
++    return value, len(_encode(value))
++
++
++def _regular(path):
++    try:
++        mode = path.lstat()
++        return stat.S_ISREG(mode.st_mode) and mode.st_nlink == 1
++    except OSError:
++        return False
++
++
++def _root(path):
++    path = Path(path).absolute()
++    if path == Path(path.anchor) or path.is_symlink():
++        raise ValueError("unsafe diagnostic root")
++    path.mkdir(mode=0o700, parents=True, exist_ok=True)
++    if path.is_symlink() or not path.is_dir():
++        raise ValueError("diagnostic root is not a directory")
++    return path
++
++
++@contextmanager
++def _lock(root):
++    fd = os.open(root / ".archive.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
++    try:
++        if not stat.S_ISREG(os.fstat(fd).st_mode):
++            raise ValueError("invalid diagnostic lock")
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        yield
++    finally:
++        os.close(fd)
++
++
++def _records(root):
++    result = []
++    for path in root.iterdir():
++        if path.suffix != ".json" or not RUN_NAME.fullmatch(path.stem) or not _regular(path):
++            continue
++        size = path.stat().st_size
++        if size > MAX_RECORD_BYTES:
++            continue  # An untrusted/unrecognized file is never deleted.
++        try:
++            row = json.loads(path.read_bytes())
++            if (row.get("owner") != OWNER or row.get("schemaVersion") != VERSION or
++                    row.get("runName") != path.stem or type(row.get("createdAt")) not in (int, float) or
++                    type(row.get("failure")) is not bool or not math.isfinite(row["createdAt"])):
++                continue
++        except (OSError, ValueError, AttributeError):
++            continue
++        result.append((path, size, row))
++    return result
++
++
++def _prune_locked(root, *, now, max_bytes, max_age, reserve=0, protect=None,
++                  incoming_failure=True):
++    # Leftover atomic-write files are ours by exact name in this private pool.
++    for path in root.iterdir():
++        if TEMP_NAME.fullmatch(path.name) and _regular(path):
++            path.unlink()
++    records = _records(root)
++    retained = []
++    for path, size, row in records:
++        if path != protect and now-row["createdAt"] > max_age:
++            path.unlink()
++        else:
++            retained.append((path, size, row))
++    total = sum(size for _, size, _ in retained)
++    # Normal summaries go first; under pressure retain newest failures longest.
++    for path, size, row in sorted(retained, key=lambda item: (item[2]["failure"], item[2]["createdAt"], item[0].name)):
++        if total + reserve <= max_bytes:
++            break
++        if path == protect:
++            continue
++        if row["failure"] and not incoming_failure:
++            return False  # A new ordinary summary must not evict a real fault.
++        path.unlink()
++        total -= size
++    if total + reserve > max_bytes:
++        raise OSError("diagnostic archive quota cannot accommodate atomic update")
++    return True
++
++
++def prune_archive(root, *, now=None, max_bytes=MAX_BYTES, max_age=MAX_AGE_SECONDS):
++    root = _root(root)
++    with _lock(root):
++        _prune_locked(root, now=time.time() if now is None else now,
++                      max_bytes=max_bytes, max_age=max_age)
++
++
++class RunDiagnosticArchive:
++    def __init__(self, root, run_name, *, clock=time.time, max_bytes=MAX_BYTES,
++                 max_age=MAX_AGE_SECONDS, created_at=None):
++        if not RUN_NAME.fullmatch(run_name):
++            raise ValueError("invalid diagnostic run name")
++        if max_bytes < MAX_RECORD_BYTES * 2 or max_age <= 0:
++            raise ValueError("diagnostic quota is too small")
++        self.root = Path(root)
++        self.run_name = run_name
++        self.clock, self.max_bytes, self.max_age = clock, max_bytes, max_age
++        self.created_at = clock() if created_at is None else created_at
++        self.context = deque()
++        self.context_size = 0
++        self.first_failure = None
++        self.before_failure = []
++        self.after_failure = deque(maxlen=16)
++        self.error = None
++
++    def observe(self, row):
++        """Called only by the log writer; failures never escape to motor code."""
++        try:
++            event = row.get("event")
++            fault = event in FAULTS or event == "shutdown" and bool(row.get("failure"))
++            if event not in CONTEXT_EVENTS | AFTER_EVENTS and not fault:
++                return
++            value, size = _event(row)
++            if fault and self.first_failure is None:
++                self.first_failure = value
++                self.before_failure = [v for v, _ in self.context]
++            elif self.first_failure is not None and event in AFTER_EVENTS:
++                self.after_failure.append(value)
++            if self.first_failure is None and event in CONTEXT_EVENTS:
++                self.context.append((value, size)); self.context_size += size
++                while self.context_size > CONTEXT_BYTES or len(self.context) > 48:
++                    _, removed = self.context.popleft(); self.context_size -= removed
++            if fault or self.first_failure is not None and event in ("shutdown", "process_exit", "log_summary"):
++                self._save()
++            elif event == "process_exit":
++                self.after_failure.append(value)
++                self._save()  # Small normal summaries yield space to failures first.
++        except Exception as exc:
++            self.error = type(exc).__name__ + ": " + str(exc)[:160]
++
++    def _save(self):
++        now = self.clock()
++        # A late migration/cleanup must not refresh the seven-day lifetime.
++        if now-self.created_at > self.max_age:
++            return
++        record = dict(owner=OWNER, schemaVersion=VERSION, runName=self.run_name,
++                      createdAt=self.created_at, updatedAt=now, failure=self.first_failure is not None,
++                      firstFailure=self.first_failure, beforeFailure=self.before_failure,
++                      afterFailure=list(self.after_failure))
++        data = _encode(record)
++        while len(data) > MAX_RECORD_BYTES and record["afterFailure"]:
++            record["afterFailure"].pop(0); record["contextTruncated"] = True; data = _encode(record)
++        while len(data) > MAX_RECORD_BYTES and record["beforeFailure"]:
++            record["beforeFailure"].pop(0); record["contextTruncated"] = True; data = _encode(record)
++        if len(data) > MAX_RECORD_BYTES:
++            raise ValueError("diagnostic record exceeds bounded size")
++        root = _root(self.root)
++        path = root / (self.run_name + ".json")
++        with _lock(root):
++            if path.exists() or path.is_symlink():
++                valid = next((r for p, _, r in _records(root) if p == path), None)
++                if valid is None:
++                    raise ValueError("refusing to replace unrecognized diagnostic file")
++                if valid["failure"]:
++                    # A recreated writer/import must not replace the first persisted fault.
++                    record["failure"] = True
++                    record["firstFailure"] = valid["firstFailure"]
++                    record["beforeFailure"] = valid.get("beforeFailure", [])
++                    record["createdAt"] = valid["createdAt"]
++                    if self.first_failure != valid["firstFailure"]:
++                        record["afterFailure"] = (valid.get("afterFailure", []) + record["afterFailure"])[-16:]
++                    data = _encode(record)
++                    while len(data) > MAX_RECORD_BYTES and record["afterFailure"]:
++                        record["afterFailure"].pop(0); record["contextTruncated"] = True; data = _encode(record)
++                    if len(data) > MAX_RECORD_BYTES:
++                        raise ValueError("persisted diagnostic exceeds bounded size")
++                    if now-record["createdAt"] > self.max_age:
++                        _prune_locked(root, now=now, max_bytes=self.max_bytes, max_age=self.max_age)
++                        return
++            # Include the old version while reserving the complete new temp file,
++            # keeping even atomic replacement below the configured byte cap.
++            if not _prune_locked(root, now=now, max_bytes=self.max_bytes, max_age=self.max_age,
++                                 reserve=len(data), protect=path, incoming_failure=record["failure"]):
++                return
++            temporary = root / (".tmp_" + uuid.uuid4().hex + ".json")
++            try:
++                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++                with os.fdopen(fd, "wb") as stream:
++                    stream.write(data); stream.flush(); os.fsync(stream.fileno())
++                os.replace(temporary, path)
++            finally:
++                if temporary.exists() and _regular(temporary):
++                    temporary.unlink()
++
++
++def archive_existing_run(directory, root):
++    """Explicit offline migration: stream evidence before disposable-run pruning.
++
++    The launcher never calls this scanner. The single runtime owner must be idle.
++    Streaming one bounded line at a time
++    avoids loading recordings or a complete multi-MB events file into memory.
++    """
++    directory = Path(directory)
++    events = directory / "events.jsonl"
++    if directory.is_symlink() or not _regular(events):
++        return
++    stamp = events.stat().st_mtime
++    match = re.match(r"run_(\d{8}_\d{6})_", directory.name)
++    if match:
++        try:
++            stamp = datetime.datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").timestamp()
++        except ValueError:
++            pass
++    archive = RunDiagnosticArchive(root, directory.name, created_at=stamp)
++    destination = Path(root) / (directory.name + ".json")
++    if _regular(destination):
++        return  # The writer already captured this run; never replace its first fault.
++    with events.open("rb") as stream:
++        while True:
++            line = stream.readline(MAX_EVENT_BYTES + 1)
++            if not line:
++                break
++            if len(line) > MAX_EVENT_BYTES and not line.endswith(b"\n"):
++                while line and not line.endswith(b"\n"):
++                    line = stream.readline(MAX_EVENT_BYTES + 1)
++                continue
++            try:
++                row = json.loads(line)
++                if isinstance(row, dict):
++                    archive.observe(row)
++            except (ValueError, UnicodeError):
++                continue
++    if archive.error:
++        raise OSError("runtime diagnostic migration failed: " + archive.error)
+--- a/tools/prepare_run_logs.py
++++ b/tools/prepare_run_logs.py
+@@ -180,7 +180,8 @@
+     return root
+ 
+ 
+-def _prune(root: Path, *, keep: int, current: Optional[Path] = None) -> list[Path]:
++def _prune(root: Path, *, keep: int, current: Optional[Path] = None,
++           diagnostic_archive_root: Optional[Path] = None) -> list[Path]:
+     previous = [item for _, item in _managed_directories(root) if item != current]
+     removed = []
+     for directory in previous[keep - int(current is not None):]:
+@@ -188,8 +189,22 @@
+         # marker and real-directory checks above are intentionally repeated.
+         if directory == current or directory.parent != root or _marker_sequence(directory) is None:
+             continue
++        if diagnostic_archive_root is not None:
++            # Explicit offline maintenance only; the follow launcher does not opt in.
++            # Backfill disposable old runs before their recordings are removed.
++            try:
++                from tools.runtime_diagnostics import archive_existing_run
++                archive_existing_run(directory, diagnostic_archive_root)
++            except Exception as exc:
++                print("runtime diagnostic archive unavailable: " + type(exc).__name__, file=sys.stderr)
+         shutil.rmtree(directory)
+         removed.append(directory)
++    if diagnostic_archive_root is not None:
++        try:
++            from tools.runtime_diagnostics import prune_archive
++            prune_archive(diagnostic_archive_root)
++        except Exception as exc:
++            print("runtime diagnostic retention unavailable: " + type(exc).__name__, file=sys.stderr)
+     return removed
+ 
+ 
+@@ -211,6 +226,7 @@
+     keep: int = 3,
+     migrate_legacy: bool = True,
+     adopt_existing_continuous: bool = False,
++    diagnostic_archive_root: Optional[Path] = None,
+ ) -> Path:
+     """Create a managed run directory under *root* and retain at most *keep*.
+ 
+@@ -231,13 +247,14 @@
+             if legacy is not None:
+                 sequence += 1
+         current = _create_managed_directory(root_path, sequence=sequence)
+-        _prune(root_path, keep=keep, current=current)
++        _prune(root_path, keep=keep, current=current, diagnostic_archive_root=diagnostic_archive_root)
+     return current
+ 
+ 
+ def prune_run_directories(
+     root: str | os.PathLike[str], *, keep: int = 3,
+     adopt_existing_continuous: bool = False,
++    diagnostic_archive_root: Optional[Path] = None,
+ ) -> list[Path]:
+     """Retain existing records without creating an empty run directory.
+ 
+@@ -250,7 +267,7 @@
+     with _preparation_lock(root_path):
+         if adopt_existing_continuous:
+             _adopt_continuous_records(root_path)
+-        return _prune(root_path, keep=keep)
++        return _prune(root_path, keep=keep, diagnostic_archive_root=diagnostic_archive_root)
+ 
+ 
+ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
+--- a/continuous_follow/telemetry.py
++++ b/continuous_follow/telemetry.py
+@@ -32,11 +32,13 @@
+ 
+ 
+ class EventLog:
+-    def __init__(self, path, capacity=4096):
++    def __init__(self, path, capacity=4096, *, diagnostic_root=None):
+         self.path = path
+         self.queue = queue.Queue(maxsize=capacity)
+         self.dropped = 0
+         self.error = None
++        self.archive_error = None
++        self.diagnostic_root = diagnostic_root
+         self.closed = threading.Event()
+         self.thread = threading.Thread(target=self._run, name="continuous-events", daemon=True)
+         self.thread.start()
+@@ -51,14 +53,38 @@
+ 
+     def _run(self):
+         try:
++            archive = None
++            if self.diagnostic_root is not None:
++                try:
++                    from pathlib import Path
++                    from tools.runtime_diagnostics import RunDiagnosticArchive, prune_archive
++                    archive = RunDiagnosticArchive(self.diagnostic_root, Path(self.path).parent.name)
++                    # Expiration and quota I/O belong to this writer, not launcher/startup.
++                    prune_archive(self.diagnostic_root)
++                except Exception as exc:
++                    self.archive_error = type(exc).__name__
+             with open(self.path, "x", encoding="utf-8") as stream:
++                reported_archive_error = None
+                 while not self.closed.is_set() or not self.queue.empty():
+                     try:
+                         row = self.queue.get(timeout=.1)
+                     except queue.Empty:
+                         continue
+                     stream.write(json.dumps(row, allow_nan=False, ensure_ascii=False) + "\n")
+-                stream.write(json.dumps(dict(event="log_summary", dropped=self.dropped)) + "\n")
++                    if archive is not None:
++                        archive.observe(row)
++                        self.archive_error = archive.error
++                    if self.archive_error and self.archive_error != reported_archive_error:
++                        stream.write(json.dumps(dict(event="diagnostic_archive_unavailable",
++                            error=self.archive_error), ensure_ascii=False) + "\n")
++                        reported_archive_error = self.archive_error
++                summary = dict(event="log_summary", dropped=self.dropped)
++                if archive is not None:
++                    archive.observe(summary)
++                    self.archive_error = archive.error
++                if self.diagnostic_root is not None:
++                    summary["archive_error"] = self.archive_error
++                stream.write(json.dumps(summary) + "\n")
+         except Exception as exc:
+             self.error = str(exc)
+ 
+--- a/request_continuous_follow.py
++++ b/request_continuous_follow.py
+@@ -325,9 +325,10 @@
+     from tools.prepare_run_logs import prepare_run_directory
+     logging.basicConfig(level=logging.WARNING)
+     with session_lock():
++        diagnostic_root = ROOT / "run_continuous_follow_diagnostics"
+         directory = prepare_run_directory(ROOT / "run_continuous_follow_logs",
+             keep=3, migrate_legacy=False, adopt_existing_continuous=True)
+-        events = EventLog(directory / "events.jsonl")
++        events = EventLog(directory / "events.jsonl", diagnostic_root=diagnostic_root)
+         diagnostic_handler = EventLoggingHandler(events)
+         root_logger = logging.getLogger()
+         root_logger.addHandler(diagnostic_handler)
+--- a/tests/tools/test_runtime_diagnostics.py
++++ b/tests/tools/test_runtime_diagnostics.py
+@@ -0,0 +1,268 @@
++"""Pure temporary-filesystem tests: no serial, camera, SSH or real log roots."""
++import json
++import ast
++import os
++from pathlib import Path
++import tempfile
++import threading
++import time
++import unittest
++from unittest import mock
++
++from continuous_follow.telemetry import EventLog
++from tools.prepare_run_logs import prepare_run_directory
++from tools.runtime_diagnostics import (RunDiagnosticArchive, archive_existing_run,
++    prune_archive, MAX_AGE_SECONDS, MAX_RECORD_BYTES, MAX_BYTES)
++
++
++class RuntimeDiagnosticsTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.base = Path(self.temp.name)
++        self.root = self.base / "diagnostics"
++        self.now = time.time()
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def archive(self, name="run_test", **kwargs):
++        return RunDiagnosticArchive(self.root, name, clock=lambda: self.now, **kwargs)
++
++    def read(self, name="run_test"):
++        return json.loads((self.root / (name + ".json")).read_text())
++
++    def fault(self, **values):
++        return dict(event="runtime_failure", emitted_at=10., stage="motor_write",
++                    exception_type="TimeoutError", error="no response from driver", **values)
++
++    def test_preserves_exact_first_fault_wire_details_and_cleanup(self):
++        a = self.archive()
++        a.observe(dict(event="intent", left_rpm=44, right_rpm=42))
++        a.observe(dict(event="feedback", left_rpm=43, right_rpm=41))
++        motor = dict(last_transaction=dict(function="0x06", register="0x0052", stage="read",
++                     tx_written=8, rx_length=0, elapsed_ms=150.2), right_acknowledged=True,
++                     recent_wire=[dict(register="0x0051", acknowledged=True)])
++        first = self.fault(motor=motor, traceback="actual call stack")
++        a.observe(first)
++        a.observe(dict(event="runtime_failure", error="later cleanup failure"))
++        a.observe(dict(event="shutdown", cleanup_errors=[], stop_acks=[True, False]))
++        a.observe(dict(event="process_exit", exit_code=1))
++        row = self.read()
++        self.assertEqual(row["firstFailure"], first)
++        self.assertEqual(row["beforeFailure"][0]["left_rpm"], 44)
++        self.assertEqual(row["afterFailure"][-2]["stop_acks"], [True, False])
++        self.assertIsNone(a.error)
++
++    def test_failure_survives_many_subsequent_normal_run_rotations(self):
++        runs = self.base / "run_continuous_follow_logs"
++        first = prepare_run_directory(runs, migrate_legacy=False)
++        events = EventLog(first / "events.jsonl", diagnostic_root=self.root)
++        events.emit("runtime_failure", stage="motor_write", motor={"rx_length": 0})
++        events.emit("process_exit", exit_code=1)
++        events.close()
++        for _ in range(6):
++            new = prepare_run_directory(runs, migrate_legacy=False, diagnostic_archive_root=self.root)
++            log = EventLog(new / "events.jsonl", diagnostic_root=self.root)
++            log.emit("process_exit", exit_code=0); log.close()
++        self.assertFalse(first.exists())
++        saved = self.read(first.name)
++        self.assertTrue(saved["failure"])
++        self.assertEqual(saved["firstFailure"]["motor"], {"rx_length": 0})
++        self.assertEqual(len(list(runs.glob("run_*"))), 3)
++
++    def test_backfills_existing_failure_before_prune_without_loading_video(self):
++        runs = self.base / "run_continuous_follow_logs"
++        old = prepare_run_directory(runs, migrate_legacy=False)
++        (old / "events.jsonl").write_text(json.dumps(self.fault(motor={"register": "0x0052"})) + "\n")
++        (old / "camera_raw.avi").write_bytes(b"must not archive images")
++        for _ in range(3):
++            prepare_run_directory(runs, migrate_legacy=False, diagnostic_archive_root=self.root)
++        self.assertFalse(old.exists())
++        self.assertEqual(self.read(old.name)["firstFailure"]["motor"]["register"], "0x0052")
++        self.assertNotIn("must not archive", (self.root / (old.name + ".json")).read_text())
++
++    def test_age_expiry_survives_reopen_and_does_not_refresh_on_cleanup(self):
++        a = self.archive(); a.observe(self.fault())
++        original = self.read()["createdAt"]
++        self.now += MAX_AGE_SECONDS - 1
++        a.observe(dict(event="shutdown", failure=None))
++        self.assertEqual(self.read()["createdAt"], original)
++        self.now += 2
++        prune_archive(self.root, now=self.now)
++        self.assertFalse((self.root / "run_test.json").exists())
++        a.observe(dict(event="process_exit", exit_code=1))
++        self.assertFalse((self.root / "run_test.json").exists())
++
++    def test_byte_quota_evicts_normal_then_old_faults_and_keeps_newest(self):
++        budget = 4 * 1024 * 1024
++        normal = self.archive("run_normal", max_bytes=budget)
++        normal.observe(dict(event="process_exit", exit_code=0))
++        payload = {f"evidence_{i}": "a" * 100000 for i in range(4)}
++        for index in range(16):
++            self.now += 1
++            a = self.archive(f"run_fault_{index}", max_bytes=budget)
++            a.observe(self.fault(motor=payload))
++            self.assertIsNone(a.error)
++            self.assertLessEqual(sum(p.stat().st_size for p in self.root.glob("*.json")), budget)
++        self.assertFalse((self.root / "run_normal.json").exists())
++        self.assertFalse((self.root / "run_fault_0.json").exists())
++        self.assertTrue((self.root / "run_fault_15.json").exists())
++        self.assertFalse(list(self.root.glob(".tmp_*")))
++
++    def test_new_normal_summary_cannot_displace_existing_fault(self):
++        a = self.archive(); a.observe(self.fault())
++        size = (self.root / "run_test.json").stat().st_size
++        from tools.runtime_diagnostics import _lock, _prune_locked
++        with _lock(self.root):
++            accepted = _prune_locked(self.root, now=self.now, max_bytes=size + 10,
++                                    max_age=MAX_AGE_SECONDS, reserve=20, incoming_failure=False)
++        self.assertFalse(accepted)
++        self.assertTrue((self.root / "run_test.json").exists())
++
++    def test_context_and_oversized_event_are_bounded_and_explicit(self):
++        a = self.archive()
++        for i in range(2000):
++            a.observe(dict(event="feedback", index=i, payload="x" * 10000))
++        self.assertLessEqual(a.context_size, 256 * 1024)
++        a.observe(self.fault(motor={str(i): "x" * 100000 for i in range(32)}))
++        row = self.read()
++        self.assertTrue(row["firstFailure"]["archiveTruncated"])
++        self.assertLessEqual((self.root / "run_test.json").stat().st_size, MAX_RECORD_BYTES)
++
++    def test_secrets_are_redacted_and_images_not_selected(self):
++        a = self.archive()
++        a.observe(dict(event="capture", image="private frame bytes"))
++        a.observe(self.fault(token="private-token", password="private-password",
++            nested={"authorization": "private-auth"}, traceback="token=private-token"))
++        text = (self.root / "run_test.json").read_text()
++        for secret in ("private-token", "private-password", "private-auth", "private frame bytes"):
++            self.assertNotIn(secret, text)
++        self.assertIn("[REDACTED]", text)
++
++    def test_symlink_destination_and_unmanaged_files_are_not_overwritten(self):
++        self.root.mkdir()
++        outside = self.base / "outside.json"; outside.write_text("keep")
++        (self.root / "run_test.json").symlink_to(outside)
++        a = self.archive(); a.observe(self.fault())
++        self.assertIsNotNone(a.error)
++        self.assertEqual(outside.read_text(), "keep")
++        (self.root / "run_test.json").unlink()
++        (self.root / "run_test.json").write_text('{"user":"keep"}')
++        a.observe(self.fault())
++        self.assertIn("unrecognized", a.error)
++        prune_archive(self.root, now=self.now + MAX_AGE_SECONDS + 1)
++        self.assertEqual(json.loads((self.root / "run_test.json").read_text()), {"user": "keep"})
++
++    def test_symlink_root_and_source_are_rejected(self):
++        outside = self.base / "outside"; outside.mkdir()
++        self.root.symlink_to(outside, target_is_directory=True)
++        a = self.archive(); a.observe(self.fault())
++        self.assertIsNotNone(a.error)
++        self.assertEqual(list(outside.iterdir()), [])
++        run = self.base / "run_source"; run.mkdir()
++        source = self.base / "external-events"; source.write_text(json.dumps(self.fault()))
++        (run / "events.jsonl").symlink_to(source)
++        archive_existing_run(run, self.base / "separate")
++        self.assertFalse((self.base / "separate").exists())
++
++    def test_failed_atomic_replace_preserves_old_fault_and_leaves_no_temp(self):
++        a = self.archive(); a.observe(self.fault())
++        before = (self.root / "run_test.json").read_bytes()
++        with mock.patch("tools.runtime_diagnostics.os.replace", side_effect=OSError("simulated disk failure")):
++            a.observe(dict(event="shutdown", cleanup_errors=[]))
++        self.assertEqual((self.root / "run_test.json").read_bytes(), before)
++        self.assertFalse(list(self.root.glob(".tmp_*")))
++        self.assertIn("OSError", a.error)
++
++    def test_slow_archive_only_blocks_writer_and_emit_stays_nonblocking(self):
++        run = self.base / "run_slow"; run.mkdir()
++        entered, release = threading.Event(), threading.Event()
++        original = RunDiagnosticArchive._save
++        def slow(archive):
++            entered.set(); release.wait(2); return original(archive)
++        with mock.patch.object(RunDiagnosticArchive, "_save", slow):
++            log = EventLog(run / "events.jsonl", capacity=8, diagnostic_root=self.root)
++            try:
++                log.emit("runtime_failure", error="test")
++                self.assertTrue(entered.wait(1))
++                started = time.monotonic()
++                for i in range(100): log.emit("feedback", count=i)
++                self.assertLess(time.monotonic()-started, .2)
++                self.assertGreater(log.dropped, 0)
++            finally:
++                release.set(); log.close()
++        self.assertTrue(self.read(run.name)["failure"])
++
++    def test_archive_write_failure_keeps_main_log_and_reports_status(self):
++        run = self.base / "run_failure"; run.mkdir()
++        self.root.write_text("not a directory")
++        log = EventLog(run / "events.jsonl", diagnostic_root=self.root)
++        log.emit("runtime_failure", error="first original fault")
++        log.emit("process_exit", exit_code=1); log.close()
++        rows = [json.loads(line) for line in (run / "events.jsonl").read_text().splitlines()]
++        self.assertIsNone(log.error)
++        self.assertIsNotNone(log.archive_error)
++        self.assertTrue(any(row["event"] == "diagnostic_archive_unavailable" for row in rows))
++        self.assertTrue(any(row["event"] == "process_exit" for row in rows))
++
++    def test_existing_archive_is_not_overwritten_by_migration(self):
++        run = self.base / "run_test"; run.mkdir()
++        (run / "events.jsonl").write_text(json.dumps(self.fault(error_extra="later"))+"\n")
++        a = self.archive(); a.observe(self.fault())
++        before = (self.root / "run_test.json").read_bytes()
++        archive_existing_run(run, self.root)
++        self.assertEqual((self.root / "run_test.json").read_bytes(), before)
++
++    def test_recreated_writer_keeps_persisted_first_fault_and_age(self):
++        first = self.fault(motor={"register": "0x0052"})
++        a = self.archive(); a.observe(first)
++        created = self.read()["createdAt"]
++        self.now += 20
++        b = self.archive()
++        b.observe(dict(event="runtime_failure", error="later different failure"))
++        b.observe(dict(event="process_exit", exit_code=1))
++        row = self.read()
++        self.assertEqual(row["firstFailure"], first)
++        self.assertEqual(row["createdAt"], created)
++
++    def test_non_opt_in_logger_preserves_original_summary_shape(self):
++        run = self.base / "run_legacy"; run.mkdir()
++        log = EventLog(run / "events.jsonl")
++        log.emit("process_exit", exit_code=0); log.close()
++        rows = [json.loads(line) for line in (run / "events.jsonl").read_text().splitlines()]
++        self.assertEqual(rows[-1], {"event": "log_summary", "dropped": 0})
++        self.assertFalse(self.root.exists())
++
++    def test_launcher_does_not_scan_or_prune_archive_on_startup_thread(self):
++        source = Path(__file__).parents[2] / "request_continuous_follow.py"
++        tree = ast.parse(source.read_text())
++        preparation = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
++                       and isinstance(node.func, ast.Name) and node.func.id == "prepare_run_directory"]
++        self.assertEqual(len(preparation), 1)
++        self.assertNotIn("diagnostic_archive_root", {kw.arg for kw in preparation[0].keywords})
++        self.assertFalse(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
++                         and node.func.id in ("prune_archive", "archive_existing_run") for node in ast.walk(tree)))
++
++    def test_slow_startup_archive_prune_does_not_block_constructor_or_emit(self):
++        run = self.base / "run_slow_prune"; run.mkdir()
++        entered, release = threading.Event(), threading.Event()
++        def slow_prune(*args, **kwargs):
++            entered.set(); release.wait(2)
++        with mock.patch("tools.runtime_diagnostics.prune_archive", slow_prune):
++            started = time.monotonic()
++            log = EventLog(run / "events.jsonl", capacity=4, diagnostic_root=self.root)
++            try:
++                self.assertLess(time.monotonic()-started, .2)
++                self.assertTrue(entered.wait(1))
++                started = time.monotonic()
++                log.emit("runtime_failure", error="test actual fault")
++                self.assertLess(time.monotonic()-started, .2)
++                self.assertFalse(log.closed.is_set())
++            finally:
++                release.set(); log.close()
++        self.assertIsNone(log.error)
++        self.assertTrue(self.read(run.name)["failure"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/RETENTION_POLICY.md
++++ b/RETENTION_POLICY.md
+@@ -0,0 +1,58 @@
++# Runtime diagnostic retention (isolated patch, not deployed)
++
++The existing `run_continuous_follow_logs/run_*` directories contain recordings,
++gallery material, and the complete high-volume event stream. They retain the
++existing latest-three-run policy. This patch does not change recording capture,
++motor behavior, serial timeouts, shutdown rules, or camera ownership.
++
++An independent `run_continuous_follow_diagnostics` pool now preserves useful
++failure evidence even after the original recording directory is pruned:
++
++- At most **7 days** from the run's original creation time and **20 MiB
++  (20,971,520 bytes)** of recognized diagnostic JSON files, including space
++  reserved for atomic replacement. Ordinary completed-run summaries are removed
++  before fault records; among faults, the oldest expires first. Incoming normal
++  summaries do not evict failures. Expiration is checked by the EventLog writer
++  at thread startup and archive writes; no independent daemon is installed.
++- The first fault keeps its structured `motor` snapshot, `traceback`, and event
++  timestamp. These include RTU register/function, TX/RX counts, timing, wheel
++  write stage, and STOP receipts **when the original event contains them**.
++  Later cleanup never overwrites the first fault, including after writer reopen.
++- A preceding window of at most 48 selected events / 256 KiB and up to 16
++  subsequent diagnostic/cleanup events provide context. It deliberately excludes
++  camera frames, target images, gallery samples, arbitrary stdout and terminal
++  command text. Secret keys and common credential text are redacted.
++- A single event is bounded to 512 KiB and a record to 2 MiB. Unusually large
++  events receive an explicit `archiveTruncated` marker instead of being presented
++  as complete; oversized context is marked `contextTruncated`. This does not
++  claim that unbounded original logs can be retained under a finite quota.
++- A new archive is written on the existing EventLog writer thread. `emit()` still
++  performs the original nonblocking queue operation. Slow/full/broken storage
++  cannot become a motor exception. Archive failure is exposed through
++  `EventLog.archive_error`, `diagnostic_archive_unavailable` in the main log, and
++  the final log summary. Atomic replacement failure preserves the earlier file.
++- An explicit offline helper can stream old recognized events files before
++  deleting their run directories. **The launcher does not opt into this scan**:
++  large old events files and slow disks must not delay follow startup. New runs
++  are archived in the writer thread instead. The administrative migration never
++  reads recordings; failure reports unavailability and retains the old bounded
++  recording-count policy. Already deleted details cannot be reconstructed.
++  Unknown files, symlinks, and unrecognized records are not followed/overwritten/
++  deleted as archive records.
++
++**Quota scope:** this new 20 MiB pool excludes the three raw recording directories
++and the preexisting `app_diagnostic_logs` session pool (which keeps its own
++existing quota). It is not a combined 20 MiB quota across all board files. The
++bounded diagnostics are correlated to session runId by their exact `runName`
++and the existing session `runtimeLogDir` field. No historical missing motor
++register values have been invented.
++
++Validation performed locally under WSL with temporary directories only:
++
++- 25 unittest cases (7 original preparation tests + 18 new archive tests) passed.
++- 9 original continuous-run filesystem/adoption tests passed. The one
++  configuration-check test was explicitly deselected because the isolated stage
++  does not contain the hardware/runtime dependency tree; no claim is made that
++  the complete runtime suite was run.
++- No SSH control command, motor/camera operation, service restart, or deployment
++  was performed while developing this patch.
