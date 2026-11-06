@@ -1,0 +1,18 @@
+{
+  "installedAtUtc": "2026-11-06T12:53:03.069780+00:00",
+  "versionCode": 39,
+  "versionName": "1.8.28-follow-motor-diagnostics",
+  "apkSha256": "e6b2c235d22d06546a29514636c34ba81fe426253a28dd2229a0a9c609ef700c",
+  "installedApkSha256": "e6b2c235d22d06546a29514636c34ba81fe426253a28dd2229a0a9c609ef700c",
+  "previousVersionCode": 38,
+  "previousApkSha256": "c342cc94cb565fa77f56a97f9183165dac3bc5607474f1141069445c09ecefad",
+  "backup": "E:\\Temp\\golfcar-motor-write-2026-11-06\\phone-before-v38-20261106T125259Z-fcece399.apk",
+  "boardRoute": "direct_172.16.16.122",
+  "boardIdleGuardHeld": true,
+  "connectionPreferencesPreserved": true,
+  "motorWritesSent": false,
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  }
+}

@@ -25,6 +25,6 @@
 
 板端在双控制锁确认空闲后备份并部署；8 个上线文件及 7 个原文件备份的 SHA-256 已复核，板端只读导入检查通过。部署记录及回退目录见[板端部署记录](follow-motor-rtu-board-deployment-2026-11-06.json)。没有修改驱动器配置或执行实车跟随测试。
 
-App `1.8.28-follow-motor-diagnostics` 将已完成的历史初始化阶段明确显示为“初始化已完成”，并解释 `motor_write: no response from driver`。376 项 JVM 测试通过，模拟器 `FollowControlsTest` 17 项通过。手机尚未接入电脑，因此 APK 已构建、模拟器已安装，真机还未安装。
+App `1.8.28-follow-motor-diagnostics` 将已完成的历史初始化阶段明确显示为“初始化已完成”，并解释 `motor_write: no response from driver`。376 项 JVM 测试通过，模拟器 `FollowControlsTest` 17 项通过。手机于 2026-11-06 12:53 UTC 安装版本 39；安装包与手机内已安装包的 SHA-256 一致，原版本 38 已备份，连接配置保留。安装时板端控制空闲，未发送电机写入。详情见[手机安装记录](follow-motor-rtu-phone-installation-2026-11-06.json)。
 
 **仍需现场验证：** 在有人可操作实体急停的条件下手动进行实车路面测试，确认短暂失回执可恢复，持续失联会停止；若再退出，独立归档可区分速度与停车刷新。持续出现空回执时仍应检查 RS485 连接器、驱动器供电和电磁干扰。新归档的 20 MiB 配额单独计算，既有会话日志与三份原始录像另计；极端日志队列满时，尚不能保证每条事件都到达归档线程。
