@@ -1,0 +1,442 @@
+diff --git a/app_follow_worker.py b/app_follow_worker.py
+--- a/app_follow_worker.py
++++ b/app_follow_worker.py
+@@ -356,8 +356,16 @@
+         if len(data) > 4096:
+             raise RuntimeError("Follow status exceeds bounded IPC size")
+         with self.write_lock:
+-            if os.write(self.fd, data) != len(data):
++            try:
++                written = os.write(self.fd, data)
++            except BlockingIOError:
++                # A full nonblocking pipe can reject one atomic status sample.
++                # The next 100 ms publication supersedes it; the bridge's
++                # freshness watchdog still stops a persistently blocked pipe.
++                return False
++            if written != len(data):
+                 raise RuntimeError("Follow status pipe blocked")
++        return True
+ 
+     def start(self):
+         def run():
+diff --git a/continuous_follow/runtime.py b/continuous_follow/runtime.py
+--- a/continuous_follow/runtime.py
++++ b/continuous_follow/runtime.py
+@@ -352,6 +352,8 @@
+         self.gallery_path, self.record_dir = gallery_path, record_dir
+         self.record_video = record_video
+         self.recorder = None
++        self._recording_disabled = threading.Event()
++        self._recording_error_lock = threading.Lock()
+         self._recording_depth_history = ()
+         backend = get(parser, "astra_depth", "backend", "openni_astra")
+         self._recording_depth_enabled = (record_video and record_dir is not None
+@@ -440,6 +442,19 @@
+                     error=f"{type(exc).__name__}: {exc}", motion_authorized=False)
+             except Exception:
+                 pass
++
++    def _recording_error(self, stage, exc):
++        """Retire optional video recording without stopping camera or control."""
++        with self._recording_error_lock:
++            if self._recording_disabled.is_set():
++                return
++            self._recording_disabled.set()
++        try:
++            self.events.emit("video_recording_unavailable", stage=stage,
++                error=f"{type(exc).__name__}: {exc}", motion_authorized=False)
++        except Exception:
++            # Diagnostic failure must not turn optional recording into a STOP.
++            pass
+ 
+     def _start_local_pointcloud(self):
+         if not self.local_pointcloud_requested:
+@@ -761,21 +776,24 @@
+             # no serial/camera descriptor, callback, or control lock.
+             self.navigation.start()
+         if self.record_dir and self.record_video:
+-            import cv2
+-            from car_control_modular.video_recorder import AsyncVideoRecorder, VideoRecorderConfig
+-            panel_provider = None
+-            if self._recording_depth_enabled:
+-                from .video_depth_panel import DepthPanelRenderer
+-                panel_provider = DepthPanelRenderer(lambda: self._recording_depth_history,
+-                    **({"expected_shape": (get(self.parser, "camera", "height", 720),
+-                                          get(self.parser, "camera", "width", 1280))}
+-                       if get(self.parser, "astra_depth", "backend", "openni_astra") == "orbbec_sdk_v2"
+-                       else {}))
+-            self.recorder = AsyncVideoRecorder(VideoRecorderConfig(
+-                output_path=str(Path(self.record_dir) / "camera_raw.avi"),
+-                fps=get(self.parser, "camera", "fps", 30.), queue_capacity=8,
+-                overlay_wait_sec=.12, depth_panel_width=320 if panel_provider else 0),
+-                cv2_module=cv2, depth_panel_provider=panel_provider)
++            try:
++                import cv2
++                from car_control_modular.video_recorder import AsyncVideoRecorder, VideoRecorderConfig
++                panel_provider = None
++                if self._recording_depth_enabled:
++                    from .video_depth_panel import DepthPanelRenderer
++                    panel_provider = DepthPanelRenderer(lambda: self._recording_depth_history,
++                        **({"expected_shape": (get(self.parser, "camera", "height", 720),
++                                              get(self.parser, "camera", "width", 1280))}
++                           if get(self.parser, "astra_depth", "backend", "openni_astra") == "orbbec_sdk_v2"
++                           else {}))
++                self.recorder = AsyncVideoRecorder(VideoRecorderConfig(
++                    output_path=str(Path(self.record_dir) / "camera_raw.avi"),
++                    fps=get(self.parser, "camera", "fps", 30.), queue_capacity=8,
++                    overlay_wait_sec=.12, depth_panel_width=320 if panel_provider else 0),
++                    cv2_module=cv2, depth_panel_provider=panel_provider)
++            except Exception as exc:
++                self._recording_error("startup", exc)
+         if self.stop_event.is_set():
+             return
+         self._startup_stage("motor")
+@@ -912,9 +930,12 @@
+                 self.capture_heartbeat = stamp
+                 self.condition.notify_all()
+             self.events.emit("capture", capture_id=cap, captured_at=stamp)
+-            if self.recorder:
+-                self.recorder.submit(frame, capture_frame_id=cap, monotonic_sec=stamp,
+-                    wheel_feedback=self._wheel_feedback_for_frame(stamp))
++            if self.recorder and not self._recording_disabled.is_set():
++                try:
++                    self.recorder.submit(frame, capture_frame_id=cap, monotonic_sec=stamp,
++                        wheel_feedback=self._wheel_feedback_for_frame(stamp))
++                except Exception as exc:
++                    self._recording_error("submit", exc)
+ 
+     def _wheel_feedback_for_frame(self, capture_timestamp):
+         # A read may complete after the camera's original capture timestamp.
+@@ -939,7 +960,11 @@
+ 
+     def _vision_loop(self):
+         from rk_vision.yolo11 import Detection as ModelDetection
+-        from car_control_modular.video_recorder import VideoTrackOverlay, VideoControlOverlay
++        if self.recorder and not self._recording_disabled.is_set():
++            try:
++                from car_control_modular.video_recorder import VideoTrackOverlay, VideoControlOverlay
++            except Exception as exc:
++                self._recording_error("overlay_import", exc)
+         previous, yaw_epoch = 0, -1
+         while not self.stop_event.is_set():
+             with self.condition:
+@@ -1092,24 +1117,27 @@
+                 near_field_recovery_ids=sorted(recovered),
+                 detection_ms=1000*(detection_done-started),
+                 tracking_session_ms=1000*(time.monotonic()-detection_done))
+-            if self.recorder:
+-                h, w = image.shape[:2]
+-                tracks = [VideoTrackOverlay(tuple(v*s for v, s in zip(c.bbox, (w,h,w,h))), c.track_id,
+-                    reid_uid=target.session_id if target.detected and c.track_id == target.track_id else 0,
+-                    active_target=target.detected and c.track_id == target.track_id, assignment_reason=target.reason)
+-                    for c in candidates]
+-                if target.lateral_source:
+-                    tracks.append(VideoTrackOverlay(tuple(v*s for v, s in zip(target.bbox, (w,h,w,h))),
+-                        target.track_id, reid_uid=0, active_target=False,
+-                        assignment_reason="lateral_only:"+target.lateral_source))
+-                self.recorder.update_overlay(cap, detected, tracks=tracks,
+-                    control=VideoControlOverlay(control_frame_id=cap, active_target_id=target.session_id,
+-                        selected_target_id=target.session_id if target.detected else None,
+-                        action_name=intent.behavior if intent else "WAIT", decision_reason=intent.reason if intent else "startup",
+-                        requested_rpm=round((intent.left_rpm+intent.right_rpm)/2) if intent else 0,
+-                        target_distance_m=distance.distance_m if distance else None,
+-                        result_age_ms=1000*(time.monotonic()-stamp),
+-                        gesture_status=self._gesture_display))
++            if self.recorder and not self._recording_disabled.is_set():
++                try:
++                    h, w = image.shape[:2]
++                    tracks = [VideoTrackOverlay(tuple(v*s for v, s in zip(c.bbox, (w,h,w,h))), c.track_id,
++                        reid_uid=target.session_id if target.detected and c.track_id == target.track_id else 0,
++                        active_target=target.detected and c.track_id == target.track_id, assignment_reason=target.reason)
++                        for c in candidates]
++                    if target.lateral_source:
++                        tracks.append(VideoTrackOverlay(tuple(v*s for v, s in zip(target.bbox, (w,h,w,h))),
++                            target.track_id, reid_uid=0, active_target=False,
++                            assignment_reason="lateral_only:"+target.lateral_source))
++                    self.recorder.update_overlay(cap, detected, tracks=tracks,
++                        control=VideoControlOverlay(control_frame_id=cap, active_target_id=target.session_id,
++                            selected_target_id=target.session_id if target.detected else None,
++                            action_name=intent.behavior if intent else "WAIT", decision_reason=intent.reason if intent else "startup",
++                            requested_rpm=round((intent.left_rpm+intent.right_rpm)/2) if intent else 0,
++                            target_distance_m=distance.distance_m if distance else None,
++                            result_age_ms=1000*(time.monotonic()-stamp),
++                            gesture_status=self._gesture_display))
++                except Exception as exc:
++                    self._recording_error("overlay", exc)
+             if self.manager.reid_due(candidates, time.monotonic()):
+                 # Preserve the owner/pending pair, then rotate visible people
+                 # through the remaining slots. Confidence alone starves the
+diff --git a/continuous_follow/hardware.py b/continuous_follow/hardware.py
+--- a/continuous_follow/hardware.py
++++ b/continuous_follow/hardware.py
+@@ -292,6 +292,8 @@
+     # motion intent. Allow scheduling headroom beyond the normal wire time;
+     # the next control cycle must recompute, never replay the old wheel pair.
+     _FEEDBACK_RECOVERY_BUDGET_SEC = .08
++    _FEEDBACK_RECOVERY_WINDOW_SEC = 2.
++    _FEEDBACK_RECOVERY_MAX_IN_WINDOW = 2
+     _STOP_REFRESH_SEC = .20
+ 
+     def __init__(self, parser):
+@@ -300,7 +302,7 @@
+         self.backend = MssdMotorBackend(self.config)
+         self._stopped = False
+         self._gesture_paused = False
+-        self._last_feedback_recovery_at = None
++        self._feedback_recovery_attempts = deque(maxlen=self._FEEDBACK_RECOVERY_MAX_IN_WINDOW)
+         self._last_stop_write_at = None
+         control = controller_config(parser)
+         self.stop_monitor = MotorStopMonitor(
+@@ -420,15 +422,18 @@
+             guard = self.backend._rtu_guard
+             now = time.monotonic()
+             if (guard is None or self.backend.motion_write_fault
+-                    or self.backend.parking_release_fault
+-                    or (self._last_feedback_recovery_at is not None
+-                        and now-self._last_feedback_recovery_at < 2.)):
++                    or self.backend.parking_release_fault):
++                raise
++            attempts = self._feedback_recovery_attempts
++            while attempts and now-attempts[0] >= self._FEEDBACK_RECOVERY_WINDOW_SEC:
++                attempts.popleft()
++            if len(attempts) >= self._FEEDBACK_RECOVERY_MAX_IN_WINDOW:
+                 raise
+             transaction = guard.last_transaction or {}
+             sequence = transaction.get("seq")
+             if not guard.can_recover_status_read_timeout(sequence):
+                 raise
+-            self._last_feedback_recovery_at = now
++            attempts.append(now)
+             try:
+                 recovered = guard.recover_status_read_timeout(
+                     sequence, budget_sec=min(self._FEEDBACK_RECOVERY_BUDGET_SEC, self.config.timeout))
+diff --git a/tests/continuous/test_follow_optional_recovery.py b/tests/continuous/test_follow_optional_recovery.py
+new file mode 100644
+--- /dev/null
++++ b/tests/continuous/test_follow_optional_recovery.py
+@@ -0,0 +1,126 @@
++"""Synthetic tests for optional recording and nonblocking status publication."""
++import ast
++import os
++from pathlib import Path
++import sys
++import threading
++import time
++import types
++import unittest
++from unittest import mock
++
++
++STAGE = Path(os.environ.get("FOLLOW_TEST_RUNTIME_ROOT", Path(__file__).resolve().parents[2]))
++sys.path.insert(0, str(STAGE))
++from app_follow_worker import StatusPublisher  # noqa: E402
++
++
++def runtime_method(name):
++    """Execute the staged method itself without importing board-only devices."""
++    tree = ast.parse((STAGE / "continuous_follow" / "runtime.py").read_text(encoding="utf-8"))
++    cls = next(node for node in tree.body
++               if isinstance(node, ast.ClassDef) and node.name == "ContinuousRuntime")
++    method = next(node for node in cls.body
++                  if isinstance(node, ast.FunctionDef) and node.name == name)
++    namespace = {"threading": threading, "time": time, "math": __import__("math"),
++                 "get": lambda _parser, _section, _key, default: default}
++    exec(compile(ast.Module(body=[method], type_ignores=[]), str(STAGE), "exec"), namespace)
++    return namespace[name]
++
++
++class Events:
++    def __init__(self):
++        self.rows = []
++
++    def emit(self, kind, **fields):
++        self.rows.append((kind, fields))
++
++
++class TestOptionalRecording(unittest.TestCase):
++    def test_submit_failure_disables_only_recording_once(self):
++        class Frame:
++            shape = (480, 640, 3)
++
++        class Inputs:
++            calls = 0
++
++            def read(self):
++                self.calls += 1
++                time.sleep(.02)
++                if self.calls == 2:
++                    runtime.stop_event.set()
++                return True, Frame(), time.monotonic()
++
++        class Recorder:
++            calls = 0
++
++            def submit(self, *_args, **_kwargs):
++                self.calls += 1
++                raise OSError("test disk full")
++
++        runtime = types.SimpleNamespace(
++            stop_event=threading.Event(), condition=threading.Condition(),
++            parser=object(), inputs=Inputs(), events=Events(), recorder=Recorder(),
++            _recording_disabled=threading.Event(),
++            _recording_error_lock=threading.Lock(),
++            _wheel_feedback_for_frame=lambda _stamp: None,
++            capture_heartbeat=0, packet=None)
++        runtime._recording_error = types.MethodType(runtime_method("_recording_error"), runtime)
++        runtime_method("_capture_loop")(runtime)
++        self.assertEqual(runtime.recorder.calls, 1)
++        self.assertEqual(len([row for row in runtime.events.rows if row[0] == "capture"]), 2,
++                         runtime.events.rows)
++        failures = [row for row in runtime.events.rows if row[0] == "video_recording_unavailable"]
++        self.assertEqual(len(failures), 1)
++        self.assertEqual(failures[0][1]["stage"], "submit")
++        self.assertTrue(runtime._recording_disabled.is_set())
++
++    def test_camera_read_failure_still_propagates(self):
++        class Inputs:
++            def read(self):
++                raise OSError("test camera disconnect")
++
++        runtime = types.SimpleNamespace(stop_event=threading.Event(),
++            condition=threading.Condition(), parser=object(), inputs=Inputs(),
++            events=Events(), recorder=None, _recording_disabled=threading.Event())
++        with self.assertRaisesRegex(OSError, "camera disconnect"):
++            runtime_method("_capture_loop")(runtime)
++
++
++class TestStatusPublisher(unittest.TestCase):
++    def make_publisher(self):
++        guard = types.SimpleNamespace(stopped=threading.Event(), reason=None,
++                                      request_stop=mock.Mock())
++        snapshot = types.SimpleNamespace(status=lambda: {"runState": "RUNNING"})
++        with mock.patch("app_follow_worker.os.set_blocking"):
++            publisher = StatusPublisher(123, snapshot, guard)
++        return publisher, guard
++
++    def test_single_full_pipe_sample_is_skipped_then_recovers(self):
++        publisher, guard = self.make_publisher()
++        writes = 0
++
++        def write(_fd, data):
++            nonlocal writes
++            writes += 1
++            if writes == 1:
++                raise BlockingIOError("test pipe full")
++            return len(data)
++
++        with mock.patch("app_follow_worker.os.write", side_effect=write):
++            self.assertFalse(publisher.publish())
++            self.assertTrue(publisher.publish())
++        guard.request_stop.assert_not_called()
++
++    def test_broken_pipe_still_stops_worker(self):
++        publisher, guard = self.make_publisher()
++        with mock.patch("app_follow_worker.os.write", side_effect=BrokenPipeError("closed")):
++            publisher.start()
++            publisher.thread.join(1)
++            self.assertFalse(publisher.thread.is_alive())
++            publisher.close()
++        guard.request_stop.assert_called_once_with("app_status_pipe_failed")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/continuous/test_feedback_recovery_window.py b/tests/continuous/test_feedback_recovery_window.py
+new file mode 100644
+--- /dev/null
++++ b/tests/continuous/test_feedback_recovery_window.py
+@@ -0,0 +1,94 @@
++"""Recovery budget for empty motor-status reads; all motor I/O is faked."""
++from types import SimpleNamespace
++
++import pytest
++
++from test_stop_hardware import Backend, intent
++from test_hardware import parser
++from continuous_follow.hardware import BoardMotor
++
++
++@pytest.fixture
++def board(monkeypatch):
++    import car_control_modular.mssd_motor as module
++    import continuous_follow.hardware as hardware
++
++    backend = Backend()
++    clock = SimpleNamespace(now=10.)
++    monkeypatch.setattr(module, "MssdMotorBackend", lambda _config: backend)
++    monkeypatch.setattr(hardware, "controller_config", lambda _parser:
++        SimpleNamespace(max_rpm=200, deceleration_rpm_s=100))
++    monkeypatch.setattr(hardware.time, "monotonic", lambda: clock.now)
++    motor = BoardMotor(parser(left_sign=1, right_sign=1, forward_target_sign=1))
++    motor.open()
++    return motor, backend, clock
++
++
++def timeout_reads(backend, *, eligible=True):
++    guard = backend._rtu_guard
++    calls = []
++
++    def failed_read(_side):
++        backend.sequence += 1
++        guard.last_transaction = {"seq": backend.sequence, "stage": "read", "rx_length": 0}
++        raise TimeoutError("no response from driver")
++
++    def recover(sequence, *, budget_sec):
++        calls.append((sequence, budget_sec))
++        return {"registers": [0] * 20,
++                "recovery": {"outcome": "recovered", "failed_sequence": sequence}}
++
++    backend.read_motor_status = failed_read
++    guard.can_recover_status_read_timeout = lambda sequence: eligible
++    guard.recover_status_read_timeout = recover
++    return calls
++
++
++def test_two_empty_read_recoveries_in_two_seconds_then_exit(board):
++    motor, backend, clock = board
++    motor.write(intent(clock))
++    calls = timeout_reads(backend)
++    for at in (10.1, 10.6):
++        clock.now = at
++        assert motor.feedback()["recovery"]["outcome"] == "recovered"
++    clock.now = 10.9
++    with pytest.raises(TimeoutError, match="no response"):
++        motor.feedback()
++    assert len(calls) == 2
++    assert all(budget == .08 for _, budget in calls)
++    assert [call[0] for call in backend.calls] == ["stop"]
++
++
++def test_recovery_budget_uses_sliding_window(board):
++    motor, backend, clock = board
++    motor.write(intent(clock))
++    calls = timeout_reads(backend)
++    for at in (10.1, 10.6, 12.2, 12.7):
++        clock.now = at
++        assert motor.feedback()["recovery"]["outcome"] == "recovered"
++    assert len(calls) == 4
++    clock.now = 12.8
++    with pytest.raises(TimeoutError, match="no response"):
++        motor.feedback()
++    assert len(calls) == 4
++
++
++def test_ineligible_or_partial_reply_never_uses_recovery_budget(board):
++    motor, backend, clock = board
++    motor.write(intent(clock))
++    calls = timeout_reads(backend, eligible=False)
++    clock.now += .1
++    with pytest.raises(TimeoutError, match="no response"):
++        motor.feedback()
++    assert not calls
++    assert len(motor._feedback_recovery_attempts) == 0
++
++
++def test_hardware_fault_is_not_a_read_timeout_recovery(board):
++    motor, backend, clock = board
++    motor.write(intent(clock))
++    backend.read_motor_status = lambda _side: SimpleNamespace(error_code=7)
++    clock.now += .1
++    with pytest.raises(RuntimeError, match="hardware fault"):
++        motor.feedback()
++    assert len(motor._feedback_recovery_attempts) == 0

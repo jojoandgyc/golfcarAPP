@@ -489,7 +489,7 @@ class FollowLifecycleStateTest {
         }
     }
 
-    @Test fun backgroundDuringStartupDoesNotCancelButChangingControlPageStillStops() = runBlocking {
+    @Test fun backgroundAndPageChangeKeepFollowUntilExplicitStop() = runBlocking {
         val fixture = startFixture(holdReady = true, persistent = true)
         withTimeout(3_000) { fixture.bridge.connectedSignal.await() }
         withContext(Dispatchers.Main) {
@@ -501,15 +501,21 @@ class FollowLifecycleStateTest {
         assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
         withContext(Dispatchers.Main) {
             fixture.vm.onControlSurfaceHidden("switch control page", ControlStopSource.PAGE_CHANGED)
-            fixture.vm.onControlSurfaceHidden("background after explicit page stop", ControlStopSource.APP_PAUSED)
+            fixture.vm.onControlSurfaceHidden("background after page change", ControlStopSource.APP_PAUSED)
         }
-        assertTrue(fixture.vm.state.value.followStopPending)
+        assertTrue(fixture.vm.state.value.followActive)
+        assertFalse(fixture.vm.state.value.followStopPending)
+        fixture.bridge.respond(status("RUNNING"))
+        assertEquals("heartbeat", fixture.bridge.nextRequest().getString("cmd"))
+        assertFalse(fixture.bridge.commands().any { it in listOf("stop", "close") })
+        withContext(Dispatchers.Main) { fixture.vm.stopFollow("user stops after returning to follow page") }
         fixture.bridge.respond(status("RUNNING"))
         assertEquals("stop", fixture.bridge.nextRequest().getString("cmd"))
         fixture.bridge.respond(status("STOPPED", exited = true, stop = true), terminal = true)
         awaitFinished(fixture)
         val stop = engine.snapshot().events.map(::JSONObject).single { it.optString("event") == "follow.stop_sending" }
-        assertEquals("PAGE_CHANGED", stop.getString("source"))
+        assertEquals("USER_STOP", stop.getString("source"))
+        assertTrue(engine.snapshot().events.map(::JSONObject).any { it.optString("event") == "follow.page_continued" })
     }
 
     @Test fun backgroundServiceFailureDuringDetachedRecoveryKeepsStopIntentUntilOriginalRunEnds() = runBlocking {

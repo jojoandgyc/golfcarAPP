@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.followingcar"
         minSdk = 35
         targetSdk = 37
-        versionCode = 40
-        versionName = "1.8.29-gemini-manual-video"
+        versionCode = 41
+        versionName = "1.8.30-follow-continuity"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

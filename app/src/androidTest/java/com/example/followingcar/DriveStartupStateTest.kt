@@ -367,6 +367,20 @@ class DriveStartupStateTest {
         assertTrue(engine.snapshot().failures.isEmpty())
     }
 
+    @Test fun leavingManualPageStillRequestsStop() = runBlocking {
+        val fixture = startFixture(networkGrace = true, holdSequence = 2)
+        withTimeout(3_000) { fixture.bridge.heldRequest.await() }
+        withContext(Dispatchers.Main) {
+            fixture.vm.onControlSurfaceHidden("test manual page change", ControlStopSource.PAGE_CHANGED)
+        }
+        withTimeout(1_000) { (field(fixture.vm, "driveJob") as Job).join() }
+        assertFalse(fixture.vm.state.value.manualActive)
+        assertEquals(listOf("stop", "stop"), fixture.bridge.requests.map { it.getString("cmd") })
+        assertTrue(engine.snapshot().events.map(::JSONObject).any {
+            it.optString("event") == "drive.stop_requested" && it.optString("source") == "PAGE_CHANGED"
+        })
+    }
+
     private suspend fun stopWhileInitialAckPending(source: ControlStopSource) {
         val fixture = startFixture()
         withTimeout(3_000) { fixture.bridge.firstRequest.await() }

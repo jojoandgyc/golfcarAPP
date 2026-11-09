@@ -42,7 +42,7 @@ class DiagnosticBoardIntegrationTest {
             compose.waitUntil(35_000) { !vm.state.value.followConfigurationLoading }
             assertTrue(vm.state.value.followConfigurationError, vm.state.value.canStartFollow)
 
-            // Background/focus callbacks keep follow alive; user and page actions still stop it.
+            // Background, page and focus callbacks keep follow alive; only an explicit user request stops it.
             for (source in listOf(ControlStopSource.USER_STOP, ControlStopSource.PAGE_CHANGED,
                 ControlStopSource.APP_PAUSED, ControlStopSource.WINDOW_FOCUS_LOST)) {
                 compose.runOnUiThread { vm.startFollow(dryRun = true) }
@@ -53,7 +53,8 @@ class DiagnosticBoardIntegrationTest {
                     .last { it.optString("event") == "follow.start_requested" }.getString("operationId")
                 suspend fun ownedEvents() = Diagnostics.snapshot().events.map(::JSONObject)
                     .filter { it.optString("operationId") == op }
-                val lifecycleOnly = source in setOf(ControlStopSource.APP_PAUSED, ControlStopSource.WINDOW_FOCUS_LOST)
+                val lifecycleOnly = source in setOf(ControlStopSource.PAGE_CHANGED,
+                    ControlStopSource.APP_PAUSED, ControlStopSource.WINDOW_FOCUS_LOST)
                 val expectedStopSource = if (lifecycleOnly) ControlStopSource.USER_STOP else source
                 if (lifecycleOnly) {
                     val ackCount = ownedEvents().count { it.optString("event") == "follow.ack" }

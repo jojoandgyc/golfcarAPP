@@ -2766,10 +2766,11 @@ class BoardViewModel @JvmOverloads internal constructor(
             fields = mapOf("followActive" to state.value.followActive, "manualActive" to state.value.manualActive), critical = true)
         if (source == ControlStopSource.WINDOW_FOCUS_LOST) return
         disableDrive(reason, source = source)
-        if (source == ControlStopSource.APP_PAUSED) {
-            // Automatic follow is a user-started background session. Pausing the
-            // Activity must not enqueue an explicit stop or overwrite a pending one.
-            if (state.value.followBlocksControl) Diagnostics.event("follow.background_continued",
+        if (source == ControlStopSource.APP_PAUSED || source == ControlStopSource.PAGE_CHANGED) {
+            // Follow belongs to the user-started session, not to the visible page.
+            // Leaving the page or Activity must not create or overwrite a stop intent.
+            if (state.value.followBlocksControl) Diagnostics.event(
+                if (source == ControlStopSource.PAGE_CHANGED) "follow.page_continued" else "follow.background_continued",
                 followDiagnostic, source = source.name, fields = mapOf(
                     "stopPending" to state.value.followStopPending,
                     "detached" to state.value.followDetached), critical = true)
