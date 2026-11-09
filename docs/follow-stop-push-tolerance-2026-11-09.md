@@ -1,6 +1,6 @@
 # 手势停车后推车不再误退（2026-11-09）
 
-> 此文记录当天最初部署的全局 800 RPM 方案，现已被[按手势暂停状态限定的修复](follow-stop-gesture-pause-scope-2026-11-09.md)取代。开发板当前普通 STOP 判定为 100 RPM；只有 Open_Palm 手势暂停期间的推车轮速不会触发此项退出。
+> 此文记录当天最初部署的全局 800 RPM 方案，现已被[按手势暂停状态限定的修复](follow-stop-gesture-pause-scope-2026-11-09.md)取代，并进一步将普通 STOP 判定调整为[200 RPM](follow-stop-200-and-exit-audit-2026-11-09.md)。只有 Open_Palm 手势暂停期间的推车轮速不会触发此项退出。
 
 ## 现场原因
 

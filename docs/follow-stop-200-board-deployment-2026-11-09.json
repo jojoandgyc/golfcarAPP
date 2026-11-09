@@ -1,0 +1,34 @@
+{
+  "observedUtc": "2026-11-09T07:28:51.689420+00:00",
+  "route": "overseas_relay_22024",
+  "status": "deployed",
+  "files": [
+    {
+      "path": "continuous_follow/motor_stop_monitor.py",
+      "before": "51d4e6b7325b6992fbe5a3eb9eebdec1f28351babc079968326ff302137c4599",
+      "after": "e66d71612652195d9b690dfa8f0f0ef06909d3361120fe643e00a116ecb6d437"
+    },
+    {
+      "path": "tests/continuous/test_motor_stop_monitor.py",
+      "before": "2a7e631e89cd147b70cffdeb94b88f7ea84b5876d16fed0e026134c05a96d84a",
+      "after": "4d4caee38983f847fc41f529782a92baec7e8cdf6ece996dc93e2c4ca12da75d"
+    },
+    {
+      "path": "tests/continuous/test_stop_hardware.py",
+      "before": "d8ab1ec309273751057b5e34ecdfbb93cd2bb337cffd85f2faadfda7ee6d92de",
+      "after": "b1acb00dc0da27b91b904fd34ceecf1e3604d9f9358763c35b6ca51ff89337b2"
+    }
+  ],
+  "backupDir": "/home/topeet/Desktop/rk_car_runtime_module/.codex_backups/follow_stop_gesture_pause_20261109T072901Z_1a1427d8",
+  "controlIdleGuard": {
+    "event": "locked",
+    "bothControlLocksHeld": true,
+    "leaseSeconds": 120
+  },
+  "tests": "........................................................................ [ 60%]\n................................................                         [100%]\n120 passed in 3.28s",
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  },
+  "controlGuardExit": 0
+}
