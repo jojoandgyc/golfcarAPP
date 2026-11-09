@@ -1,0 +1,49 @@
+{
+  "observedUtc": "2026-11-09T07:11:49.934894+00:00",
+  "route": "overseas_relay_22024",
+  "status": "deployed",
+  "files": [
+    {
+      "path": "continuous_follow/motor_stop_monitor.py",
+      "before": "28a8de948332ac5ef03dca84e1bb7209a2ca530f70d275e9e25c59ea31155b37",
+      "after": "51d4e6b7325b6992fbe5a3eb9eebdec1f28351babc079968326ff302137c4599"
+    },
+    {
+      "path": "continuous_follow/hardware.py",
+      "before": "bf714d0049ce932e85ec808750063d9e975b64e68f880adbe0177d35533c5fb5",
+      "after": "a1be35ecd0be39f8ea68cbcb31fc0b59f0b6dd41df8cc2bf795a290f1e915c2a"
+    },
+    {
+      "path": "continuous_follow/runtime.py",
+      "before": "393430bfd566fcfb21e8013dc5f57ee0669b3b8bcdaabacbaf0c635e9a726e98",
+      "after": "f8ab279c3545e3fa2a567dfc99d704f5bc6b4a0e5cf497b628cdb0be4aad2262"
+    },
+    {
+      "path": "tests/continuous/test_motor_stop_monitor.py",
+      "before": "84aa1f6eee3799641af5945ae8a0cc38890f9f144dd1e49c6e589fc4c9400718",
+      "after": "2a7e631e89cd147b70cffdeb94b88f7ea84b5876d16fed0e026134c05a96d84a"
+    },
+    {
+      "path": "tests/continuous/test_stop_hardware.py",
+      "before": "47712ccb40a85a5a563d2932d53c50fcdcd95728b241fd1e0e24898fa1cecb8d",
+      "after": "d8ab1ec309273751057b5e34ecdfbb93cd2bb337cffd85f2faadfda7ee6d92de"
+    },
+    {
+      "path": "tests/continuous/test_stop_runtime.py",
+      "before": "d7d583c9b90d3725a48c2371e0e163c40344cca7af7c43f040a45f77775d6362",
+      "after": "0883e6cb6b36279602909edde6b876e5dddf9f6595dededf990a742e0dd32157"
+    }
+  ],
+  "backupDir": "/home/topeet/Desktop/rk_car_runtime_module/.codex_backups/follow_stop_gesture_pause_20261109T071229Z_04c1f0c5",
+  "controlIdleGuard": {
+    "event": "locked",
+    "bothControlLocksHeld": true,
+    "leaseSeconds": 120
+  },
+  "tests": "........................................................................ [ 62%]\n...........................................                              [100%]\n115 passed in 3.38s",
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  },
+  "controlGuardExit": 0
+}

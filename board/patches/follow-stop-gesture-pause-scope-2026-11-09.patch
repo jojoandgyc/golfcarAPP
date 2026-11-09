@@ -1,0 +1,390 @@
+diff --git a/continuous_follow/motor_stop_monitor.py b/continuous_follow/motor_stop_monitor.py
+--- a/continuous_follow/motor_stop_monitor.py
++++ b/continuous_follow/motor_stop_monitor.py
+@@ -34,7 +34,7 @@
+     No command, zero-speed sample, or elapsed time clears the fault.
+     """
+ 
+-    def __init__(self, *, deceleration_rpm_s=60., speed_threshold_rpm=800.,
++    def __init__(self, *, deceleration_rpm_s=60., speed_threshold_rpm=100.,
+                  required_samples=2, feedback_max_age_sec=.30,
+                  evidence_max_gap_sec=.30, min_grace_sec=.5,
+                  max_grace_sec=4., settle_margin_sec=.2):
+@@ -124,7 +124,7 @@
+         self._reason = reason
+         return None
+ 
+-    def observe_feedback(self, feedback, now):
++    def observe_feedback(self, feedback, now, *, gesture_paused=False):
+         """Consume one independently timestamped wheel sample, or reject it.
+ 
+         Stale, reordered, future, and nonfinite observations break consecutive
+@@ -134,6 +134,11 @@
+         """
+         if self.faulted:
+             return self.fault
++        # Open_Palm intentionally allows the person to push the stopped car.
++        # A preceding high sample must not combine with a sample after resume.
++        # The caller supplies the live gate state, never a cached STOP reason.
++        if gesture_paused:
++            self._clear_evidence()
+         if not _finite(now) or now < 0 or not isinstance(feedback, Mapping):
+             return self._reject_feedback("invalid_feedback")
+         if now < self._last_feedback_now:
+@@ -164,6 +169,11 @@
+             return self._reject_feedback("motion_permitted" if self._last_command else "waiting_for_command")
+         if timestamp < self._stop_requested_at:
+             return self._reject_feedback("feedback_before_stop")
++        if gesture_paused:
++            reason = ("gesture_paused_external_motion"
++                      if max(abs(left), abs(right)) > self.speed_threshold_rpm
++                      else "gesture_paused")
++            return self._reject_feedback(reason)
+         if timestamp < self._stop_requested_at + self._grace_sec:
+             return self._reject_feedback("deceleration_grace")
+         if max(abs(left), abs(right)) <= self.speed_threshold_rpm:
+diff --git a/continuous_follow/hardware.py b/continuous_follow/hardware.py
+--- a/continuous_follow/hardware.py
++++ b/continuous_follow/hardware.py
+@@ -299,6 +299,7 @@
+         self.config = motor_config(parser)
+         self.backend = MssdMotorBackend(self.config)
+         self._stopped = False
++        self._gesture_paused = False
+         self._last_feedback_recovery_at = None
+         self._last_stop_write_at = None
+         control = controller_config(parser)
+@@ -320,6 +321,10 @@
+         if getattr(self, "stop_monitor", None) is None:
+             self.stop_monitor = MotorStopMonitor()
+         return self.stop_monitor
++
++    def set_gesture_paused(self, paused):
++        """Set the live Open_Palm pause state on the sole motor owner thread."""
++        self._gesture_paused = bool(paused)
+ 
+     def _wire_records(self, after_sequence=0):
+         guard = getattr(self.backend, "_rtu_guard", None)
+@@ -453,7 +458,8 @@
+ 
+     def _check_stop_feedback(self, feedback, since):
+         monitor = self._monitor()
+-        fault = monitor.observe_feedback(feedback, time.monotonic())
++        fault = monitor.observe_feedback(feedback, time.monotonic(),
++            gesture_paused=bool(getattr(self, "_gesture_paused", False) and self._stopped))
+         feedback["transactions"] = self._wire_records(since)
+         feedback["motor_status"] = dict(getattr(self, "_last_status", {}))
+         feedback["stop_monitor"] = monitor.snapshot()
+diff --git a/continuous_follow/runtime.py b/continuous_follow/runtime.py
+--- a/continuous_follow/runtime.py
++++ b/continuous_follow/runtime.py
+@@ -1377,6 +1377,10 @@
+ 
+     def _update_feedback(self):
+         began = time.monotonic()
++        set_gesture_paused = getattr(self.motor, "set_gesture_paused", None)
++        if callable(set_gesture_paused):
++            set_gesture_paused(self.gesture_gate is not None
++                and self.gesture_gate.state == "PAUSED")
+         feedback = self.motor.feedback()
+         if feedback is None:
+             return
+diff --git a/tests/continuous/test_motor_stop_monitor.py b/tests/continuous/test_motor_stop_monitor.py
+--- a/tests/continuous/test_motor_stop_monitor.py
++++ b/tests/continuous/test_motor_stop_monitor.py
+@@ -6,10 +6,10 @@
+ from continuous_follow.motor_stop_monitor import MotorStopMonitor
+ 
+ 
+-def feedback(monitor, at, left, right=None, *, now=None):
++def feedback(monitor, at, left, right=None, *, now=None, gesture_paused=False):
+     return monitor.observe_feedback(
+         dict(timestamp=at, left_rpm=left, right_rpm=left if right is None else right),
+-        at if now is None else now)
++        at if now is None else now, gesture_paused=gesture_paused)
+ 
+ 
+ def waiting_monitor(**kwargs):
+@@ -19,7 +19,7 @@
+ 
+ 
+ def test_recorded_startup_pattern_is_detected_on_second_nonzero_sample():
+-    # Historical strict-policy replay; production now tolerates up to 800 RPM.
++    # Historical 10 RPM policy replay; the ordinary production STOP uses 100 RPM.
+     monitor = waiting_monitor(speed_threshold_rpm=10.)
+     assert feedback(monitor, 1.021, 0, 0) is None
+     assert feedback(monitor, 1.163, -13, -13) is None
+@@ -35,14 +35,12 @@
+     (0., 0.), (14., 8.), (12., 9.), (30., 30.), (-30., -30.),
+     (30., -30.), (-30., 30.), (31., -31.), (80., -90.),
+     (100., 100.), (-100., -100.), (100., -100.), (-100., 100.),
+-    (101., 103.), (200., -200.), (799.999, 0.), (0., -799.999),
+-    (800., 800.), (-800., -800.), (800., -800.), (-800., 800.),
+-    (800., 0.), (0., -800.),
+-])
+-def test_default_threshold_tolerates_both_wheels_up_to_800_rpm(left, right):
+-    monitor = waiting_monitor()
+-    assert monitor.speed_threshold_rpm == 800.
+-    assert monitor.snapshot()["threshold_rpm"] == 800.
++    (99.999, 0.), (0., -99.999),
++])
++def test_default_threshold_tolerates_both_wheels_up_to_100_rpm(left, right):
++    monitor = waiting_monitor()
++    assert monitor.speed_threshold_rpm == 100.
++    assert monitor.snapshot()["threshold_rpm"] == 100.
+     assert monitor.snapshot()["required_samples"] == 2
+     for at in (1.1, 1.2, 1.3):
+         assert feedback(monitor, at, left, right) is None
+@@ -52,16 +50,16 @@
+ 
+ 
+ @pytest.mark.parametrize("left,right", [
+-    (801., 0.), (-801., 0.), (0., 801.), (0., -801.),
+-    (801., -801.), (-801., 801.), (800.001, 0.), (0., -800.001),
+-])
+-def test_default_threshold_requires_two_fresh_samples_above_800_rpm(left, right):
++    (101., 0.), (-101., 0.), (0., 101.), (0., -101.),
++    (101., -101.), (-101., 101.), (100.001, 0.), (0., -100.001),
++])
++def test_default_threshold_requires_two_fresh_samples_above_100_rpm(left, right):
+     monitor = waiting_monitor()
+     assert feedback(monitor, 1.1, left, right) is None
+     assert monitor.snapshot()["consecutive_samples"] == 1
+     fault = feedback(monitor, 1.2, left, right)
+     assert fault["samples"] == 2
+-    assert fault["threshold_rpm"] == 800.
++    assert fault["threshold_rpm"] == 100.
+     assert monitor.faulted
+     assert feedback(monitor, 1.3, 0, 0) == fault
+     assert not monitor.observe_command(40, 40, False, 1.4)
+@@ -73,27 +71,56 @@
+     monitor.observe_command(0, 0, True, 1.1)
+     deadline = monitor.snapshot()["grace_until"]
+     assert monitor.snapshot()["grace_sec"] == pytest.approx(2.2)
+-    assert feedback(monitor, deadline-.1, 850, -850) is None
++    assert feedback(monitor, deadline-.1, 150, -150) is None
+     assert monitor.snapshot()["reason"] == "deceleration_grace"
+     assert monitor.snapshot()["consecutive_samples"] == 0
+-    assert feedback(monitor, deadline+.01, 850, -850) is None
+-    fault = feedback(monitor, deadline+.11, 850, -850)
+-    assert fault["threshold_rpm"] == 800. and fault["samples"] == 2
++    assert feedback(monitor, deadline+.01, 150, -150) is None
++    fault = feedback(monitor, deadline+.11, 150, -150)
++    assert fault["threshold_rpm"] == 100. and fault["samples"] == 2
+     assert fault["stop_requested_at"] == 1.1 and fault["grace_until"] == deadline
+ 
+ 
+-def test_recorded_gesture_pause_push_does_not_fault_at_default_threshold():
++def test_recorded_gesture_pause_push_does_not_fault_even_above_800_rpm():
+     monitor = MotorStopMonitor()
+     assert monitor.observe_command(0, 0, True, 5990.7845)
+-    assert feedback(monitor, 5991.090, 0, 0) is None
++    assert feedback(monitor, 5991.090, 0, 0, gesture_paused=True) is None
+     assert monitor.observe_command(0, 0, True, 6025.927)
+-    assert feedback(monitor, 6027.229, 16, 14) is None
++    assert feedback(monitor, 6027.229, 16, 14, gesture_paused=True) is None
+     assert monitor.observe_command(0, 0, True, 6042.300)
+-    assert feedback(monitor, 6042.392, 69, 101) is None
+-    assert feedback(monitor, 6042.543, 76, 103) is None
++    for at, left, right in (
++        (6042.392, 69, 101), (6042.543, 76, 103),
++        (6042.693, 800, -850), (6042.843, -1200, 1200),
++    ):
++        assert feedback(monitor, at, left, right, gesture_paused=True) is None
++        assert monitor.snapshot()["consecutive_samples"] == 0
++        assert monitor.snapshot()["last_feedback"]["left_rpm"] == left
+     assert not monitor.faulted
+     assert monitor.snapshot()["stop_requested_at"] == 5990.7845
++    assert monitor.snapshot()["reason"] == "gesture_paused_external_motion"
++
++
++def test_gesture_pause_breaks_prior_evidence_and_normal_stop_monitoring_resumes():
++    monitor = waiting_monitor()
++    assert feedback(monitor, 1.1, 101, 0) is None
++    assert monitor.snapshot()["consecutive_samples"] == 1
++    for at, speed in ((1.2, 1200), (1.3, -800), (1.4, 900)):
++        assert monitor.observe_command(0, 0, True, at - .01)
++        assert feedback(monitor, at, speed, gesture_paused=True) is None
++        assert monitor.snapshot()["consecutive_samples"] == 0
++    assert monitor.snapshot()["stop_requested_at"] == 1.
++    assert feedback(monitor, 1.5, 100, -100) is None
+     assert monitor.snapshot()["reason"] == "below_threshold"
++    assert feedback(monitor, 1.6, 101, 0) is None
++    fault = feedback(monitor, 1.7, 101, 0)
++    assert fault["threshold_rpm"] == 100.
++    assert fault["evidence_started_at"] == 1.6
++
++
++def test_nonpaused_stop_is_not_exempt_even_after_paused_feedback():
++    monitor = waiting_monitor()
++    assert feedback(monitor, 1.1, 950, gesture_paused=True) is None
++    assert feedback(monitor, 1.2, 801, gesture_paused=False) is None
++    assert feedback(monitor, 1.3, 801, gesture_paused=False)["samples"] == 2
+ 
+ 
+ def test_latest_recorded_stop_feedback_does_not_fault_at_default_threshold():
+diff --git a/tests/continuous/test_stop_hardware.py b/tests/continuous/test_stop_hardware.py
+--- a/tests/continuous/test_stop_hardware.py
++++ b/tests/continuous/test_stop_hardware.py
+@@ -136,7 +136,7 @@
+ 
+ def test_board_default_tolerates_latest_recorded_low_speed_stop_feedback(board):
+     motor, backend, clock = board
+-    assert motor.stop_monitor.speed_threshold_rpm == 800.
++    assert motor.stop_monitor.speed_threshold_rpm == 100.
+     clock.now += .01
+     motor.write(intent(clock, stop=False, left=-5, right=5))
+     backend.rpm = (8, -3)
+@@ -146,7 +146,7 @@
+     motor.write(intent(clock))
+     stop_at = clock.now
+     for elapsed, pair in ((.514, (14, 8)), (.651, (12, 9)), (.8, (30, -30)),
+-                         (.9, (31, -31)), (1., (800, -800)), (1.1, (-800, 800))):
++                         (.9, (31, -31)), (1., (100, -100)), (1.1, (-100, 100))):
+         clock.now = stop_at + elapsed
+         backend.rpm = pair
+         result = motor.feedback()
+@@ -156,11 +156,11 @@
+     assert not any(call[0] == "parking" for call in backend.calls)
+ 
+ 
+-@pytest.mark.parametrize("pair", [(801, 0), (-801, 0), (0, 801), (0, -801),
+-                                  (800.001, -800), (800, -800.001)])
+-def test_board_default_still_latches_two_samples_above_800_rpm(board, pair):
+-    motor, backend, clock = board
+-    assert motor.stop_monitor.speed_threshold_rpm == 800.
++@pytest.mark.parametrize("pair", [(101, 0), (-101, 0), (0, 101), (0, -101),
++                                  (100.001, -100), (100, -100.001)])
++def test_board_default_still_latches_two_samples_above_100_rpm(board, pair):
++    motor, backend, clock = board
++    assert motor.stop_monitor.speed_threshold_rpm == 100.
+     motor.write(intent(clock))
+     backend.rpm = pair
+     clock.now += .1
+@@ -169,7 +169,7 @@
+     clock.now += .1
+     with pytest.raises(BoardStopMotionFault) as caught:
+         motor.feedback()
+-    assert caught.value.diagnostics["feedback"]["stop_monitor"]["fault"]["threshold_rpm"] == 800.
++    assert caught.value.diagnostics["feedback"]["stop_monitor"]["fault"]["threshold_rpm"] == 100.
+     assert [action["action"] for action in caught.value.diagnostics["actions"]] == [
+         "emergency_stop", "clear_parking_current", "final_emergency_stop"]
+     clock.now += .1
+@@ -178,6 +178,74 @@
+         motor.feedback()
+     with pytest.raises(BoardStopMotionFault):
+         motor.write(intent(clock, stop=False, left=20, right=10))
++
++
++def test_gesture_pause_allows_repeated_stops_and_external_push_above_800_rpm(board):
++    motor, backend, clock = board
++    motor.set_gesture_paused(True)
++    motor.write(intent(clock, reason="gesture_paused"))
++    stop_at = motor.stop_monitor.snapshot()["stop_requested_at"]
++    for pair in ((800, -850), (-1200, 900), (900, 0), (0, -801), (1100, 1000)):
++        clock.now += .1
++        motor.write(intent(clock, reason="gesture_paused"))
++        backend.rpm = pair
++        row = motor.feedback()
++        assert (row["left_rpm"], row["right_rpm"]) == pair
++        assert row["stop_monitor"]["reason"] == "gesture_paused_external_motion"
++        assert row["stop_monitor"]["consecutive_samples"] == 0
++        assert row["stop_monitor"]["fault"] is None
++    assert motor.stop_monitor.snapshot()["stop_requested_at"] == stop_at
++    assert motor._stop_fault is None
++    assert not any(call[0] == "parking" for call in backend.calls)
++
++
++def test_non_gesture_stop_after_pause_restores_100_rpm_fault_even_if_stop_is_throttled(board):
++    motor, backend, clock = board
++    motor.set_gesture_paused(True)
++    motor.write(intent(clock, reason="gesture_paused"))
++    clock.now += .1
++    backend.rpm = (900, 0)
++    assert motor.feedback()["stop_monitor"]["fault"] is None
++    # The new STOP reason may not reach the wire due to refresh throttling;
++    # the live gate state must still end the paused exemption.
++    motor.set_gesture_paused(False)
++    clock.now += .01
++    assert motor.write(intent(clock, reason="capture_inactive"))["dispatched"] is False
++    backend.rpm = (101, 0)
++    clock.now += .1
++    assert motor.feedback()["stop_monitor"]["consecutive_samples"] == 1
++    clock.now += .1
++    with pytest.raises(BoardStopMotionFault) as caught:
++        motor.feedback()
++    assert caught.value.diagnostics["feedback"]["stop_monitor"]["fault"]["threshold_rpm"] == 100.
++
++
++def test_resumed_motion_then_normal_stop_preserves_original_grace_and_threshold(board):
++    motor, backend, clock = board
++    motor.set_gesture_paused(True)
++    motor.write(intent(clock, reason="gesture_paused"))
++    clock.now += .1
++    backend.rpm = (900, -900)
++    assert motor.feedback()["stop_monitor"]["fault"] is None
++    motor.set_gesture_paused(False)
++    clock.now += .1
++    motor.write(intent(clock, stop=False, left=40, right=-40, reason="gesture_resume"))
++    backend.rpm = (40, -40)
++    clock.now += .1
++    assert motor.feedback()["stop_monitor"]["state"] == "moving"
++    motor.write(intent(clock, reason="capture_inactive"))
++    stop_at = clock.now
++    grace = motor.stop_monitor.snapshot()["grace_sec"]
++    assert grace > 0
++    backend.rpm = (101, 0)
++    clock.now = stop_at + grace - .01
++    assert motor.feedback()["stop_monitor"]["reason"] == "deceleration_grace"
++    clock.now = stop_at + grace + .01
++    assert motor.feedback()["stop_monitor"]["consecutive_samples"] == 1
++    clock.now += .1
++    with pytest.raises(BoardStopMotionFault) as caught:
++        motor.feedback()
++    assert caught.value.diagnostics["feedback"]["stop_monitor"]["fault"]["threshold_rpm"] == 100.
+ 
+ 
+ def test_failed_park_release_still_attempts_final_stop(board):
+diff --git a/tests/continuous/test_stop_runtime.py b/tests/continuous/test_stop_runtime.py
+--- a/tests/continuous/test_stop_runtime.py
++++ b/tests/continuous/test_stop_runtime.py
+@@ -67,6 +67,39 @@
+     runtime = enabled(rig, backend)
+     runtime.execute = True  # All adapters remain injected fakes.
+     return runtime
++
++
++def test_feedback_receives_current_gesture_pause_even_when_stop_reason_is_obstacle(rig):
++    """The feedback policy follows the gate, not a STOP reason overwritten by hazards."""
++    class GestureSignalMotor(ReceiptMotor):
++        def __init__(self):
++            super().__init__()
++            self.gesture_paused = None
++            self.stop_reason = None
++            self.feedback_states = []
++
++        def set_gesture_paused(self, paused):
++            self.gesture_paused = paused
++
++        def feedback(self):
++            self.feedback_states.append((self.gesture_paused, self.stop_reason))
++            return None
++
++    motor = GestureSignalMotor()
++    runtime = waiting_runtime(rig, motor)
++    cases = [
++        ("WAITING", "gesture_waiting", False),
++        ("PAUSED", "gesture_paused", True),
++        ("PAUSED", "obstacle", True),
++        ("RUNNING", "gesture_paused", False),
++        ("WAITING", "gesture_waiting", False),
++    ]
++    for gate_state, stop_reason, expected_pause in cases:
++        runtime.gesture_gate.state = gate_state
++        motor.stop_reason = stop_reason
++        runtime._update_feedback()
++        assert motor.feedback_states[-1] == (expected_pause, stop_reason)
++    assert len(motor.feedback_states) == len(cases)
+ 
+ 
+ def test_legacy_motor_return_does_not_claim_a_real_dispatch(rig):
