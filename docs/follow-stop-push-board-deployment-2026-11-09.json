@@ -1,0 +1,34 @@
+{
+  "observedUtc": "2026-11-09T06:29:07.623118+00:00",
+  "route": "overseas_relay_22024",
+  "status": "deployed",
+  "files": [
+    {
+      "path": "continuous_follow/motor_stop_monitor.py",
+      "before": "d893abc5f28cd75ee453ac0a1b407e7178c53f4e4fa086bba4df4142fcc1b7b9",
+      "after": "28a8de948332ac5ef03dca84e1bb7209a2ca530f70d275e9e25c59ea31155b37"
+    },
+    {
+      "path": "tests/continuous/test_motor_stop_monitor.py",
+      "before": "3b957efd721c690c493d5ffaf1adf10b84c8e6e2b8c3fdd3154e4b971092211f",
+      "after": "84aa1f6eee3799641af5945ae8a0cc38890f9f144dd1e49c6e589fc4c9400718"
+    },
+    {
+      "path": "tests/continuous/test_stop_hardware.py",
+      "before": "9f71076e1c57dec63e8641842626741a364c6b267e70c90ffa6f35b30e659f5c",
+      "after": "47712ccb40a85a5a563d2932d53c50fcdcd95728b241fd1e0e24898fa1cecb8d"
+    }
+  ],
+  "controlIdleGuard": {
+    "event": "locked",
+    "bothControlLocksHeld": true,
+    "leaseSeconds": 120
+  },
+  "backupDir": "/home/topeet/Desktop/rk_car_runtime_module/.codex_backups/follow_stop_push_20261109T062925Z_0f6a1276",
+  "tests": "........................................................................ [ 69%]\n...............................                                          [100%]\n103 passed in 0.68s",
+  "controlGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  },
+  "controlGuardExit": 0
+}

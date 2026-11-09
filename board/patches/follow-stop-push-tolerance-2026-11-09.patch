@@ -1,0 +1,154 @@
+diff --git a/continuous_follow/motor_stop_monitor.py b/continuous_follow/motor_stop_monitor.py
+--- a/continuous_follow/motor_stop_monitor.py
++++ b/continuous_follow/motor_stop_monitor.py
+@@ -34,7 +34,7 @@
+     No command, zero-speed sample, or elapsed time clears the fault.
+     """
+ 
+-    def __init__(self, *, deceleration_rpm_s=60., speed_threshold_rpm=100.,
++    def __init__(self, *, deceleration_rpm_s=60., speed_threshold_rpm=800.,
+                  required_samples=2, feedback_max_age_sec=.30,
+                  evidence_max_gap_sec=.30, min_grace_sec=.5,
+                  max_grace_sec=4., settle_margin_sec=.2):
+diff --git a/tests/continuous/test_motor_stop_monitor.py b/tests/continuous/test_motor_stop_monitor.py
+--- a/tests/continuous/test_motor_stop_monitor.py
++++ b/tests/continuous/test_motor_stop_monitor.py
+@@ -19,7 +19,7 @@
+ 
+ 
+ def test_recorded_startup_pattern_is_detected_on_second_nonzero_sample():
+-    # Historical strict-policy replay; production now tolerates up to 100 RPM.
++    # Historical strict-policy replay; production now tolerates up to 800 RPM.
+     monitor = waiting_monitor(speed_threshold_rpm=10.)
+     assert feedback(monitor, 1.021, 0, 0) is None
+     assert feedback(monitor, 1.163, -13, -13) is None
+@@ -35,12 +35,14 @@
+     (0., 0.), (14., 8.), (12., 9.), (30., 30.), (-30., -30.),
+     (30., -30.), (-30., 30.), (31., -31.), (80., -90.),
+     (100., 100.), (-100., -100.), (100., -100.), (-100., 100.),
+-    (100., 0.), (0., -100.),
+-])
+-def test_default_threshold_tolerates_both_wheels_up_to_100_rpm(left, right):
++    (101., 103.), (200., -200.), (799.999, 0.), (0., -799.999),
++    (800., 800.), (-800., -800.), (800., -800.), (-800., 800.),
++    (800., 0.), (0., -800.),
++])
++def test_default_threshold_tolerates_both_wheels_up_to_800_rpm(left, right):
+     monitor = waiting_monitor()
+-    assert monitor.speed_threshold_rpm == 100.
+-    assert monitor.snapshot()["threshold_rpm"] == 100.
++    assert monitor.speed_threshold_rpm == 800.
++    assert monitor.snapshot()["threshold_rpm"] == 800.
+     assert monitor.snapshot()["required_samples"] == 2
+     for at in (1.1, 1.2, 1.3):
+         assert feedback(monitor, at, left, right) is None
+@@ -50,16 +52,16 @@
+ 
+ 
+ @pytest.mark.parametrize("left,right", [
+-    (101., 0.), (-101., 0.), (0., 101.), (0., -101.),
+-    (101., -101.), (-101., 101.), (100.001, 0.), (0., -100.001),
+-])
+-def test_default_threshold_requires_two_fresh_samples_above_100_rpm(left, right):
++    (801., 0.), (-801., 0.), (0., 801.), (0., -801.),
++    (801., -801.), (-801., 801.), (800.001, 0.), (0., -800.001),
++])
++def test_default_threshold_requires_two_fresh_samples_above_800_rpm(left, right):
+     monitor = waiting_monitor()
+     assert feedback(monitor, 1.1, left, right) is None
+     assert monitor.snapshot()["consecutive_samples"] == 1
+     fault = feedback(monitor, 1.2, left, right)
+     assert fault["samples"] == 2
+-    assert fault["threshold_rpm"] == 100.
++    assert fault["threshold_rpm"] == 800.
+     assert monitor.faulted
+     assert feedback(monitor, 1.3, 0, 0) == fault
+     assert not monitor.observe_command(40, 40, False, 1.4)
+@@ -71,13 +73,27 @@
+     monitor.observe_command(0, 0, True, 1.1)
+     deadline = monitor.snapshot()["grace_until"]
+     assert monitor.snapshot()["grace_sec"] == pytest.approx(2.2)
+-    assert feedback(monitor, deadline-.1, 150, -150) is None
++    assert feedback(monitor, deadline-.1, 850, -850) is None
+     assert monitor.snapshot()["reason"] == "deceleration_grace"
+     assert monitor.snapshot()["consecutive_samples"] == 0
+-    assert feedback(monitor, deadline+.01, 150, -150) is None
+-    fault = feedback(monitor, deadline+.11, 150, -150)
+-    assert fault["threshold_rpm"] == 100. and fault["samples"] == 2
++    assert feedback(monitor, deadline+.01, 850, -850) is None
++    fault = feedback(monitor, deadline+.11, 850, -850)
++    assert fault["threshold_rpm"] == 800. and fault["samples"] == 2
+     assert fault["stop_requested_at"] == 1.1 and fault["grace_until"] == deadline
++
++
++def test_recorded_gesture_pause_push_does_not_fault_at_default_threshold():
++    monitor = MotorStopMonitor()
++    assert monitor.observe_command(0, 0, True, 5990.7845)
++    assert feedback(monitor, 5991.090, 0, 0) is None
++    assert monitor.observe_command(0, 0, True, 6025.927)
++    assert feedback(monitor, 6027.229, 16, 14) is None
++    assert monitor.observe_command(0, 0, True, 6042.300)
++    assert feedback(monitor, 6042.392, 69, 101) is None
++    assert feedback(monitor, 6042.543, 76, 103) is None
++    assert not monitor.faulted
++    assert monitor.snapshot()["stop_requested_at"] == 5990.7845
++    assert monitor.snapshot()["reason"] == "below_threshold"
+ 
+ 
+ def test_latest_recorded_stop_feedback_does_not_fault_at_default_threshold():
+diff --git a/tests/continuous/test_stop_hardware.py b/tests/continuous/test_stop_hardware.py
+--- a/tests/continuous/test_stop_hardware.py
++++ b/tests/continuous/test_stop_hardware.py
+@@ -37,7 +37,7 @@
+     def ensure_driver(self):
+         return self
+ 
+-    def send_stop(self, label, mode):
++    def send_stop(self, label, mode, **kwargs):
+         self.calls.append(("stop", label, mode))
+         if self.fail_stop:
+             raise OSError("injected stop failure")
+@@ -136,7 +136,7 @@
+ 
+ def test_board_default_tolerates_latest_recorded_low_speed_stop_feedback(board):
+     motor, backend, clock = board
+-    assert motor.stop_monitor.speed_threshold_rpm == 100.
++    assert motor.stop_monitor.speed_threshold_rpm == 800.
+     clock.now += .01
+     motor.write(intent(clock, stop=False, left=-5, right=5))
+     backend.rpm = (8, -3)
+@@ -146,7 +146,7 @@
+     motor.write(intent(clock))
+     stop_at = clock.now
+     for elapsed, pair in ((.514, (14, 8)), (.651, (12, 9)), (.8, (30, -30)),
+-                         (.9, (31, -31)), (1., (100, -100)), (1.1, (-100, 100))):
++                         (.9, (31, -31)), (1., (800, -800)), (1.1, (-800, 800))):
+         clock.now = stop_at + elapsed
+         backend.rpm = pair
+         result = motor.feedback()
+@@ -156,11 +156,11 @@
+     assert not any(call[0] == "parking" for call in backend.calls)
+ 
+ 
+-@pytest.mark.parametrize("pair", [(101, 0), (-101, 0), (0, 101), (0, -101),
+-                                  (100.001, -100), (100, -100.001)])
+-def test_board_default_still_latches_two_samples_above_100_rpm(board, pair):
+-    motor, backend, clock = board
+-    assert motor.stop_monitor.speed_threshold_rpm == 100.
++@pytest.mark.parametrize("pair", [(801, 0), (-801, 0), (0, 801), (0, -801),
++                                  (800.001, -800), (800, -800.001)])
++def test_board_default_still_latches_two_samples_above_800_rpm(board, pair):
++    motor, backend, clock = board
++    assert motor.stop_monitor.speed_threshold_rpm == 800.
+     motor.write(intent(clock))
+     backend.rpm = pair
+     clock.now += .1
+@@ -169,7 +169,7 @@
+     clock.now += .1
+     with pytest.raises(BoardStopMotionFault) as caught:
+         motor.feedback()
+-    assert caught.value.diagnostics["feedback"]["stop_monitor"]["fault"]["threshold_rpm"] == 100.
++    assert caught.value.diagnostics["feedback"]["stop_monitor"]["fault"]["threshold_rpm"] == 800.
+     assert [action["action"] for action in caught.value.diagnostics["actions"]] == [
+         "emergency_stop", "clear_parking_current", "final_emergency_stop"]
+     clock.now += .1
