@@ -1,0 +1,98 @@
+diff --git a/car_control_modular/motor_rtu.py b/car_control_modular/motor_rtu.py
+index 419ab71..02e688a 100644
+--- a/car_control_modular/motor_rtu.py
++++ b/car_control_modular/motor_rtu.py
+@@ -359,7 +359,8 @@ class MotorRtuGuard:
+         This is a continuous-owner opt-in, never a retry of a speed packet.
+         Keep the RTU lock throughout. A late FC10 ACK is identifiable by its
+         exact original address/count, and cannot certify any STOP or feedback.
+-        Other corrupt/partial/unknown frames and failed STOPs remain fatal.
++        A single entirely missing initial STOP ACK may be retried only after
++        a read fence. Other corrupt/partial/unknown frames remain fatal.
+         """
+         if not math.isfinite(float(budget_sec)) or not 0 < float(budget_sec) <= .6:
+             raise ValueError("speed recovery budget must be positive and at most 0.6 seconds")
+@@ -427,7 +428,8 @@ class MotorRtuGuard:
+                         detail["stage"] = "read"
+                         self._read_response(response, transaction_deadline, detail)
+                         detail["stage"] = "validate"
+-                        late_stop = stop_refresh and not report["fence_completed"] and response[1] == 6
++                        late_stop = (stop_refresh or report.get("unconfirmed_stop_ack")) \
++                            and not report["fence_completed"] and response[1] == 6
+                         # Before the fence, an exact response to the emergency
+                         # reassertion is UNPROVEN: the missing old ACK is identical.
+                         uncredited_match = late_stop and function == 6 and response[:6] == packet[:6]
+@@ -442,7 +444,8 @@ class MotorRtuGuard:
+                                 self._validate(expected, bytes(response), 8)
+                             else:
+                                 self._validate(request, bytes(response), 8)
+-                            if len(report["discarded_late_frames"]) >= (3 if stop_refresh else 1):
++                            if len(report["discarded_late_frames"]) >= (
++                                    3 if stop_refresh or report.get("unconfirmed_stop_ack") else 1):
+                                 raise RtuProtocolError("too many late write acknowledgements")
+                             report["discarded_late_frames"].append(bytes(response).hex())
+                             response.clear()
+@@ -481,18 +484,54 @@ class MotorRtuGuard:
+                 # arbitrary response reordering is not a supported protocol.
+                 transaction(3, 0x0000, 3, 11)
+                 report["fence_completed"] = True
+-            failures = []
+-            for side, address in (("right", 0x0040), ("left", 0x0044)):
+-                try:
+-                    transaction(6, address, 1, 8)
+-                    report["stop_acknowledged"].append(side)
+-                except Exception as exc:
+-                    failures.append(exc)
++            def stop_both():
++                failures = []
++                for side, address in (("right", 0x0040), ("left", 0x0044)):
++                    try:
++                        transaction(6, address, 1, 8)
++                        report["stop_acknowledged"].append(side)
++                    except Exception as exc:
++                        detail = dict(report["transactions"][-1])
++                        failures.append((exc, detail, side))
++                        if (not stop_refresh and not report["fence_completed"]
++                                and empty_stop_ack(exc, detail, side)):
++                            # The old STOP may have executed. A later FC06 ACK
++                            # cannot certify a new STOP until an FC03 fence.
++                            report.setdefault("initial_stop_empty_timeouts", []).append(side)
++                            report.setdefault("unconfirmed_stop_ack", side)
++                return failures
++
++            def empty_stop_ack(exc, detail, side):
++                packet = bytes.fromhex(detail.get("tx_hex", ""))
++                return bool(type(exc) is TimeoutError
++                    and str(exc) == "no response from driver"
++                    and detail.get("error_type") == "TimeoutError"
++                    and detail.get("stage") == "read"
++                    and detail.get("rx_length") == 0
++                    and detail.get("read_calls", 0) >= 1
++                    and detail.get("tx_written") == detail.get("tx_length") == 8
++                    and not detail.get("timeout_restore_error")
++                    and len(packet) == 8 and packet[1] == 6
++                    and int.from_bytes(packet[2:4], "big") == (0x40 if side == "right" else 0x44)
++                    and packet[4:6] == b"\x00\x01")
++
++            failures = stop_both()
+             if failures:
+-                raise failures[0]
++                if stop_refresh or len(failures) != 1 or not empty_stop_ack(*failures[0]):
++                    raise failures[0][0]
++                # The first STOP response is missing, so even a later matching
++                # FC06 frame is ambiguous. Fence with a different response
++                # function/length before confirming a fresh dual STOP.
++                report["initial_stop_acknowledged"] = list(report["stop_acknowledged"])
++                report["stop_acknowledged"] = []
++                transaction(3, 0x0000, 3, 11)
++                report["fence_completed"] = True
++                retry_failures = stop_both()
++                if retry_failures:
++                    raise retry_failures[0][0]
+             # Function and length differ from both STOP and the missing speed
+             # ACK. This fence never reads or writes motor configuration.
+-            if not stop_refresh:
++            if not stop_refresh and not report["fence_completed"]:
+                 transaction(3, 0x0000, 3, 11)
+                 report["fence_completed"] = True
+             for _ in range(16):

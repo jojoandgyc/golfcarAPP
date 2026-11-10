@@ -1,0 +1,26 @@
+{
+  "observedUtc": "2026-11-10T08:24:55.117129+00:00",
+  "route": "direct_confirmed_172.16.16.160",
+  "deployRequested": true,
+  "file": "car_control_modular/motor_rtu.py",
+  "beforeSha256": "dcfbc89ea340689b71d5a7d5d85911fa198cc508140dca497d69b4355de446d1",
+  "afterSha256": "94ebc2cc38e17b3fbf31b7bd7fb69c1177aebc0e0cae5f2138f66b0ee2197424",
+  "offlineFakeSerialTests": "121 passed; stage test digests pinned; no board test files overwritten",
+  "status": "deployed_and_syntax_verified",
+  "observedBoardSha256": "dcfbc89ea340689b71d5a7d5d85911fa198cc508140dca497d69b4355de446d1",
+  "boardTestSha256": null,
+  "boardTestDisposition": "untouched; fake tests validated locally",
+  "backupDir": "/home/topeet/Desktop/rk_car_runtime_module/.codex_backups/follow_rtu_ack_20261110T082455Z_d8ccde5c",
+  "backupSha256": "dcfbc89ea340689b71d5a7d5d85911fa198cc508140dca497d69b4355de446d1",
+  "idleGuard": {
+    "event": "locked",
+    "bothControlLocksHeld": true,
+    "leaseSeconds": 120
+  },
+  "boardSyntaxValidation": "passed",
+  "idleGuardRelease": {
+    "event": "unlocked",
+    "reason": "released"
+  },
+  "idleGuardExit": 0
+}
